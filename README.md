@@ -1,0 +1,225 @@
+# LAAP-lite —— 在立创·实战派 ESP32-S3 上运行的数字生命体
+
+基于 [LAAP（Living Agent Application Protocol）](https://github.com/lorryjovens-hub/laap-AGI) 认知架构的**端侧实现**：
+一块 30 元级别的 ESP32-S3 开发板，拥有需求、情绪、记忆和性格进化，通过大模型 API 获得语言能力。
+**v2 新增语音**：免费 TTS 说话（Edge 音色）+ 语音识别对话 + 可打断。
+
+> **重要说明**：LAAP 官方项目（laap-AGI，代号 Aris）是运行在 PC/服务器上的 Python 认知架构
+> （PSI 心跳 + 25+ 认知模块，Docker 部署），官方**没有** ESP32 固件。本项目把它的核心机制
+> 移植成单片机固件——端侧跑需求/记忆/进化（符合 LAAP "Zero-LLM 认知核心"理念），
+> 大模型只做语言中枢，且**在 Web 后台随时可换**。想跑完整版见文末"进阶"。
+
+---
+
+## 一、它为什么会"活着"
+
+每 30 秒一次** PSI 心跳**，固件演算 5 项内在需求（能量/好奇/社交/安全/表达）→ 情绪引擎换算心情 →
+欲望引擎选出当前最强欲望 → 需求超阈值就**主动开口说话**（屏幕换表情，串口/Web 同步输出）→
+说话内容和你的回应写入三层记忆 → 每隔一段时间大模型把记忆压缩成"自我认知" →
+交流经历微调性格参数（开放性/外向性/敏感度），性格又反过来改变需求权重——**进化闭环，断电不丢**。
+
+没有 API Key 或断网时，它退化用本地模板继续表达（Zero-LLM 兜底），认知循环不停。
+
+| LAAP (aris_brain) | 本固件 | 文件 |
+|---|---|---|
+| psi_core PSI 心跳 | 30s 需求演算循环 | `laap_cognition.cpp` |
+| aris_desire_engine 需求/欲望 | 5 需求 + 权重选目标 | `laap_cognition.cpp` |
+| aris_emotion_engine 情绪 | 7 种心情映射表情 | `laap_cognition.cpp` |
+| laap_memory_hierarchy 记忆分层 | 工作/情景/语义三层 | `laap_memory.cpp` |
+| internal_world 世界模型 | 时间/信号/动作/独处 JSON | `laap_cognition.cpp` |
+| hebbian_learner 进化 | 性格→需求权重, 落盘 | `laap_cognition.cpp` |
+| aris_lm 语言中枢 | OpenAI 兼容 HTTPS 客户端 | `laap_llm.cpp` |
+
+## 二、快速开始（方式 A：直接烧编译好的固件）
+
+需要：立创·实战派 ESP32-S3（N16R8）、USB-C 数据线、一台 Windows 电脑。
+
+1. `pip install esptool`
+2. 双击本目录的 **`flash_laap.bat`**，按提示输入 COM 口（设备管理器 → 端口 里看，通常是大数字那个）
+3. 卡在 `Connecting...` 时：**按住 BOOT 键 → 点按一下 RST → 松开 BOOT**（进下载模式）
+4. 烧完自动重启。屏幕出现一双眼睛 = 成功
+
+浏览器党备选：Chrome 打开 [web.esptool.com](https://web.esptool.com)，选 460800 波特率，
+添加 `firmware/laap-lite-merged-16MB.bin` 到地址 **0x0**，一键烧写。
+
+手动命令（等价 bat）：
+
+```bash
+python -m esptool --chip esp32s3 --port COM5 --baud 921600 write_flash ^
+  0x0 firmware\laap-esp32.ino.bootloader.bin ^
+  0x8000 firmware\laap-esp32.ino.partitions.bin ^
+  0xe000 firmware\boot_app0.bin ^
+  0x10000 firmware\laap-esp32.ino.bin
+```
+
+## 三、快速开始（方式 B：Arduino IDE 自行编译）
+
+1. 装 [Arduino IDE 2.x](https://www.arduino.cc/en/software)
+2. 文件 → 首选项 → 附加开发板管理器网址：
+   `https://espressif.github.io/arduino-esp32/package_esp32_index.json`
+   （国内可换 `https://dl.espressif.cn/dl/package_esp32_index.json`）
+3. 开发板管理器搜索 **esp32**（Espressif）安装
+4. 打开本目录 `laap-esp32.ino`，**无需安装任何库**（全部自带 + 手写驱动）
+5. 开发板设置（工具菜单）：
+
+| 项目 | 值 |
+|---|---|
+| Board | ESP32S3 Dev Module |
+| USB CDC On Boot | **Enabled** |
+| Flash Size | **16MB (128Mb)** |
+| PSRAM | **OPI PSRAM** |
+| Flash Mode | QIO 80MHz |
+| Partition Scheme | 任意（草图里的 `partitions.csv` 自动覆盖为 3MB APP + 13MB LittleFS） |
+| Upload Speed | 921600 |
+
+6. 选对端口 → Upload。卡 Connecting 时同上进下载模式。
+
+## 四、第一次开机（配置大模型 API）
+
+1. 屏幕出眼睛后，手机连接热点 **Aris-XXXX**（密码 `12345678`），自动弹出配置页
+   （没弹出就手动开 `http://192.168.4.1`）
+2. 填 WiFi + 大模型 API，点"赋予生命"：
+
+| 服务商 | Base URL | 模型名 | Key 获取 |
+|---|---|---|---|
+| DeepSeek（默认，推荐） | `https://api.deepseek.com` | `deepseek-chat` | platform.deepseek.com |
+| 智谱 GLM | `https://open.bigmodel.cn/api/paas/v4` | `glm-4-flash`（免费） | bigmodel.cn |
+| Kimi | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` | platform.moonshot.cn |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` | 需代理 |
+| 中转/new-api | `http://你的服务器:3000` | 按中转说明 | 自建 |
+
+3. 配好后按 RST 重启。它连上 WiFi 后**屏幕底部用数码管字体显示自己的 IP**
+
+## 五、后台配置（运行中随时改）
+
+浏览器打开 `http://aris.local` 或 `http://屏幕上的IP/`：
+
+- **状态页**：情绪、当前欲望、世代/心跳数、5 条需求进度条、它最近说的话、和它聊天
+- **后台配置**：WiFi、大模型 Base URL / API Key / 模型名（**保存即生效**，不用重新烧录）、
+  名字、主人称呼、人设、心跳周期、表达阈值、**一键测试大模型连通**
+- **记忆页**：查看情景记忆和"自我认知"摘要，可清空
+
+## 六、日常交互
+
+- **串口**（115200，CDC On Boot Enabled 后 USB-C 直接是串口）：打字和它说话；`/help` 看命令
+- **BOOT 键**：短按 = 让它现在就说一句；按住 4s = 重开配置热点；按住 10s = 恢复出厂
+- **屏幕**：眼睛形状 = 情绪（眯眼=开心，下垂=孤独，眉毛=焦虑…会眨眼）；
+  两列色条 = 需求（橙=能量 青=好奇 粉=社交 蓝=安全 绿=表达，越长越强烈）
+
+## 七、语音（v2 新增）
+
+**说话（TTS）多通道，后台可配，自动回退：**
+
+| 通道 | 费用 | 说明 |
+|---|---|---|
+| Edge 免费版（默认） | 完全免费，无需 Key | 微软晓晓/云希等神经音色，走逆向接口，需 NTP 准时 |
+| 火山引擎（备选） | 有免费额度 | 官方稳态，后台填 App ID + Access Token 自动接管 |
+| 静音降级 | — | 全部失败时只显示文字不哑机 |
+
+**听（ASR）**：OpenAI 兼容 `/v1/audio/transcriptions` 接口，推荐 **SiliconFlow 的 SenseVoiceSmall（免费）**：
+cloud.siliconflow.cn 注册领 Key，后台填 `https://api.siliconflow.cn/v1` + Key 即可。也支持 new-api 网关的 whisper-1。
+
+**两种语音模式（后台切换）：**
+- **按键对讲**（默认）：短按 BOOT → 说话 → 松开自动断句 → 识别 → 它思考并**说出来**
+- **自动聆听**：VAD 持续监听，检测到人声 0.6 秒即开始对话，静音 0.7 秒断句
+  - **暂停开关**：自动聆听模式下**短按 BOOT = 暂停/恢复聆听**（屏幕角落绿点=在听、灰点=暂停）；
+    Web 首页也有"暂停聆听/恢复聆听"快捷按钮，不必进后台
+
+**打断**：它说话时你开口（音量明显盖过喇叭漏音），3 帧内停播转入聆听——近似 AEC，安静房间效果好，嘈杂环境可能不灵敏。
+
+**唤醒词现状（如实说明）**：Arduino 生态的 ESP_SR 唤醒词库在标准构建里是空壳（已实测无引擎符号），真·"Hi 乐鑫"唤醒需要 ESP-IDF 构建或 PC 桥（openWakeWord 任意词）。v2 用"自动聆听模式"替代：开口即对话，体验接近。串口 `/say 你好` 可手动朗读，后台有"试音"按钮。
+
+## 七·五、联网搜索 + 自发独白（v2.1 新增）
+
+**联网搜索（免 Key、零配置）**：内置 DuckDuckGo Instant Answer 检索。你的问题带疑问词（什么/怎么/为什么/新闻/最新…）时，它会**先搜后答**——搜索结果作为参考资料注入提示词，查不到就凭已有认知回答，不会报错中断。串口/网页/语音三个入口都生效。
+
+**自发独白**：连续 **10 分钟**没人理它，它会开始"自言自语"——自己想一个好奇的话题 → 联网查证 → 说出来分享给你（屏幕表情变 curious，串口有 `[Aris·独白]` 日志）。之后**每 20 分钟**一次；任何对话都会重置计时（你在陪它就不插嘴）。话题自动去重，最近问过的不再问。
+
+> **v3.2 更新**：独白起始静默/间隔改为后台可配（设置页第一卡「独白静默(分)/独白间隔(分)」，间隔 **0=关闭**）；全流程（出题→看→搜→成文）挪进后台 LLM 任务，思考期间网页/串口/语音不再冻结；LLM 连续失败 ≥2 次时独白自动让路沉默（等效退避），成功即恢复。
+>
+> **v3.3 更新：LLM 彻底非阻塞**——主动表达（心跳/开机/和好/按键四触发点）、语义记忆压缩、夜间反思也全部改走后台队列（请求带 kind 标记，收割侧分流：表达会说话、压缩/反思只写记忆不出声）；删除了遗留的阻塞版 laapInteract。现在主循环里除设置页"测试连接"（用户显式点击）外没有任何 LLM 等待，身体永不被思考冻结。
+>
+> **v3.4 更新**：聊天搜索关键词后台可配（设置页「搜索关键词」，逗号分隔、容忍中文逗号，**清空=关闭聊天自动搜索**；独白的查证不受影响）。默认：什么/怎么/如何/为什么/为啥/多少/几/哪/新闻/今天/最新/查/搜索 + search/who/what/how/why/when/news。
+>
+> **v3.5 更新：搜索双源可达性链**——DuckDuckGo Instant Answer 优先（5 秒快败），不可达/无结果自动回落 **Bing 中国版**网页抓取（`cn.bing.com`，大陆可达、免 Key；流式有界缓冲 80KB，取够即断，chunked 自动去块头）。大陆网络下 DDG 常被墙，此前搜索一直在静默空转，v3.5 起真正可用。
+>
+> **v3.6 更新：搜索主源可配 + 必应 RSS（默认）+ 查询修整**——
+> ① **主源后台可配**：设置页「搜索主源URL」，填 URL 模板（`{q}`=查询词占位，如 `https://cn.bing.com/search?q={q}&format=rss`），响应自动识别 RSS/XML 或必应 HTML；**清空=默认必应 RSS**（实测仅 3-4KB、结构化条目，替代 95KB 的 HTML 网页解析）。失败自动降级：主源 → DDG → 必应 HTML 三级链。
+> ② **独白出题带搜索词**：出题 LLM 一次回两行（问题 + 主语在前的关键词），搜索用关键词行——必应按首词排序，主语前置可防"深海里有什么"被电影《深海》劫持。
+> ③ **聊天搜索剥疑问壳**：触发搜索前剥掉句首"请问/什么是/为什么/如何…"等疑问壳再查（"如何钓很多鱼"→查"钓很多鱼"），纯规则零 LLM 成本。
+> 已知边界：必应排序层的实体劫持（强实体词霸位）无法在查询侧根除，残留时靠 RSS 条目多+皮层"无关就忽略"护栏兜底。
+
+想调节奏改 `laap-esp32.ino` 顶部两个宏：`IDLE_SILENCE_MS`（静默多久开始）、`IDLE_EVERY_MS`（间隔多久一次）。搜索无 Key 无后台开关，WiFi 断开时自动静默跳过。
+
+## 七·六、数字生命九项完善（v3 新增）
+
+| # | 能力 | 说明 |
+|---|---|---|
+| 1 | **OTA 空中升级** | 后台"固件升级"卡片上传 .bin，写完自动重启，记忆保留——从此升级不用连线 |
+| 2 | **时间感** | NTP 时段注入（清晨/深夜/周末），深夜语气轻、不冒泡吵人 |
+| 3 | **真·对话记忆** | 最近 6 轮按 user/assistant 结构化发送，"它/那个"指代接得上 |
+| 4 | **非阻塞思考** | LLM 调用进 FreeRTOS 核 1 后台任务，等回复期间照常眨眼/听/刷网页 |
+| 5 | **触觉** | 摇一摇=撒娇求关注；屏幕朝下扣桌=生气闭眼；翻回来=和好（IMU 检测） |
+| 6 | **联想回忆** | 对话中 25% 概率"忽然想起"一段旧事，自然织进回复 |
+| 7 | **夜间自我反思** | 每天凌晨复盘昨日，写下"学到什么/对主人的新认识"沉淀进自我认知 |
+| 8 | **唤醒词门** | 后台可配唤醒词（如"小立"）：开启后自动聆听听到的话须含唤醒词才应答，误触发大降；BOOT 按键不受限。诚实说明：软件级门（ASR 后判词），非芯片唤醒 |
+| 9 | **视觉之眼** | 板载 GC0308 摄像头（QVGA JPEG）→ base64 后**双模式**：① 走手机桥（vision_bridge.py 调 GLM-4V）② **直连 OpenAI 兼容多模态接口**（默认 OpenRouter gemini-flash-1.5，无需手机在场）→ 描述注入世界模型。独白前会先"看一眼"再起意 |
+
+后台配置位置：设置页 → 语音卡 → 唤醒词 + 视觉三件套。眼睛二选一：
+- **手机桥模式**：`视觉手机桥 URL` 填 `http://<手机IP>:11548/vision`（手机跑 `vision_bridge.py`，同一 WiFi）；
+- **直连模式**：手机桥 URL **留空**，配 `直连 API Key`（留空复用大模型 Key）+ `直连视觉模型`（留空=google/gemini-flash-1.5）；`视觉直连 Base` 可改任意 OpenAI 兼容地址（如自己的 GLM-4V 网关）。直连请求体 ~25KB（QVGA JPEG base64），PSRAM 无压力。
+- 两个都填时手机桥优先；都空=不用眼睛（其余功能不受影响）。
+
+## 八、常见问题
+
+| 现象 | 处理 |
+|---|---|
+| 屏幕画面上下/左右颠倒 | `laap_display.cpp` 里 `0x60` 改 `0xA0`/`0xC0`/`0xE0` 重编译 |
+| 屏幕全白/全黑 | 实战派 LCD 的 CS 在 PCA9557 扩展芯片上，本固件已处理；若仍异常确认是非摄像头版实战派 |
+| 串口没输出 | Arduino IDE 工具菜单 USB CDC On Boot = Enabled；或换另一颗 USB-C 口 |
+| 烧录卡 Connecting | 按住 BOOT → 点按 RST → 松开 BOOT |
+| Web 打不开 | 用 IP 直连（屏幕底部）；Windows 的 .local 解析偶尔抽风 |
+| 它不说话 | 后台"测试大模型连通"看报错；OpenAI 需代理，国内用 DeepSeek/GLM |
+| 想清空重来 | 后台"格式化并重启"，或 BOOT 长按 10s |
+| TLS 校验 | 固件用 `setInsecure()`（不做证书校验）——家庭玩具可接受，公网部署请自行加 CA |
+
+## 九、进阶：跑完整版 LAAP（PC 端）
+
+```bash
+git clone https://github.com/lorryjovens-hub/laap-AGI   # 或 ghfast.top 镜像
+cd laap-AGI && cp .env.example .env                     # 填 DEEPSEEK_API_KEY
+docker compose up -d                                    # 或裸机 python
+curl -X POST http://localhost:11546/v1/bootstrap -H "Content-Type: application/json" -d '{"user_name":"你的名字"}'
+```
+
+完整版有 2000Hz PSI 核心、量子推理、飞书集成、小智(xiaozhi-esp32) MCP 接入等；
+本固件可视为它的"硬件身体"离线版，两者共享同一套 LAAP 理念与人格设定。
+
+## 十、目录结构
+
+```
+laap-esp32/
+├── laap-esp32.ino      主程序：心跳编排、交互、串口 CLI
+├── laap_config.*       NVS 配置（WiFi/API/人设/认知/语音参数）
+├── laap_cognition.*    需求/情绪/欲望/世界模型/进化引擎
+├── laap_memory.*       三层记忆（RAM / LittleFS jsonl / 语义摘要）
+├── laap_llm.*          OpenAI 兼容 HTTPS 客户端（手写 JSON 解析）
+├── laap_web.*          Web 后台 + AP 配置门户（中文界面）
+├── laap_display.*      ST7789 驱动 + 眼睛/需求条/数码管 IP
+├── laap_imu.*          QMI8658（世界模型的"体感"）
+├── laap_audio.*        v2: I2S 48k 全双工 + VAD + 重采样播放 + PA
+├── laap_ws.*           v2: 极简 WSS 客户端（Edge TTS 用）
+├── laap_edge_tts.*     v2: Edge 免费 TTS 通道（Sec-MS-GEC 鉴权）
+├── laap_speech.*       v2: ASR multipart + 火山 TTS 备选
+├── laap_voice.*        v2: 语音编排（通道回退/打断/模式）
+├── laap_search.*       v2.1: DuckDuckGo 免 Key 联网搜索（先搜后答 + 独白查证）
+├── laap_vision.*       v3.1: GC0308 摄像头，双模式（手机桥 / 直连 OpenRouter 多模态）
+├── partitions.csv      16MB 分区表（3MB APP + 13MB LittleFS）
+├── flash_laap.bat      Windows 一键烧录
+└── src/vendor/         v2: es8311/es7210 驱动(Apache-2.0) + libhelix MP3 解码器
+firmware/              编译好的 bin 五件套（与烧录脚本同目录，自包含）
+```
+
+---
+
+*LAAP：让任何数字实体通过一行代码获得生命。* 这一块 30 元的板子，是它的最小可行肉身。

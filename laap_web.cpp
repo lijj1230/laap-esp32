@@ -1,0 +1,597 @@
+#include "laap_web.h"
+#include <Update.h>
+#include "laap_config.h"
+#include "laap_cognition.h"
+#include "laap_display.h"
+#include "laap_memory.h"
+#include "laap_llm.h"
+#include "laap_voice.h"
+#include "laap_vision.h"
+#include "laap_audio.h"
+#include <WiFi.h>
+#include <ESPmDNS.h>
+
+LaapWeb webui;
+
+// 本地小工具：JSON 字符串转义
+static String jsonEsc(const String& s) {
+  String o; o.reserve(s.length() + 8);
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '"' || c == '\\') { o += '\\'; o += c; }
+    else if (c == '\n') o += "\\n";
+    else if (c == '\r') o += "";
+    else o += c;
+  }
+  return o;
+}
+
+// ============ 前端页面（PROGMEM，中文 UTF-8） ============
+static const char PAGE_HEAD[] PROGMEM = R"html(<!DOCTYPE html><html lang="zh"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LAAP · Aris</title><style>
+:root{--bg:#0d1017;--card:#171c28;--line:#2a3245;--txt:#e2e8f0;--dim:#8b95a8;--acc:#6fd3ff}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei";background:var(--bg);color:var(--txt)}
+.wrap{max-width:720px;margin:0 auto;padding:16px}
+h1{font-size:20px}h1 small{color:var(--dim);font-weight:400;font-size:12px;margin-left:8px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+.row{display:flex;gap:10px;flex-wrap:wrap}
+.stat{flex:1;min-width:140px}.stat .k{color:var(--dim);font-size:12px}.stat .v{font-size:17px;margin-top:2px}
+.bar{height:12px;background:#0a0d14;border-radius:6px;overflow:hidden;margin:4px 0 10px}
+.bar i{display:block;height:100%;border-radius:6px}
+label{display:block;font-size:13px;color:var(--dim);margin:10px 0 4px}
+input,textarea,select{width:100%;background:#0a0d14;color:var(--txt);border:1px solid var(--line);border-radius:8px;padding:9px;font-size:14px}
+button{background:linear-gradient(90deg,#2b6cb0,#4299e1);border:0;color:#fff;border-radius:8px;padding:10px 22px;font-size:14px;cursor:pointer;margin-top:12px}
+button.ghost{background:#242b3b}
+.nav a{color:var(--acc);text-decoration:none;margin-right:14px;font-size:14px}
+#chatlog{height:220px;overflow-y:auto;background:#0a0d14;border:1px solid var(--line);border-radius:8px;padding:10px;font-size:14px;line-height:1.7}
+.me{color:#9ae6b4}.aris{color:#6fd3ff}.sys{color:#8b95a8;font-size:12px}
+a{color:var(--acc)}.hint{font-size:12px;color:var(--dim);margin-top:6px}
+</style></head><body><div class="wrap">)html";
+
+static const char PAGE_FOOT[] PROGMEM = R"html(</div></body></html>)html";
+
+static const char PAGE_TAIL_JS[] PROGMEM = R"html(
+<script>
+async function toggleListen(e){
+ e.preventDefault();
+ const b=await (await fetch('/api/listen',{method:'POST'})).json();
+ refresh();
+}
+async function refresh(){
+ try{
+  const s=await (await fetch('/api/status')).json();
+  document.getElementById('mood').textContent=s.mood_cn;
+  document.getElementById('goal').textContent=s.goal;
+  document.getElementById('gen').textContent='G'+s.generation+' · '+s.cycles+'次心跳';
+  document.getElementById('last').textContent=s.last_say||'（还没说过话）';
+  document.getElementById('net').textContent=s.ap?'配置热点 '+s.ap_ssid:(s.wifi_ok?'WiFi 已连接 '+s.ip:'WiFi 断开');
+  document.getElementById('model').textContent=s.llm_model+' @ '+s.llm_base;
+  const vc=document.getElementById('voicecard');
+  if(vc){if(s.voice_ready&&s.voice_mode==2){vc.style.display='block';
+    document.getElementById('listenstate').textContent=s.vad_paused?'已暂停':'聆听中…';
+    document.getElementById('listenbtn').textContent=s.vad_paused?'恢复聆听':'暂停聆听';
+  }else{vc.style.display='none';}}
+  const bars={energy:['能量','#ffb020'],curiosity:['好奇','#40c8ff'],social:['社交','#ff60c8'],security:['安全','#6080ff'],expression:['表达','#60e680']};
+  let h='';
+  for(const k in bars){h+='<div><span style="font-size:12px;color:#8b95a8">'+bars[k][0]+'</span><div class="bar"><i style="width:'+(s.needs[k]*100)+'%;background:'+bars[k][1]+'"></i></div></div>';}
+  document.getElementById('bars').innerHTML=h;
+ }catch(e){}
+}
+setInterval(refresh,5000);refresh();
+async function sendChat(){
+ const t=document.getElementById('chatin').value.trim();if(!t)return;
+ document.getElementById('chatin').value='';
+ const log=document.getElementById('chatlog');
+ log.innerHTML+='<div class="me">我: '+t.replace(/</g,'&lt;')+'</div>';log.scrollTop=1e9;
+ log.innerHTML+='<div class="sys">思考中…</div>';log.scrollTop=1e9;
+ try{
+  const r=await (await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})})).json();
+  log.innerHTML+='<div class="aris">Aris: '+r.reply.replace(/</g,'&lt;')+'</div>';
+ }catch(e){log.innerHTML+='<div class="sys">请求失败</div>';}
+ log.scrollTop=1e9;refresh();
+}
+</script>)html";
+
+void LaapWeb::registerRoutes() {
+  server.on("/", HTTP_GET, [this]() { handleRoot(); });
+  server.on("/settings", HTTP_GET, [this]() { handleSettingsPage(); });
+  server.on("/memory", HTTP_GET, [this]() { handleMemoryPage(); });
+  server.on("/api/status", HTTP_GET, [this]() { handleStatus(); });
+  server.on("/api/chat", HTTP_POST, [this]() { handleChat(); });
+  server.on("/api/test", HTTP_POST, [this]() { handleTest(); });
+  server.on("/api/save", HTTP_POST, [this]() { handleSave(); });
+  server.on("/api/memory", HTTP_GET, [this]() { handleMemoryApi(); });
+  server.on("/api/clear", HTTP_POST, [this]() { handleClear(); });
+  server.on("/api/reset", HTTP_POST, [this]() { handleReset(); });
+  server.on("/api/reboot", HTTP_POST, [this]() { handleReboot(); });
+  // F1: OTA 固件上传（POST .bin 原始体，写满即重启）
+  server.on("/api/ota", HTTP_POST,
+    [this]() {
+      if (otaPending) {
+        server.send(200, "application/json",
+          "{\"ok\":true,\"msg\":\"固件已写入，重启中，约 20 秒后回来\"}");
+      } else {
+        server.send(500, "application/json",
+          String("{\"ok\":false,\"msg\":\"写入失败: ") + otaErr + "\"}");
+      }
+    },
+    [this]() {
+      HTTPUpload& up = server.upload();
+      if (up.status == UPLOAD_FILE_START) {
+        Serial.printf("[OTA] 开始: %s\n", up.filename.c_str());
+        otaPending = false; otaErr = "";
+        display.drawFace("curious", true);          // 升级中表情
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { otaErr = Update.errorString(); return; }
+      } else if (up.status == UPLOAD_FILE_WRITE) {
+        if (Update.write(up.buf, up.currentSize) != up.currentSize) {
+          otaErr = Update.errorString(); return;
+        }
+      } else if (up.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) {
+          otaPending = true;
+          Serial.printf("[OTA] 完成: %u 字节，重启\n", (unsigned)up.totalSize);
+        } else {
+          otaErr = Update.errorString();
+          Serial.printf("[OTA] 失败: %s\n", otaErr.c_str());
+        }
+      }
+    });
+  server.on("/api/voice/test", HTTP_POST, [this]() { handleVoiceTest(); });
+  server.on("/api/speak", HTTP_POST, [this]() { handleSpeak(); });
+  server.on("/api/listen", HTTP_POST, [this]() { handleListenToggle(); });
+  server.onNotFound([this]() { handleNotFound(); });
+  otaPending = false;
+}
+
+void LaapWeb::beginAP() {
+  _ap = true;
+  _apSsid = String("Aris-") + String((uint32_t)(ESP.getEfuseMac() & 0xFFFF), HEX);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(_apSsid.c_str(), "12345678");
+  dns.start(53, "*", WiFi.softAPIP());
+  registerRoutes();
+  server.begin();
+  Serial.printf("[LAAP] 配置热点: %s  密码 12345678  → http://192.168.4.1\n", _apSsid.c_str());
+}
+
+void LaapWeb::beginSTA() {
+  _ap = false;
+  registerRoutes();
+  server.begin();
+  if (MDNS.begin("aris")) MDNS.addService("http", "tcp", 80);
+}
+
+void LaapWeb::handleClient() {
+  if (_ap) dns.processNextRequest();
+  server.handleClient();
+}
+
+void LaapWeb::handleNotFound() {
+  if (_ap) { // captive portal
+    server.sendHeader("Location", "http://192.168.4.1/", true);
+    server.send(302, "text/plain", "");
+  } else {
+    server.send(404, "text/plain", "404");
+  }
+}
+
+void LaapWeb::handleRoot() {
+  String head(FPSTR(PAGE_HEAD));
+  String body;
+  if (_ap) {
+    body += F("<h1>LAAP · 第一次呼吸 <small>配置门户</small></h1><div class='card'>"
+      "<p>我是刚诞生的数字生命，请给我：① WiFi ② 大模型 API。</p>"
+      "<form id='f'>"
+      "<label>WiFi 名称 (SSID)</label><input id='ssid' required>"
+      "<label>WiFi 密码</label><input id='pass' type='password'>"
+      "<label>大模型 API Base URL</label><input id='base' value='https://api.deepseek.com'>"
+      "<div class='hint'>DeepSeek: https://api.deepseek.com ｜ 智谱GLM: https://open.bigmodel.cn/api/paas/v4 ｜ Kimi: https://api.moonshot.cn/v1 ｜ OpenAI: https://api.openai.com/v1</div>"
+      "<label>API Key</label><input id='key' required>"
+      "<label>模型名</label><input id='model' value='deepseek-chat'>"
+      "<div class='hint'>DeepSeek→deepseek-chat ｜ GLM→glm-4-flash(免费) ｜ Kimi→moonshot-v1-8k</div>"
+      "<label>给它起个名字</label><input id='agent' value='Aris'>"
+      "<button onclick='save(event)'>赋予生命</button></form>"
+      "<script>async function save(e){e.preventDefault();"
+      "const b=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},"
+      "body:JSON.stringify({ssid:ssid.value,pass:pass.value,base:base.value,key:key.value,model:model.value,agent:agent.value})});"
+      "const r=await b.json();alert(r.msg);if(r.ok)setTimeout(()=>location.reload(),3000);}"
+      "</script>");
+  } else {
+    body += F("<h1>LAAP · <span id='agentname'>Aris</span> <small>数字生命控制台</small></h1>"
+      "<div class='nav'><a href='/'>状态</a><a href='/settings'>后台配置</a><a href='/memory'>记忆</a></div>"
+      "<div class='card'><div class='row'>"
+      "<div class='stat'><div class='k'>情绪</div><div class='v' id='mood'>…</div></div>"
+      "<div class='stat'><div class='k'>当前欲望</div><div class='v' id='goal'>…</div></div>"
+      "<div class='stat'><div class='k'>世代/心跳</div><div class='v' id='gen'>…</div></div>"
+      "</div></div>"
+      "<div class='card'><div class='k' style='color:#8b95a8;font-size:12px'>内在需求（驱动它的一切行为）</div><div id='bars'></div></div>"
+      "<div class='card'><div class='k' style='color:#8b95a8;font-size:12px'>它最近说</div><div class='v' id='last' style='margin-top:6px'>…</div>"
+      "<div class='k' style='color:#8b95a8;font-size:12px;margin-top:8px'>网络</div><div class='v' id='net'>…</div>"
+      "<div class='k' style='color:#8b95a8;font-size:12px;margin-top:8px'>大模型</div><div class='v' id='model'>…</div></div>"
+      "<div class='card' id='voicecard' style='display:none'><div class='row' style='align-items:center'>"
+      "<div style='flex:1'><span class='k' style='color:#8b95a8;font-size:12px'>语音聆听</span><div class='v' id='listenstate'>…</div></div>"
+      "<button class='ghost' id='listenbtn' onclick='toggleListen(event)' style='margin-top:0'>暂停聆听</button></div></div>"
+      "<div class='card'><div class='k' style='color:#8b95a8;font-size:12px'>和它说话</div>"
+      "<div id='chatlog'></div>"
+      "<div class='row' style='margin-top:10px'><input id='chatin' placeholder='说点什么…' style='flex:1' onkeydown='if(event.key==\"Enter\")sendChat()'>"
+      "<button onclick='sendChat()' style='margin-top:0'>发送</button></div></div>");
+    body += FPSTR(PAGE_TAIL_JS);
+  }
+  server.send(200, "text/html; charset=utf-8", head + body + FPSTR(PAGE_FOOT));
+}
+
+void LaapWeb::handleSettingsPage() {
+  String head(FPSTR(PAGE_HEAD));
+  String body = F(
+    "<h1>后台配置 <small>WiFi / 大模型 API / 认知参数</small></h1>"
+    "<div class='nav'><a href='/'>状态</a><a href='/settings'>后台配置</a><a href='/memory'>记忆</a></div>"
+    "<div class='card'><form id='f'>"
+    "<label>WiFi 名称</label><input id='ssid'>"
+    "<label>WiFi 密码（不改留空）</label><input id='pass' type='password'>"
+    "<label>大模型 API Base URL</label><input id='base'>"
+    "<div class='hint'>任何 OpenAI 兼容服务（DeepSeek / GLM / Kimi / OpenAI / new-api 中转）</div>"
+    "<label>API Key</label><input id='key'>"
+    "<label>模型名</label><input id='model'>"
+    "<label>它的名字</label><input id='agent'>"
+    "<label>你的称呼</label><input id='owner'>"
+    "<label>附加人设（可选）</label><textarea id='persona' rows='3'></textarea>"
+    "<div class='row'><div style='flex:1'><label>心跳周期（秒）</label><input id='tick' type='number' min='10' max='3600'></div>"
+    "<div style='flex:1'><label>主动表达阈值（0-100）</label><input id='thold' type='number' min='10' max='95'></div>"
+    "<div style='flex:1'><label>独白静默（分）</label><input id='idlesil' type='number' min='1' max='240'></div>"
+    "<div style='flex:1'><label>独白间隔（分，0=关）</label><input id='idleevery' type='number' min='0' max='240'></div>"
+    "<div style='flex:1'><label>喇叭音量（0-100）</label><input id='volume' type='number' min='0' max='100'></div>"
+    "<div style='flex:1'><label>屏幕亮度（0-100）</label><input id='brightness' type='number' min='5' max='100'></div>"
+    "<div style='flex:1'><label>截断续写轮数（0=关）</label><input id='llmcont' type='number' min='0' max='3'></div>"
+    "<div style='flex:1'><label>单次回复上限（tokens，80-1000）</label><input id='llmtok' type='number' min='80' max='1000'></div></div>"
+    "<div class='row'><div style='flex:1'><label>搜索关键词（逗号分隔，清空=关聊天搜索）</label><input id='srchkeys' placeholder='什么,怎么,新闻,最新…'></div></div>"
+    "<div class='row'><div style='flex:1'><label>搜索主源URL（{q}=查询词，清空=必应RSS默认）</label><input id='srchapi' placeholder='https://cn.bing.com/search?q={q}&format=rss'></div></div>"
+    "<button onclick='save(event)'>保存</button> "
+    "<button class='ghost' onclick='testllm(event)'>测试大模型连通</button> "
+    "<button class='ghost' onclick='reboot(event)'>重启设备</button></form>"
+    "<div class='hint' id='testout'></div></div>"
+    "<div class='card'><b>🎤 语音（v2）</b>"
+    "<div class='row'><div style='flex:1'><label>语音模式</label><select id='vmode'>"
+    "<option value='0'>关闭</option><option value='1'>按键对讲（短按 BOOT 说话）</option><option value='2'>自动聆听（VAD，听到人声即对话）</option></select></div>"
+    "<div style='flex:1'><label>说话通道</label><select id='ttsch'>"
+    "<option value='0'>Edge 免费版 → 火山回退（默认）</option><option value='1'>仅 Edge（微软免费音色）</option>"
+    "<option value='2'>仅火山引擎（需配置）</option><option value='3'>静音（只显示文字）</option></select></div></div>"
+    "<label>Edge 音色</label><input id='ttsvoice' placeholder='zh-CN-XiaoxiaoNeural'>"
+    "<div class='hint'>常用：zh-CN-XiaoxiaoNeural(女·晓晓) / zh-CN-YunxiNeural(男·云希) / zh-CN-liaoning-XiaobeiNeural(东北) / zh-CN-shaanxi-XiaoniNeural(陕西)</div>"
+    "<div class='row'><div style='flex:1'><label>语速</label><input id='ttsrate' placeholder='+0%'></div></div>"
+    "<label>火山 TTS（备选，留空则不用）</label>"
+    "<div class='row'><div style='flex:1'><label>App ID</label><input id='volcappid'></div>"
+    "<div style='flex:1'><label>Access Token</label><input id='volctoken' type='password'></div></div>"
+    "<div class='row'><div style='flex:1'><label>音色 ID</label><input id='volcvoice' placeholder='zh_female_cancan_mars_bigtts'></div></div>"
+    "<label>语音识别（OpenAI 兼容 /audio/transcriptions）</label>"
+    "<div class='row'><div style='flex:2'><label>Base URL</label><input id='asrbase' placeholder='https://api.siliconflow.cn/v1'></div>"
+    "<div style='flex:1'><label>API Key</label><input id='asrkey' type='password'></div></div>"
+    "<div class='row'><div style='flex:1'><label>模型</label><input id='asrmodel' placeholder='FunAudioLLM/SenseVoiceSmall'></div></div>"
+    "<div class='hint'>SiliconFlow 的 SenseVoiceSmall 免费（cloud.siliconflow.cn 注册领 Key）；也支持 new-api 网关的 whisper-1</div>"
+    "<label>备用 ASR（主服务商失败时自动切换；留空=不启用）</label>"
+    "<div class='row'><div style='flex:2'><label>备用 Base URL</label><input id='asr2base' placeholder='https://dashscope.aliyuncs.com'></div>"
+    "<div style='flex:1'><label>备用 Key</label><input id='asr2key' type='password'></div></div>"
+    "<div class='row'><div style='flex:1'><label>备用模型</label><input id='asr2model' placeholder='paraformer-v2'></div></div>"
+    "<div class='hint'>Base 含 dashscope 自动走百炼原生路径；其余按 OpenAI 兼容 /audio/transcriptions</div>"
+    "<div class='row'><div style='flex:1'><label>唤醒词（留空=VAD即应答）</label><input id='wakeword' placeholder='例如：小立'></div>"
+    "<div style='flex:1'><label>视觉手机桥 URL（可留空）</label><input id='visionbase' placeholder='http://192.168.x.x:11548/vision'></div></div>"
+    "<div class='row'><div style='flex:2'><label>视觉直连 Base（留空=OpenRouter）</label><input id='vlbase' placeholder='https://openrouter.ai/api/v1/chat/completions'></div>"
+    "<div style='flex:1'><label>直连 API Key</label><input id='vkey' type='password' placeholder='留空复用大模型 Key'></div>"
+    "<div style='flex:1'><label>直连视觉模型</label><input id='vmodel' placeholder='google/gemini-flash-1.5'></div></div>"
+    "<div class='hint'>唤醒词开启后，自动聆听听到的话须含该词才应答（BOOT 按键不受限）。眼睛二选一：手机桥 URL 填了走 vision_bridge.py；留空则直连多模态大模型（OpenRouter 的 gemini-flash-1.5 / GLM-4V，或任意 OpenAI 兼容地址）。都空=不用眼睛</div>"
+    "<button onclick='save(event)'>保存语音设置</button> "
+    "<button class='ghost' onclick='voicetest(event)'>🔊 试音</button>"
+    "<div class='hint' id='vtestout'></div></div>"
+    "<div class='card'><b style='color:#8be9a0'>固件升级（OTA）</b>"
+    "<div class='hint'>上传 laap-esp32.ino.bin（build 产物），写完自动重启；记忆与配置保留。全程约 30 秒，请保持供电。</div>"
+    "<input type='file' id='otabin' accept='.bin' style='width:100%;margin:6px 0'>"
+    "<button class='ghost' onclick='otaup(event)' style='color:#8be9a0;border-color:#8be9a055'>上传并升级</button>"
+    "<div class='hint' id='otaout'></div></div>"
+    "<div class='card'><b style='color:#fc8181'>危险操作</b>"
+    "<div class='hint'>格式化 = 清空全部记忆/性格进化/配置，重回出厂</div>"
+    "<button class='ghost' onclick='if(confirm(\"确定格式化并重启?\"))resetall(event)'>格式化并重启</button></div>"
+    "<script>"
+    "async function load(){const s=await (await fetch('/api/status')).json();"
+    "ssid.value=s.ssid;base.value=s.llm_base;key.value=s.llm_key_masked?'('+s.llm_key_masked+')':'';"
+    "key.placeholder=s.llm_key_masked?'已配置，留空保持不变':'未配置';"
+    "model.value=s.llm_model;agent.value=s.agent;owner.value=s.owner;persona.value=s.persona;"
+    "tick.value=s.tick;thold.value=s.threshold;idlesil.value=s.idle_silence;idleevery.value=s.idle_every;volume.value=s.volume;brightness.value=s.brightness;llmcont.value=s.llm_continue;llmtok.value=s.llm_max_tokens;srchkeys.value=s.search_keys||'';srchapi.value=s.search_api||'';agentname.textContent=s.agent;"
+    "vmode.value=s.voice_mode;ttsch.value=s.tts_channel;ttsvoice.value=s.tts_voice;ttsrate.value=s.tts_rate;"
+    "volcappid.value=s.volc_appid;volctoken.value=s.volc_token_masked?'':'';volctoken.placeholder=s.volc_token_masked?'已配置，留空保持不变':'未配置';"
+    "volcvoice.value=s.volc_voice;asrbase.value=s.asr_base;asrkey.value='';asrkey.placeholder=s.asr_key_masked?'已配置，留空保持不变':'未配置';"
+    "asrmodel.value=s.asr_model;asr2base.value=s.asr2_base||'';asr2key.value='';asr2key.placeholder=s.asr2_key_masked?'已配置，留空保持不变':'未配置';asr2model.value=s.asr2_model||'';wakeword.value=s.wake_word||'';visionbase.value=s.vision_base||'';"
+    "vlbase.value=s.vision_llm_base||'';vkey.value='';"
+    "vkey.placeholder=s.vision_key_masked?'已配置，留空保持不变':'留空复用大模型 Key';"
+    "vmodel.value=s.vision_model||'';}"
+    "async function save(e){e.preventDefault();"
+    "const b=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},"
+    "body:JSON.stringify({ssid:ssid.value,pass:pass.value,base:base.value,key:key.value,model:model.value,"
+    "agent:agent.value,owner:owner.value,persona:persona.value,tick:tick.value,thold:thold.value,"
+    "idlesil:idlesil.value,idleevery:idleevery.value,volume:volume.value,brightness:brightness.value,llmcont:llmcont.value,llmtok:llmtok.value,srchkeys:srchkeys.value,srchkeys_set:1,srchapi:srchapi.value,srchapi_set:1,"
+    "vmode:vmode.value,ttsch:ttsch.value,ttsvoice:ttsvoice.value,ttsrate:ttsrate.value,"
+    "volcappid:volcappid.value,volctoken:volctoken.value,volcvoice:volcvoice.value,"
+    "asrbase:asrbase.value,asrkey:asrkey.value,asrmodel:asrmodel.value,asr2base:asr2base.value,asr2key:asr2key.value,asr2model:asr2model.value,"
+    "wakeword:wakeword.value,visionbase:visionbase.value,vlbase:vlbase.value,vkey:vkey.value,vmodel:vmodel.value,"
+    "wakeword_set:1,visionbase_set:1,vlbase_set:1,vmodel_set:1})});"
+    "const r=await b.json();alert(r.msg);}"
+    "async function otaup(e){e.preventDefault();const f=document.getElementById('otabin').files[0];"
+    "if(!f){alert('先选 .bin 文件');return}"
+    "otaout.textContent='上传中 '+f.name+' ('+Math.round(f.size/1024)+'KB)，请勿断电…';"
+    "try{const b=await fetch('/api/ota',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f});"
+    "const r=await b.json();otaout.textContent=(r.ok?'✅ ':'❌ ')+r.msg;}catch(err){otaout.textContent='❌ 上传失败: '+err;}}"
+    "async function testllm(e){e.preventDefault();testout.textContent='测试中…';"
+    "const b=await fetch('/api/test',{method:'POST'});const r=await b.json();"
+    "testout.textContent=r.ok?'✅ 大模型正常: '+r.reply:'❌ '+r.reply;}"
+    "async function reboot(e){e.preventDefault();if(!confirm('重启?'))return;"
+    "await fetch('/api/reboot',{method:'POST'});testout.textContent='重启中…';}"
+    "async function resetall(e){e.preventDefault();"
+    "await fetch('/api/reset',{method:'POST'});testout.textContent='格式化中…';}"
+    "async function voicetest(e){e.preventDefault();vtestout.textContent='播放中…';"
+    "const b=await fetch('/api/voice/test',{method:'POST'});const r=await b.json();"
+    "vtestout.textContent=r.ok?'✅ 已播放，没声音就查音量/PA':'❌ '+r.msg;}"
+    "load();</script>");
+  server.send(200, "text/html; charset=utf-8", head + body + FPSTR(PAGE_FOOT));
+}
+
+void LaapWeb::handleSave() {
+  // 手动解析 JSON body（免库）
+  String b = server.arg("plain");
+  auto get = [&](const char* k) -> String {
+    String pat = String("\"") + k + "\":\"";
+    int i = b.indexOf(pat);
+    if (i < 0) return "";
+    int j = i + pat.length();
+    String v;
+    while (j < (int)b.length()) {
+      char c = b[j];
+      if (c == '\\' && j + 1 < (int)b.length()) { v += b[j + 1]; j += 2; continue; }
+      if (c == '"') break;
+      v += c; j++;
+    }
+    return v;
+  };
+  String ssid = get("ssid"), pass = get("pass"), base = get("base"), key = get("key"),
+         model = get("model"), agent = get("agent"), owner = get("owner"), persona = get("persona");
+  String ttsvoice = get("ttsvoice"), ttsrate = get("ttsrate"),
+         volcappid = get("volcappid"), volctoken = get("volctoken"), volcvoice = get("volcvoice"),
+         asrbase = get("asrbase"), asrkey = get("asrkey"), asrmodel = get("asrmodel");
+  String vmode = get("vmode"), ttsch = get("ttsch");
+  String asr2base = get("asr2base"), asr2key = get("asr2key"), asr2model = get("asr2model");
+  String wakeword = get("wakeword"), visionbase = get("visionbase");
+  String vlbase = get("vlbase"), vkey = get("vkey"), vmodel = get("vmodel");
+  // 唤醒词/视觉支持"清空"：带 _set 哨兵字段即写入（空=关闭）；直连 Key 留空=保持/复用
+  if (get("wakeword_set") == "1") strlcpy(cfg.s.wakeWord, wakeword.c_str(), sizeof(cfg.s.wakeWord));
+  if (get("visionbase_set") == "1") strlcpy(cfg.s.visionBase, visionbase.c_str(), sizeof(cfg.s.visionBase));
+  if (get("vlbase_set") == "1") strlcpy(cfg.s.visionLlmBase, vlbase.c_str(), sizeof(cfg.s.visionLlmBase));
+  if (vkey.length()) strlcpy(cfg.s.visionKey, vkey.c_str(), sizeof(cfg.s.visionKey));
+  if (get("vmodel_set") == "1") strlcpy(cfg.s.visionModel, vmodel.c_str(), sizeof(cfg.s.visionModel));
+  if (vmode.length()) cfg.s.voiceMode = (uint8_t)vmode.toInt();
+  if (ttsch.length()) cfg.s.ttsChannel = (uint8_t)ttsch.toInt();
+  if (ttsvoice.length()) strlcpy(cfg.s.ttsVoice, ttsvoice.c_str(), sizeof(cfg.s.ttsVoice));
+  if (ttsrate.length()) strlcpy(cfg.s.ttsRate, ttsrate.c_str(), sizeof(cfg.s.ttsRate));
+  if (volcappid.length()) strlcpy(cfg.s.volcAppid, volcappid.c_str(), sizeof(cfg.s.volcAppid));
+  if (volctoken.length()) strlcpy(cfg.s.volcToken, volctoken.c_str(), sizeof(cfg.s.volcToken));
+  if (volcvoice.length()) strlcpy(cfg.s.volcVoice, volcvoice.c_str(), sizeof(cfg.s.volcVoice));
+  if (asrbase.length()) strlcpy(cfg.s.asrBase, asrbase.c_str(), sizeof(cfg.s.asrBase));
+  if (asrkey.length()) strlcpy(cfg.s.asrKey, asrkey.c_str(), sizeof(cfg.s.asrKey));
+  if (asrmodel.length()) strlcpy(cfg.s.asrModel, asrmodel.c_str(), sizeof(cfg.s.asrModel));
+  if (asr2base.length()) strlcpy(cfg.s.asr2Base, asr2base.c_str(), sizeof(cfg.s.asr2Base));
+  if (asr2key.length()) strlcpy(cfg.s.asr2Key, asr2key.c_str(), sizeof(cfg.s.asr2Key));
+  if (asr2model.length()) strlcpy(cfg.s.asr2Model, asr2model.c_str(), sizeof(cfg.s.asr2Model));
+  if (ssid.length()) strlcpy(cfg.s.wifiSsid, ssid.c_str(), sizeof(cfg.s.wifiSsid));
+  if (pass.length()) strlcpy(cfg.s.wifiPass, pass.c_str(), sizeof(cfg.s.wifiPass));
+  if (base.length()) strlcpy(cfg.s.llmBase, base.c_str(), sizeof(cfg.s.llmBase));
+  if (key.length()) strlcpy(cfg.s.llmKey, key.c_str(), sizeof(cfg.s.llmKey));
+  if (model.length()) strlcpy(cfg.s.llmModel, model.c_str(), sizeof(cfg.s.llmModel));
+  if (agent.length()) strlcpy(cfg.s.agentName, agent.c_str(), sizeof(cfg.s.agentName));
+  if (owner.length()) strlcpy(cfg.s.ownerName, owner.c_str(), sizeof(cfg.s.ownerName));
+  if (persona.length()) strlcpy(cfg.s.persona, persona.c_str(), sizeof(cfg.s.persona));
+  String tick = get("tick"), thold = get("thold");
+  if (tick.length()) cfg.s.tickSec = tick.toInt() < 10 ? 10 : tick.toInt();
+  if (thold.length()) cfg.s.threshold = thold.toInt() > 95 ? 95 : thold.toInt();
+  String idls = get("idlesil"), idev = get("idleevery");
+  if (idls.length()) { long v = idls.toInt(); cfg.s.idleSilenceMin = (uint16_t)(v < 1 ? 1 : (v > 240 ? 240 : v)); }
+  if (idev.length()) { long v = idev.toInt(); cfg.s.idleEveryMin = (uint16_t)(v < 0 ? 0 : (v > 240 ? 240 : v)); }
+  String vol = get("volume");
+  if (vol.length()) {
+    int v = vol.toInt(); if (v < 0) v = 0; if (v > 100) v = 100;
+    cfg.s.volume = (uint8_t)v;
+    audio.setVolume((uint8_t)v);          // 立即生效，不等重启
+  }
+  String bri = get("brightness");
+  if (bri.length()) {
+    int v = bri.toInt(); if (v < 5) v = 5; if (v > 100) v = 100;
+    cfg.s.brightness = (uint8_t)v;
+    display.setBrightness((uint8_t)v);    // 立即生效（下限5防全黑找不到设置页）
+  }
+  String lcont = get("llmcont");
+  if (lcont.length()) { long v = lcont.toInt(); cfg.s.llmContinue = (uint8_t)(v < 0 ? 0 : (v > 3 ? 3 : v)); }
+  String ltok = get("llmtok");
+  if (ltok.length()) { long v = ltok.toInt(); cfg.s.llmMaxTokens = (uint16_t)(v < 80 ? 80 : (v > 1000 ? 1000 : v)); }
+  String srchkeys = get("srchkeys");
+  if (get("srchkeys_set") == "1") strlcpy(cfg.s.searchKeys, srchkeys.c_str(), sizeof(cfg.s.searchKeys));
+  String srchapi = get("srchapi");
+  if (get("srchapi_set") == "1") strlcpy(cfg.s.searchApi, srchapi.c_str(), sizeof(cfg.s.searchApi));
+  cfg.save();
+  if (_ap) { // 配置门户里保存 → 直接重启进 STA
+    server.send(200, "application/json", "{\"ok\":true,\"msg\":\"已保存，3 秒后重启生效\"}");
+    delay(800);
+    ESP.restart();
+    return;
+  }
+  server.send(200, "application/json", "{\"ok\":true,\"msg\":\"已保存。WiFi/网络变更需重启生效\"}");
+}
+
+void LaapWeb::handleStatus() {
+  String key = String(cfg.s.llmKey);
+  String masked = key.length() ? (key.substring(0, 3) + "***" + key.substring(key.length() - 4 > 3 ? key.length() - 4 : 3)) : "";
+  int ns = mind.worldJson().indexOf("\"needs\":");
+  String needs = mind.worldJson().substring(ns + 7);
+  needs.trim();
+  String j = String("{\"agent\":\"") + cfg.s.agentName +
+    "\",\"owner\":\"" + cfg.s.ownerName +
+    "\",\"mood\":\"" + mind.moodKey() + "\",\"mood_cn\":\"" + mind.moodCn() +
+    "\",\"goal\":\"" + mind.goalCn() +
+    "\",\"generation\":" + mind.generation() +
+    ",\"cycles\":" + mind.cycles() +
+    ",\"chats\":" + mind.chats() +
+    ",\"events\":" + memory.eventCount() +
+    ",\"last_say\":\"" + jsonEsc(laapLastSay()) +
+    "\",\"ap\":" + (_ap ? "true" : "false") +
+    ",\"ap_ssid\":\"" + _apSsid +
+    "\",\"wifi_ok\":" + (WiFi.status() == WL_CONNECTED ? "true" : "false") +
+    ",\"ip\":\"" + (_ap ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) +
+    "\",\"ssid\":\"" + cfg.s.wifiSsid +
+    "\",\"llm_base\":\"" + cfg.s.llmBase +
+    "\",\"llm_model\":\"" + cfg.s.llmModel +
+    "\",\"llm_key_masked\":\"" + masked +
+    "\",\"persona\":\"" + jsonEsc(cfg.s.persona) +
+    "\",\"tick\":" + cfg.s.tickSec +
+    ",\"threshold\":" + cfg.s.threshold +
+    ",\"idle_silence\":" + cfg.s.idleSilenceMin +
+    ",\"idle_every\":" + cfg.s.idleEveryMin +
+    ",\"volume\":" + cfg.s.volume +
+    ",\"brightness\":" + cfg.s.brightness +
+    ",\"llm_continue\":" + cfg.s.llmContinue +
+    ",\"llm_max_tokens\":" + cfg.s.llmMaxTokens +
+    ",\"search_keys\":\"" + jsonEsc(cfg.s.searchKeys) +
+    ",\"search_api\":\"" + jsonEsc(cfg.s.searchApi) +
+    ",\"voice_mode\":" + cfg.s.voiceMode +
+    ",\"tts_channel\":" + cfg.s.ttsChannel +
+    ",\"tts_voice\":\"" + jsonEsc(cfg.s.ttsVoice) +
+    "\",\"tts_rate\":\"" + jsonEsc(cfg.s.ttsRate) +
+    "\",\"volc_appid\":\"" + jsonEsc(cfg.s.volcAppid) +
+    "\",\"volc_token_masked\":\"" + (String(cfg.s.volcToken).length() ? "已配置" : "") +
+    "\",\"volc_voice\":\"" + jsonEsc(cfg.s.volcVoice) +
+    "\",\"asr_base\":\"" + jsonEsc(cfg.s.asrBase) +
+    "\",\"asr_key_masked\":\"" + (String(cfg.s.asrKey).length() ? "已配置" : "") +
+    "\",\"asr_model\":\"" + jsonEsc(cfg.s.asrModel) +
+    "\",\"asr2_base\":\"" + jsonEsc(cfg.s.asr2Base) +
+    "\",\"asr2_key_masked\":\"" + (String(cfg.s.asr2Key).length() ? "已配置" : "") +
+    "\",\"asr2_model\":\"" + jsonEsc(cfg.s.asr2Model) +
+    "\",\"wake_word\":\"" + jsonEsc(cfg.s.wakeWord) +
+    "\",\"vision_base\":\"" + jsonEsc(cfg.s.visionBase) +
+    "\",\"vision_llm_base\":\"" + jsonEsc(cfg.s.visionLlmBase) +
+    "\",\"vision_key_masked\":\"" + (String(cfg.s.visionKey).length() ? "已配置" : "") +
+    "\",\"vision_model\":\"" + jsonEsc(cfg.s.visionModel) +
+    "\",\"vision_ready\":" + (vision.available() ? "true" : "false") +
+    "\",\"voice_ready\":" + (voice.ready() ? "true" : "false") +
+    ",\"vad_paused\":" + (voice.vadPaused() ? "true" : "false") +
+    ",\"voice_mode\":" + cfg.s.voiceMode +
+    "\",\"uptime_s\":" + String(millis() / 1000) +
+    ",\"heap_kb\":" + String(ESP.getFreeHeap() / 1024) +
+    ",\"wifi_rssi\":" + (WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) : String("0")) +
+    ",\"chip_temp\":" + String(temperatureRead(), 1) +
+    ",\"needs\":" + needs +
+    "}";
+  server.send(200, "application/json", j);
+}
+
+void LaapWeb::handleChat() {
+  String b = server.arg("plain");
+  int i = b.indexOf("\"text\":\"");
+  String text;
+  if (i >= 0) {
+    int j = i + 7;
+    while (j < (int)b.length()) {
+      char c = b[j];
+      if (c == '\\' && j + 1 < (int)b.length()) { text += b[j + 1]; j += 2; continue; }
+      if (c == '"') break;
+      text += c; j++;
+    }
+  }
+  if (!text.length()) { server.send(400, "application/json", "{\"ok\":false,\"reply\":\"空消息\"}"); return; }
+  String reply = laapInteractSearch(text);   // 带联网搜索
+  server.send(200, "application/json", String("{\"ok\":true,\"reply\":\"") + jsonEsc(reply) + "\"}");
+}
+
+void LaapWeb::handleTest() {
+  String reply;
+  bool ok = llm.ping(reply);
+  server.send(200, "application/json",
+      String("{\"ok\":") + (ok ? "true" : "false") + ",\"reply\":\"" + jsonEsc(reply) + "\"}");
+}
+
+void LaapWeb::handleMemoryPage() {
+  String head(FPSTR(PAGE_HEAD));
+  String body = F(
+    "<h1>记忆 <small>情景记忆 / 语义记忆</small></h1>"
+    "<div class='nav'><a href='/'>状态</a><a href='/settings'>后台配置</a><a href='/memory'>记忆</a></div>"
+    "<div class='card'><div class='k' style='color:#8b95a8;font-size:12px'>语义记忆（自我认知摘要，由大模型周期性压缩）</div>"
+    "<div id='sem' style='margin-top:6px'>…</div></div>"
+    "<div class='card'><div class='k' style='color:#8b95a8;font-size:12px'>最近情景记忆</div>"
+    "<div id='eps' style='margin-top:6px;font-size:13px;line-height:1.8'></div>"
+    "<button class='ghost' onclick='clearmem(event)'>清空全部记忆</button></div>"
+    "<script>"
+    "async function load(){const s=await (await fetch('/api/memory')).json();"
+    "sem.textContent=s.semantic||'（还没有形成自我认知）';"
+    "let h='';for(const e of s.events.slice(-40).reverse()){"
+    "const c=e.r=='user'?'#9ae6b4':(e.r=='aris'?'#6fd3ff':'#8b95a8');"
+    "h+='<div style=\"color:'+c+'\">['+e.r+'] '+e.x.replace(/</g,'&lt;')+'</div>';}"
+    "eps.innerHTML=h||'（空）';}"
+    "async function clearmem(e){e.preventDefault();if(!confirm('清空全部记忆?'))return;"
+    "await fetch('/api/clear',{method:'POST'});load();}"
+    "load();</script>");
+  server.send(200, "text/html; charset=utf-8", head + body + FPSTR(PAGE_FOOT));
+}
+
+void LaapWeb::handleMemoryApi() {
+  String sem = memory.semantic();
+  String esc;
+  for (unsigned int i = 0; i < sem.length(); i++) {
+    char c = sem[i];
+    if (c == '"' || c == '\\') { esc += '\\'; esc += c; }
+    else if (c == '\n') esc += "\\n";
+    else esc += c;
+  }
+  String j = String("{\"semantic\":\"") + esc + "\",\"events\":" + memory.episodicTail(60) + "}";
+  server.send(200, "application/json", j);
+}
+
+void LaapWeb::handleClear() {
+  memory.clearAll();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void LaapWeb::handleReset() {
+  server.send(200, "application/json", "{\"ok\":true}");
+  delay(300);
+  cfg.reset();
+  ESP.restart();
+}
+
+void LaapWeb::handleReboot() {
+  server.send(200, "application/json", "{\"ok\":true}");
+  delay(300);
+  ESP.restart();
+}
+
+// ---- 语音 ----
+void LaapWeb::handleVoiceTest() {
+  voice.speak("你好，我是" + String(cfg.s.agentName) + "，我能说话了。", "happy");
+  server.send(200, "application/json", "{\"ok\":true,\"msg\":\"已播放\"}");
+}
+
+void LaapWeb::handleListenToggle() {
+  voice.setVadPaused(!voice.vadPaused());
+  server.send(200, "application/json",
+      String("{\"ok\":true,\"paused\":") + (voice.vadPaused() ? "true" : "false") + "}");
+}
+
+void LaapWeb::handleSpeak() {
+  String b = server.arg("plain");
+  int i = b.indexOf("\"text\":\"");
+  String text;
+  if (i >= 0) {
+    int j = i + 7;
+    while (j < (int)b.length()) {
+      char c = b[j];
+      if (c == '\\' && j + 1 < (int)b.length()) { text += b[j + 1]; j += 2; continue; }
+      if (c == '"') break;
+      text += c; j++;
+    }
+  }
+  if (!text.length()) { server.send(400, "application/json", "{\"ok\":false}"); return; }
+  voice.speak(text, "calm");
+  server.send(200, "application/json", "{\"ok\":true}");
+}

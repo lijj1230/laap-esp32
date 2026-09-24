@@ -1,0 +1,8 @@
+# Arduino 编译产物
+build/
+
+# 16MB 整片镜像体积过大（可用 arduino-cli --merge 或 esptool 重新合并生成）
+firmware/*merged*.bin
+
+# 运行期临时文件
+*.log
