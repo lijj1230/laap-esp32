@@ -122,21 +122,21 @@ void LaapVoice::loopTick() {
   static uint32_t s_lastChatMs = 0;
   if (_busy) s_lastChatMs = millis();
   bool chatRecent = (s_lastChatMs != 0) && (millis() - s_lastChatMs < 300000);
-  if (vadMode && !_vadPaused && chatRecent && millis() >= _cooldownMs &&
+  if (vadMode && !_vadPaused && chatRecent && (int32_t)(millis() - _cooldownMs) >= 0 &&
       millis() - s_warmMs > 20000) {
     if (asr.warmAlive()) {
       s_warmMs = millis();                    // 热连接还活着：不重握手
     } else {
       s_warmMs = millis();
       if (xTaskCreate([](void*) { asr.warmup(); vTaskDelete(nullptr); },
-                      "asrwarm", 4096, nullptr, 1, nullptr) != pdPASS) {
+                      "asrwarm", 8192, nullptr, 1, nullptr) != pdPASS) {  // TLS 握手栈峰值 6KB+，4K 会溢出
         asr.warmup();                         // 建任务失败：退化为主线程预热
       }
     }
   }
   if (!vadMode) return;
   if (_vadPaused) { audio.recordTick(); return; }   // 暂停：只排水不触发
-  if (millis() < _cooldownMs) { audio.recordTick(); return; }
+  if ((int32_t)(millis() - _cooldownMs) < 0) { audio.recordTick(); return; }  // 回绕安全
   audio.recordTick();
   // 检测持续人声（>600ms 才开麦，避免误触发）
   if (audio.vadSpeaking()) {

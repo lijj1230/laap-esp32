@@ -117,6 +117,11 @@ bool LaapConfig::save() {
   return true;
 }
 
+// 轻量保存：只写信任值（心跳里周期调用，避免整盘 30+ 键重写磨损 NVS）
+void LaapConfig::saveTrust() {
+  prefs.putUChar("trust", (uint8_t)(laapTrust() * 255));
+}
+
 void LaapConfig::reset() {
   prefs.clear();
   memory.clearAll();

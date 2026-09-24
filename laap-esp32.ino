@@ -68,6 +68,7 @@ struct LlmRequest;
 bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
                const String& userText, uint8_t kind = 0);
 void arisIdleMonologue();
+String associativeRecall(const String& currentUserText, const String& preRecalled = "");
 String buildSystemPrompt();
 String buildUserPrompt(const String& userText, const String& trigger);
 void consolidateMemory();
@@ -136,6 +137,9 @@ static uint8_t g_llmFailStreak = 0;                   // LLM 连续失败次数�
 static String g_monoTopic, g_monoSight, g_monoKnow;   // 独白中间产物（收割侧落盘）
 
 // 独白流水线（跑在后台 LLM 任务里：出题→看一眼→搜索→成文，纯网络无 UI）
+static String g_monoCtx;    // 提交侧（loopTask）拍的上下文快照，llmTask 只读它
+static String g_monoSys;    // 同上：buildSystemPrompt 也读 mind 全量，提交侧拍好
+
 static LlmReply monologueGenerate() {
   g_monoTopic = g_monoSight = g_monoKnow = "";
   LlmMsg m1[2] = {
@@ -168,14 +172,17 @@ static LlmReply monologueGenerate() {
   Serial.printf("[LAAP·独白] 话题「%s」 搜「%s」:%s\n", g_monoTopic.c_str(), query.c_str(),
                 g_monoKnow.length() ? "OK" : laapSearch.lastError.c_str());
 
+  // recentContext 遍历 _work String 环——loopTask 的 logEvent 同时会覆写槽位，
+  // 并发读会拿悬垂缓冲。在 llmTask 里只读这份提交时拍好的快照（g_monoCtx）。
+  String ctx = g_monoCtx.length() ? g_monoCtx : String("（安静了很久）");
   LlmMsg m2[4] = {
-    {"system", buildSystemPrompt()},
+    {"system", g_monoSys},
     {"system", String("你独自思考时想到了一个问题：「") + g_monoTopic + "」。"
                + (g_monoSight.length() ? String("你刚才亲眼看到：「" + g_monoSight + "」。") : "")
                + String("刚从网上查到资料：") +
                (g_monoKnow.length() ? g_monoKnow : String("（没查到，凭已有认知聊）")) +
                "。把这个发现说给主人听，像分享趣闻，可以有具体数字或事实。"},
-    {"assistant", memory.recentContext(300).length() ? memory.recentContext(300) : String("（安静了很久）")},
+    {"assistant", ctx},
     {"user", "说说你的发现。"} };
   return llm.chatMsgs(m2, 4, cfg.s.llmMaxTokens < 80 ? 80 : cfg.s.llmMaxTokens, 0.95f);
 }
@@ -200,7 +207,7 @@ bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
                const String& userText, uint8_t kind) {
   if (g_llmBusy || !g_llmQueue) return false;
   LlmRequest* req = new LlmRequest();
-  req->nm = nm < 10 ? nm : 10;
+  req->nm = nm < 12 ? nm : 12;  // msgs[14] 容量内尽量保全（10 会截掉队尾当前 user 消息）
   for (int i = 0; i < req->nm; i++) req->msgs[i] = { msgs[i].role, msgs[i].content };
   req->maxTokens = maxTokens; req->temperature = temperature;
   req->userText = userText; req->kind = kind;
@@ -365,6 +372,9 @@ void arisIdleMonologue() {
     return;
   }
   LlmMsg m[1] = { {"user", ""} };
+  // 提交侧拍快照：llmTask 里不再遍历 _work String 环 / mind（与 logEvent 并发=悬垂指针）
+  g_monoCtx = memory.recentContext(300);
+  g_monoSys = buildSystemPrompt();
   if (llmSubmit(m, 1, 40, 0.95f, "", LK_MONO)) {
     display.drawFace("curious", true);    // 起意表情（后台思考中）
     Serial.println("[LAAP·独白] 起意（后台思考中）");
@@ -476,7 +486,8 @@ String buildSystemPrompt() {
 
 String buildUserPrompt(const String& userText, const String& trigger) {
   String ctx = memory.recentContext(500);
-  String recall = userText.length() ? memory.recallSmart(userText.substring(0, 12), 200) : "";
+  String recall = userText.length() ? memory.recallSmart(utf8Cut(userText, 12), 200) : "";
+  // 下面的 associativeRecall 复用同一份 recall（原实现再查一次 = 每条消息 2 次串行 embedding）
   String p = "[世界模型] " + mind.worldJson() + "\n";
   if (recall.length()) p += "[相关回忆] " + recall + "\n";
   if (ctx.length()) p += "[最近发生] " + ctx + "\n";
@@ -497,7 +508,7 @@ String buildUserPrompt(const String& userText, const String& trigger) {
   p += String("[状态提示] ") + hint[top] + "。";
   // F6 联想回忆：25% 概率让一段旧事漂进此刻（意识流）
   if (userText.length() && (esp_random() % 100) < 25) {
-    String assoc = associativeRecall(userText);
+    String assoc = associativeRecall(userText, recall);
     if (assoc.length() > 20)
       p += String("\n[忽然想起] ") + assoc + "\n（如果自然，可以提一句这段回忆）";
   }
@@ -536,11 +547,12 @@ void consolidateMemory() {
 //  F6 联想回忆：不是关键词检索，而是"情绪相近"的联想
 //  每次交互有 25% 概率抽一条旧事，在回复后由 LLM 织进去
 // ============================================================
-String associativeRecall(const String& currentUserText) {
-  // 智能回忆（Mem0 式）：语义向量优先，退关键词；被想起的记忆权重升级（越常想起越牢固）
-  String hit = memory.recallSmart(currentUserText.substring(0, 6), 300);
+// preRecalled 非空时直接复用 buildUserPrompt 已做的召回结果（省一次 embedding 网络往返）
+String associativeRecall(const String& currentUserText, const String& preRecalled) {
+  String hit = preRecalled;
+  if (!hit.length()) hit = memory.recallSmart(utf8Cut(currentUserText, 6), 300);
   if (hit.length()) {
-    memory.rememberBoost(currentUserText.substring(0, 6));
+    memory.rememberBoost(utf8Cut(currentUserText, 6));
     if (hit.length() < 240) return hit;
   }
   return memory.semantic().substring(0, 200);           // 兜底用自我认知
@@ -602,7 +614,16 @@ void psiTick() {
   if (mind.cycles() % 48 == 0 || millis() - g_lastConsumeMs > 4UL * 3600UL * 1000UL) {
     consolidateMemory();
   }
-  mind.saveEvolution();
+  // 性格进化落盘降频：周期数变化时才写（原来每 30s 全量写，每天 2880 次 flash 磨损）
+  static uint32_t s_savedCycle = 0;
+  if (mind.cycles() != s_savedCycle) { s_savedCycle = mind.cycles(); mind.saveEvolution(); }
+  // 小凌⑥: 信任值变化超 ±0.05 才落 NVS（原来只在 cfg.save() 时顺带写，重启回滚）
+  static float s_lastTrustSaved = -1;
+  if (s_lastTrustSaved < 0 || (mind.trust - s_lastTrustSaved > 0.05f) || (s_lastTrustSaved - mind.trust > 0.05f)) {
+    s_lastTrustSaved = mind.trust;
+    laapTrustSet(mind.trust);
+    cfg.saveTrust();
+  }
 }
 
 // ============================================================

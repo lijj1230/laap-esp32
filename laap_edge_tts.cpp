@@ -66,9 +66,14 @@ static uint8_t mp3StreamBuf[16 * 1024];  // MP3 帧最大 ~1.5KB，16KB 很宽�
 static size_t mp3StreamLen = 0;
 
 static void mp3StreamReset() { mp3StreamLen = 0; }
+static bool playMp3Stream();   // 前向声明：feedMp3 满时会先播腾空间
 
 static void feedMp3(const uint8_t* d, size_t n) {
-  if (mp3StreamLen + n > sizeof(mp3StreamBuf)) return;   // 满（正常不会：播得比收快）
+  if (mp3StreamLen + n > sizeof(mp3StreamBuf)) {
+    playMp3Stream();                                     // 满：先播掉腾空间（原整块丢弃=成段杂音）
+    if (mp3StreamLen + n > sizeof(mp3StreamBuf)) n = sizeof(mp3StreamBuf) - mp3StreamLen;  // 仍放不下：截尾保帧头
+  }
+  if (n == 0) return;
   memcpy(mp3StreamBuf + mp3StreamLen, d, n);
   mp3StreamLen += n;
 }
@@ -86,7 +91,8 @@ static bool playMp3Stream() {
     const uint8_t* p = mp3StreamBuf + pos + off;
     int bytesLeft = mp3StreamLen - pos - off;
     int r = MP3Decode(dec, (unsigned char**)&p, &bytesLeft, pcm, 0);
-    if (r != ERR_MP3_NONE) { pos += off + 1; continue; }
+    if (r == ERR_MP3_INDATA_UNDERFLOW || r == ERR_MP3_MAINDATA_UNDERFLOW) break;  // 帧跨网络分块未收全：留缓冲头等续块（原来扔掉=每 26ms 爆音）
+    if (r != ERR_MP3_NONE) { pos += off + 1; continue; }                // 真非法帧：跳过同步字
     int used = mp3StreamLen - pos - off - bytesLeft;
     pos += off + used;
     MP3FrameInfo fi;
@@ -155,12 +161,14 @@ bool EdgeTts::speak(const String& text, const String& voice, const String& rate,
   mp3StreamReset();
   audio.bargeInEnable(interruptible);
   bool audioRecv = false, turnEnd = false;
-  uint32_t deadline = millis() + 30000;
-  while (!turnEnd && millis() < deadline) {
+  uint32_t lastProgress = millis();          // 收到音频/文本就续期：30s 只限制"无进展空闲"
+  while (!turnEnd) {
+    if (millis() - lastProgress > 30000) { lastError = "30s 无进展超时"; break; }
     int fr = ws.poll(3000);
     if (fr < 0) { lastError = "连接中断"; break; }
     if (fr == 0) continue;
     if (fr == 1) {
+      lastProgress = millis();
       if (ws.textPayload().indexOf("Path:turn.end") >= 0) turnEnd = true;
     } else {
       const uint8_t* d = ws.binPayload();
@@ -170,6 +178,7 @@ bool EdgeTts::speak(const String& text, const String& voice, const String& rate,
       if (hdrLen + 2 > n) continue;
       feedMp3(d + hdrLen + 2, n - hdrLen - 2);
       if (playMp3Stream()) audioRecv = true;
+      lastProgress = millis();
       if (audio.interrupted()) break;
     }
   }

@@ -9,19 +9,30 @@ AsrClient asr;
 VolcTts volcTts;
 
 size_t wavWrap(const int16_t* pcm, size_t bytes, uint8_t* out, size_t outCap) {
+  // 标准 44 字节 WAV 头（RIFF/WAVE/fmt /data 四块齐全，小端）
   uint32_t sr = 16000, ch = 1, bits = 16;
   uint32_t dataLen = bytes;
   uint32_t byteRate = sr * ch * bits / 8;
-  uint32_t hdr[] = {0x46464952, 36 + dataLen, 0x45564120, 16, ch, sr, byteRate,
-                    ch * bits / 8, bits, dataLen, 0x61746164};
-  // 小端逐字段写入
-  size_t p = 0;
-  auto put32 = [&](uint32_t v) { if (p + 4 <= outCap) { memcpy(out + p, &v, 4); p += 4; } };
-  put32(hdr[0]); put32(hdr[1]); put32(hdr[2]); put32(hdr[3]); put32(hdr[4]);
-  put32(hdr[5]); put32(hdr[6]); put32(hdr[7]); put32(hdr[8]); put32(hdr[10]);
-  if (p + dataLen > outCap) dataLen = outCap - p;
-  memcpy(out + p, pcm, dataLen);
-  return p + dataLen;
+  uint8_t hdr[44] = {
+    'R','I','F','F', 0,0,0,0,        'W','A','V','E',   // +8 = 36+dataLen
+    'f','m','t',' ', 16,0,0,0,                          // fmt 块长 16
+    1,0,                   ch&0xFF,(ch>>8)&0xFF,        // PCM 格式、声道
+    (sr)&0xFF,(sr>>8)&0xFF,(sr>>16)&0xFF,(sr>>24)&0xFF, // 采样率
+    0,0,0,0,                                            // 字节率（下方填）
+    2,0, 16,0,                                          // 块对齐 ch*bits/8、位深
+    'd','a','t','a', 0,0,0,0,                           // data 块长（下方填）
+  };
+  auto put32 = [&](int off, uint32_t v) {
+    hdr[off] = v & 0xFF; hdr[off+1] = (v>>8)&0xFF; hdr[off+2] = (v>>16)&0xFF; hdr[off+3] = (v>>24)&0xFF;
+  };
+  put32(4, 36 + dataLen);
+  put32(16, byteRate);
+  put32(40, dataLen);
+  if (44 + dataLen > outCap) dataLen = (outCap > 44) ? outCap - 44 : 0;
+  put32(4, 36 + dataLen); put32(40, dataLen);          // 截断后重填两处长度
+  memcpy(out, hdr, 44);
+  if (dataLen) memcpy(out + 44, pcm, dataLen);
+  return 44 + dataLen;
 }
 
 // 通用 HTTPS POST，返回 HTTP 状态与响应体
@@ -31,8 +42,14 @@ static String g_warmHost;
 static int g_warmPort = 443;
 
 // 录音开始前调用：后台把 TLS 握手做完（小智"录传并行"思想的适配——握手最耗时且与录音无依赖）
+// 预热连接的互斥保护（asrwarm 任务与主线程 transcribe 并发访问 g_warm）
+static SemaphoreHandle_t g_warmMtx = nullptr;
+static void warmLock()   { if (!g_warmMtx) g_warmMtx = xSemaphoreCreateMutex(); xSemaphoreTake(g_warmMtx, portMAX_DELAY); }
+static void warmUnlock() { xSemaphoreGive(g_warmMtx); }
+
 void AsrClient::warmup() {
-  if (!WiFi.status() == WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED) return;   // 原 !x==y 优先级错恒 false
+  warmLock();
   String base(cfg.s.asrBase);
   while (base.endsWith("/")) base.remove(base.length() - 1);
   bool dash = base.indexOf("dashscope") >= 0;
@@ -49,13 +66,18 @@ void AsrClient::warmup() {
   (void)path;
   g_warmOk = false;
   g_warm.setTimeout(8);
+  g_warm.setInsecure();   // 缺这句 WiFiClientSecure 无证书配置 connect() 恒败（预热曾是死代码）
   if (g_warm.connect(g_warmHost.c_str(), g_warmPort)) g_warmOk = true;  // TLS 握手在此完成
+  warmUnlock();
 }
 
-static void warmupInvalidate() { g_warmOk = false; g_warm.stop(); }
+static void warmupInvalidate() { warmLock(); g_warmOk = false; g_warm.stop(); warmUnlock(); }
 
 bool AsrClient::warmAlive() {
-  return g_warmOk && g_warm.connected();
+  warmLock();
+  bool alive = g_warmOk && g_warm.connected();
+  warmUnlock();
+  return alive;
 }
 // 通用 HTTPS POST（warm=已握手的 ASR 预热连接，用后即失效），返回 HTTP 状态与响应体
 static int httpsPost(const String& url, const String& contentType, const uint8_t* body, size_t bodyLen,
@@ -95,8 +117,8 @@ static int httpsPost(const String& url, const String& contentType, const uint8_t
     sent += n;
   }
   String resp;
-  uint32_t dl = millis() + 40000;
-  while (c->connected() && millis() < dl) {
+  uint32_t t0ms = millis();
+  while (c->connected() && millis() - t0ms < 40000) {  // 差值比较：回绕安全
     while (c->available()) { resp += (char)c->read(); if (resp.length() > 200000) break; }
     if (resp.length() > 200000) break;
     delay(2);
@@ -197,9 +219,11 @@ String AsrClient::transcribe(const int16_t* pcm16k, size_t bytes, String& err) {
   size_t wavLen = wavWrap(pcm16k, bytes, wav, wavCap);
 
   String text;
+  warmLock();
   WiFiClient* warmConn = g_warmOk ? (WiFiClient*)&g_warm : nullptr;
   int code = transcribeOnce(cfg.s.asrBase, cfg.s.asrKey, cfg.s.asrModel, wav, wavLen, text, err, warmConn);
   if (g_warmOk) { g_warmOk = false; g_warm.stop(); }   // 热连接一次性（Connection: close）
+  warmUnlock();
   if (code != 200 && code != -1) {
     // 主 ASR 失败 → 备用 ASR 自动回退（配置了才试）
     Serial.printf("[ASR] 主服务商失败(%s)，尝试备用…\n", err.c_str());
@@ -226,6 +250,9 @@ bool VolcTts::speak(const String& text, String& err) {
   for (unsigned int i = 0; i < text.length(); i++) {
     char c = text[i];
     if (c == '"' || c == '\\') body += '\\';
+    else if (c == '\n') { body += "\\n"; continue; }   // 控制字符必须转义，否则请求体非法 JSON
+    else if (c == '\r') { continue; }
+    else if (c == '\t') { body += "\\t"; continue; }
     body += c;
   }
   body += "\",\"operation\":\"query\"}}";

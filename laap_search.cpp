@@ -1,4 +1,5 @@
 #include "laap_search.h"
+#include "laap_llm.h"   // utf8Cut
 #include "laap_config.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -8,6 +9,15 @@ LaapSearch laapSearch;
 void LaapSearch::begin() { _ok = true; }
 
 // ---------- 工具：剥 HTML 标签 + 常见实体 ----------
+// 先剥 CDATA 外壳（<![CDATA[内容]]> → 内容），防 htmlClean 把整段当标签吞掉
+static String cdataStrip(const String& s) {
+  int a = s.indexOf("<![CDATA[");
+  if (a < 0) return s;
+  int b = s.indexOf("]]>", a + 9);
+  if (b < 0) return s.substring(0, a);           // 残缺 CDATA：取壳外部分
+  return s.substring(0, a) + s.substring(a + 9, b) + cdataStrip(s.substring(b + 3));
+}
+
 static String htmlClean(const String& s) {
   String out; out.reserve(s.length() + 8);
   int i = 0;
@@ -184,7 +194,7 @@ String LaapSearch::searchBing(const String& q, int maxHit, int maxLen) {
     if (title.length() < 4 && snip.length() < 8) continue;
     String item = (title.length() && snip.length()) ? (title + "：" + snip)
                  : (title.length() ? title : snip);
-    if (item.length() > 220) item = item.substring(0, 220);
+    if (item.length() > 220) item = utf8Cut(item, 220);
     if (out.length()) out += "；";
     out += item;
     hit++;
@@ -239,15 +249,13 @@ String LaapSearch::searchRss(const String& q, int maxHit, int maxLen) {
     String blk = payload.substring(it + 6, ie);
     pos = ie + 7;
     // title/description 可能带 CDATA；实体由 htmlClean 兜底
-    String t = htmlClean(tagInner(blk, "title", 0));
-    String d = htmlClean(tagInner(blk, "description", 0));
-    t.replace("[CDATA[", ""); t.replace("]]", "");
-    d.replace("[CDATA[", ""); d.replace("]]", "");
+    String t = htmlClean(cdataStrip(tagInner(blk, "title", 0)));
+    String d = htmlClean(cdataStrip(tagInner(blk, "description", 0)));
     t.trim(); d.trim();
     String item = (t.length() && d.length()) ? (t + "：" + d)
                  : (t.length() ? t : d);
     if (item.length() < 8) continue;
-    if (item.length() > 220) item = item.substring(0, 220);
+    if (item.length() > 220) item = utf8Cut(item, 220);
     if (out.length()) out += "；";
     out += item;
     hit++;
@@ -316,15 +324,13 @@ String LaapSearch::searchCustom(const String& q, int maxHit, int maxLen) {
       if (ie < 0) break;
       String blk = payload.substring(it, ie);
       pos = ie + 7;
-      String t = htmlClean(tagInner(blk, "title", 0));
-      String d = htmlClean(tagInner(blk, "description", 0));
-      t.replace("[CDATA[", ""); t.replace("]]", "");
-      d.replace("[CDATA[", ""); d.replace("]]", "");
+      String t = htmlClean(cdataStrip(tagInner(blk, "title", 0)));
+      String d = htmlClean(cdataStrip(tagInner(blk, "description", 0)));
       t.trim(); d.trim();
       String item = (t.length() && d.length()) ? (t + "：" + d)
                    : (t.length() ? t : d);
       if (item.length() < 8) continue;
-      if (item.length() > 220) item = item.substring(0, 220);
+      if (item.length() > 220) item = utf8Cut(item, 220);
       if (out.length()) out += "；";
       out += item;
       hit++;
@@ -340,7 +346,7 @@ String LaapSearch::searchCustom(const String& q, int maxHit, int maxLen) {
       if (title.length() < 4 && snip.length() < 8) continue;
       String item = (title.length() && snip.length()) ? (title + "：" + snip)
                    : (title.length() ? title : snip);
-      if (item.length() > 220) item = item.substring(0, 220);
+      if (item.length() > 220) item = utf8Cut(item, 220);
       if (out.length()) out += "；";
       out += item;
       hit++;

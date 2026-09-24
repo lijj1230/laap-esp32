@@ -1,4 +1,5 @@
 #include "laap_memory.h"
+#include "laap_llm.h"   // utf8Cut
 #include <LittleFS.h>
 #include <time.h>
 #include <vector>
@@ -21,7 +22,16 @@ bool MemorySystem::begin() {
   // 向量缓存对齐条数（emb.bin 与 episodes.jsonl 行序一一对应）
   _embCount = 0; _embFail = 0;
   File ef = LittleFS.open(EMB_PATH, "r");
-  if (ef) { _embCount = ef.size() / (EMB_DIM * 4); ef.close(); }
+  if (ef) {
+    _embCount = ef.size() / (EMB_DIM * 4);
+    if (ef.size() % (EMB_DIM * 4) != 0) {       // 掉电残条：半条向量，作废重建
+      ef.close();
+      LittleFS.remove(EMB_PATH);
+      _embCount = 0;
+      return true;
+    }
+    ef.close();
+  }
   if (_embCount != (uint32_t)_count) {          // 行数不齐（淘汰/损坏）→ 缓存作废重嵌
     LittleFS.remove(EMB_PATH);
     _embCount = 0;
@@ -33,7 +43,8 @@ void MemorySystem::appendEpisodic(const char* role, const String& text) {
   File f = LittleFS.open(EP_PATH, "a");
   if (!f) return;
   time_t now = time(nullptr);
-  uint32_t t = (now > 1700000000) ? (uint32_t)now : (millis() / 1000);
+  // 时钟未同步时 t=0（区别于"开机后秒数"——那会被 decay 当成 5 万天前而最先淘汰）
+  uint32_t t = (now > 1700000000) ? (uint32_t)now : 0;
   // JSON 行，手动转义；w=重要度权重（Mem0 式分层：新记忆 1.0 起步）
   String esc; esc.reserve(text.length() + 8);
   for (unsigned int i = 0; i < text.length(); i++) {
@@ -76,7 +87,7 @@ void MemorySystem::rewriteEpisodicByScore() {
       float ageDay = (now - t) / 86400.0f;
       if (ageDay < 0) ageDay = 0;
       fresh = 1.0f / (1.0f + ageDay);             // 当天≈1，一周≈0.13
-    } else fresh = 0.5f;                          // 无时钟：一视同仁
+    } else fresh = 0.5f;                          // 无时钟（t==0 或本机无钟）：一视同仁
     lines.push_back({l, w * 0.7f + fresh * 0.3f});
   }
   in.close();
@@ -90,17 +101,23 @@ void MemorySystem::rewriteEpisodicByScore() {
     lines[worst].score = 999;                     // 标记淘汰
     lines[worst].line = "";
   }
-  File out = LittleFS.open(EP_PATH, "w");
+  // 原子重写：先写临时文件再 rename，掉电不会丢整个记忆文件
+  File out = LittleFS.open("/mem/episodes.tmp", "w");
   if (!out) return;
   for (auto& r : lines) if (r.line.length()) out.println(r.line);
   out.close();
+  LittleFS.remove(EP_PATH);
+  LittleFS.rename("/mem/episodes.tmp", EP_PATH);
   _count = EP_MAX;
+  // 淘汰改变了行序 → 向量缓存整份作废（错位召回比没召回更糟），embedTick 会重建
+  LittleFS.remove(EMB_PATH);
+  _embCount = 0;
 }
 
 void MemorySystem::logEvent(const char* role, const String& text) {
   // 工作记忆（环）：截断单条长度；String operator= 容量足够时复用已有缓冲，不反复碎片化
   String tmp = String(role) + ":" + text;
-  if (tmp.length() > 160) tmp = tmp.substring(0, 160);
+  if (tmp.length() > 160) tmp = utf8Cut(tmp, 160);
   if (_work[_workHead].length() == 0) _work[_workHead].reserve(176); // 首次预留，之后容量常驻
   _work[_workHead] = tmp;
   _workHead = (_workHead + 1) % WORK_MAX;
@@ -129,7 +146,7 @@ int MemorySystem::recentTurns(String* out, int max) const {
     if (!isUser && !isAris) continue;
     // 独白也进对话轮：用户问"你刚才在想什么"要能接上（v3.12 前"【自发】"被排除，问必茫然）
     out[n] = e.substring(e.indexOf(':') + 1);
-    if (out[n].length() > 160) out[n] = out[n].substring(0, 160);
+    if (out[n].length() > 160) out[n] = utf8Cut(out[n], 160);
     n++;
   }
   // out 现在是近→远；翻转为远→近（对话时序）
@@ -169,7 +186,12 @@ static bool callEmbedding(const String& text, float* out) {
 }
 
 void MemorySystem::embedTick() {
-  if (_embFail >= 3) return;
+  if (_embFail >= 3) {
+    // 熔断后不永久装死：每 5 分钟放行一次试探，成功路径会把 _embFail 清零（自愈）
+    static uint32_t s_probeMs = 0;
+    if (millis() - s_probeMs < 300000) return;
+    s_probeMs = millis();
+  }
   if (millis() - _embLastMs < 15000) return;              // 限速：15s 一条
   // 有未对齐的新行才干活
   File f = LittleFS.open(EP_PATH, "r");
@@ -188,10 +210,20 @@ void MemorySystem::embedTick() {
     if (line.length() && ++lineno == (int)_embCount + 1) break;
   }
   f.close();
-  if (!line.length()) { _embCount = total; return; }      // 行数对不齐（淘汰发生过）→ 跳过本轮
+  if (!line.length()) {
+    // 行数对不齐（淘汰/掉电残行发生过）→ 缓存作废重建，绝不带着错位继续
+    LittleFS.remove(EMB_PATH);
+    _embCount = 0;
+    return;
+  }
   // 抽 x 字段文本
   int xp = line.indexOf("\"x\":\"");
-  if (xp < 0) { _embCount++; return; }
+  if (xp < 0) {
+    // 非记忆行（无正文）：向量缓存与行序已脱钩，整份作废重建（原来 _embCount++ 会错位）
+    LittleFS.remove(EMB_PATH);
+    _embCount = 0;
+    return;
+  }
   int xe = line.length() - 3;                              // "}\n 尾
   String text = line.substring(xp + 5, xe > xp + 5 ? xe : xp + 5);
 
@@ -327,7 +359,7 @@ String MemorySystem::semantic() const {
   if (!f) return "";
   String s = f.readString();
   f.close();
-  if (s.length() > 400) s = s.substring(0, 400);
+  if (s.length() > 400) s = utf8Cut(s, 400);
   return s;
 }
 
@@ -362,5 +394,7 @@ void MemorySystem::clearAll() {
   LittleFS.remove(EP_PATH);
   LittleFS.remove("/mem/semantic.txt");
   LittleFS.remove("/evolution.json");
+  LittleFS.remove(EMB_PATH);              // 向量缓存一并清，否则旧向量错配新记忆
   _count = 0; _workLen = 0; _workHead = 0;
+  _embCount = 0; _embFail = 0;
 }

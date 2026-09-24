@@ -29,7 +29,11 @@ bool toolMatchSentence(const VoiceTool& t, const String& text, ToolMatch& m) {
   }
   m.hasValue = digits.length() > 0;
   if (m.hasValue) { m.value = digits.toInt(); act = true; }
-  m.up = text.indexOf("大") >= 0 || text.indexOf("亮") >= 0 || text.indexOf("高") >= 0;
+  // 方向判定：抱怨句式"太X了"（太大/太亮/太高/太响…）意图是调小/调暗，
+  // 但触发词本身含"大/亮/高"会被下面的增量词误判成向上——抱怨词优先反转为向下。
+  bool complain = text.indexOf("太") >= 0 || text.indexOf("好吵") >= 0 || text.indexOf("刺眼") >= 0;
+  bool upWord = text.indexOf("大") >= 0 || text.indexOf("亮") >= 0 || text.indexOf("高") >= 0;
+  m.up = complain ? false : upWord;   // "大点声/调大"原语义不变；"太大了"改为向下
   m.fine = text.indexOf("一点") >= 0 || text.indexOf("一些") >= 0 || text.indexOf("稍微") >= 0;
   m.extreme = containsAny(text, t.actions, 8) &&
               (text.indexOf("最大") >= 0 || text.indexOf("最亮") >= 0);

@@ -45,4 +45,7 @@ private:
   String buildUrl() const;
 };
 
+// UTF-8 安全截断（laap_llm.cpp 实现，全局可用）：len 字节上限处回退到字符边界
+String utf8Cut(const String& s, int len);
+
 extern LlmClient llm;

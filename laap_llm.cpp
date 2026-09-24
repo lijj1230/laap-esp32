@@ -122,8 +122,8 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
 
   // 读响应
   String resp; resp.reserve(4096);
-  uint32_t deadline = millis() + 30000;
-  while (client->connected() && millis() < deadline) {
+  uint32_t t0ms = millis();
+  while (client->connected() && millis() - t0ms < 30000) {  // 差值比较：49.7 天回绕安全
     while (client->available()) {
       resp += (char)client->read();
       if (resp.length() > 40000) break;
@@ -198,10 +198,10 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
     }
   }
 
-  if (r.say.length() > 240) r.say = r.say.substring(0, 240);  // 续写拼接后放宽上限（120 会砍掉续段）
+  if (r.say.length() > 240) r.say = utf8Cut(r.say, 240);      // 续写拼接后放宽上限（回退到 UTF-8 边界）
   r.ok = true;
   lastError = "";
-  (void)t0;
+  // 回绕改造后无起始时刻需要
   return r;
 }
 
@@ -209,6 +209,14 @@ bool LlmClient::ping(String& reply) {
   LlmReply r = chat("你是测试助手。只回复两个字：正常", "ping", 16, 0.1f);
   reply = r.ok ? r.say : lastError;
   return r.ok;
+}
+
+// UTF-8 安全截断：len 字节上限处回退到字符边界（不切碎中文）
+String utf8Cut(const String& s, int len) {
+  if ((int)s.length() <= len) return s;
+  int cut = len;
+  while (cut > 0 && (s[cut] & 0xC0) == 0x80) cut--;   // 落在续字节上→退到首字节
+  return s.substring(0, cut);
 }
 
 // ================= 语义向量：硅基流动 bge-m3（记忆智能召回用） =================
@@ -252,7 +260,25 @@ String laapEmbed(const String& text, bool& ok) {
   String payload = bs > 0 ? resp.substring(bs + 4) : "";
   if (code != 200) return "";
 
-  // 解析 "embedding":[0.123,-0.456,...]（1024 个浮点）——chunked 已随去块头变纯 JSON
+  // chunked 块头去掉（与 chat 路径同法：纯十六进制行删）。原实现漏了这步，
+  // 块大小行的 hex 字母会让下面的解析游标卡死 → llmTask 死循环 → 看门狗复位
+  if (payload.indexOf('{') < 0 || payload.indexOf('\n') >= 0) {
+    String clean; int pos = 0;
+    while (pos < (int)payload.length()) {
+      int nl = payload.indexOf('\n', pos);
+      String line = (nl < 0) ? payload.substring(pos) : payload.substring(pos, nl);
+      line.trim();
+      bool allHex = line.length() > 0;
+      for (unsigned int ci = 0; ci < line.length() && allHex; ci++)
+        if (!isHexadecimalDigit(line[ci])) allHex = false;
+      if (!allHex) clean += line;
+      if (nl < 0) break;
+      pos = nl + 1;
+    }
+    payload = clean;
+  }
+
+  // 解析 "embedding":[0.123,-0.456,...]（1024 个浮点）
   int epos = payload.indexOf("\"embedding\"");
   if (epos < 0) return "";
   int lb = payload.indexOf('[', epos);
@@ -275,7 +301,9 @@ String laapEmbed(const String& text, bool& ok) {
       for (int b = 0; b < 4; b++) bin += pc[b];
       n++;
     }
-    while (i < rb && (payload[i] == ',' || payload[i] == ' ')) i++;
+    int before = i;                                   // 死循环保险：本轮游标必须前进
+    while (i < rb && (payload[i] == ',' || payload[i] == ' ' || payload[i] == '\r' || payload[i] == '\n')) i++;
+    if (i == before && k == 0) i++;                   // 未知字符也前进，绝不原地打转
   }
   if (n != EMB_DIM_L) return "";
   ok = true;

@@ -11,7 +11,7 @@ static String wsKey() {
 }
 
 bool WsClient::connect(const char* host, int port, const char* path, const char* extraHeaders, uint32_t timeoutMs) {
-  _tls = (port == 443);
+  _tls = (port == 443 || port == 8443 || port == 2053 || port == 2087 || port == 2096);  // 常见 TLS 端口
   if (_tls) {
     _secure.setInsecure();
     _secure.setTimeout(timeoutMs / 1000 + 1);
@@ -110,16 +110,31 @@ int WsClient::poll(uint32_t timeoutMs) {
       uint8_t opcode = h0 & 0x0F;
       bool masked = h1 & 0x80;
       uint64_t len = h1 & 0x7F;
+      auto waitBytes = [&](int need) -> bool {
+        uint32_t wt = millis();
+        while (_nc->available() < need) {
+          if (millis() - wt > 3000 || !_nc->connected()) { lastError = "帧头超时"; stop(); return false; }
+          delay(1);
+        }
+        return true;
+      };
       if (len == 126) {
-        while (_nc->available() < 2) delay(1);
+        if (!waitBytes(2)) return -1;
         len = (_nc->read() << 8) | _nc->read();
       } else if (len == 127) {
-        while (_nc->available() < 8) delay(1);
+        if (!waitBytes(8)) return -1;
         len = 0;
         for (int i = 0; i < 8; i++) len = (len << 8) | _nc->read();
       }
       uint8_t mask[4] = {0};
-      if (masked) { while (_nc->available() < 4) delay(1); for (int i = 0; i < 4; i++) mask[i] = _nc->read(); }
+      if (masked) {
+        uint32_t mt = millis();
+        while (_nc->available() < 4) {           // 半开连接防线：等掩码也要有超时
+          if (millis() - mt > 3000 || !_nc->connected()) { lastError = "帧掩码超时"; stop(); return -1; }
+          delay(1);
+        }
+        for (int i = 0; i < 4; i++) mask[i] = _nc->read();
+      }
       if (len > 6 * 1024 * 1024) { lastError = "帧过大"; return -1; }
       if (opcode == 0x8) { stop(); return -1; }               // close
       if (opcode == 0x9) {                                     // ping → pong
