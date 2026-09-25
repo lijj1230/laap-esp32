@@ -79,9 +79,12 @@ static void feedMp3(const uint8_t* d, size_t n) {
 }
 
 // 把缓冲里所有完整帧解码播掉；半帧残余留在缓冲头等下一块
+// 解码器全局持久化：MP3 位池跨帧引用前帧数据，每调用重建丢状态→后续帧解码失败/爆音
+static HMP3Decoder s_mp3Dec = nullptr;
+static uint32_t s_playedSamps = 0;   // 本次 speak 累计播放样本数（诊断）
 static bool playMp3Stream() {
-  HMP3Decoder dec = MP3InitDecoder();
-  if (!dec) return false;
+  if (!s_mp3Dec) { s_mp3Dec = MP3InitDecoder(); if (!s_mp3Dec) return false; }
+  HMP3Decoder dec = s_mp3Dec;
   static int16_t pcm[2 * 1152];
   bool any = false;
   int pos = 0;
@@ -100,11 +103,11 @@ static bool playMp3Stream() {
     size_t samples = fi.outputSamps;
     if (samples > 0) {
       audio.playPcm(pcm, samples, fi.samprate ? fi.samprate : 24000);
+      s_playedSamps += samples;
       any = true;
     }
     if (audio.interrupted()) break;
   }
-  MP3FreeDecoder(dec);
   if (pos > 0) {
     if (mp3StreamLen > (size_t)pos) memmove(mp3StreamBuf, mp3StreamBuf + pos, mp3StreamLen - pos);
     mp3StreamLen -= pos;
@@ -159,6 +162,7 @@ bool EdgeTts::speak(const String& text, const String& voice, const String& rate,
 
   // 收音频：流式——到一个块喂一块，喂后立刻解码播放（首帧 ~100ms 出声，小智式流水线）
   mp3StreamReset();
+  s_playedSamps = 0;
   audio.bargeInEnable(interruptible);
   bool audioRecv = false, turnEnd = false;
   uint32_t lastProgress = millis();          // 收到音频/文本就续期：30s 只限制"无进展空闲"
@@ -183,6 +187,7 @@ bool EdgeTts::speak(const String& text, const String& voice, const String& rate,
     }
   }
   ws.stop();
+  Serial.printf("[TTS] 播放 %.1f 秒音频（%u 样本）\n", s_playedSamps / 24000.0, s_playedSamps);
   if (!audioRecv) { lastError = lastError.length() ? lastError : "未收到音频"; return false; }
   if (audio.interrupted()) return true;      // 被打断：算成功（说了半截）
   mp3StreamFlush();

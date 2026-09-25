@@ -11,7 +11,8 @@ class EdgeTts {
 public:
   // text: 要说的话 voice: 如 zh-CN-XiaoxiaoNeural rate: "+0%"
   // 成功播放返回 true。interruptible: 播放期间允许能量门打断
-  bool speak(const String& text, const String& voice, const String& rate, bool interruptible = true);
+  // 默认 false：泄漏基线 ×1.9 的能量门会被语音自身的动态范围误触发，把 TTS 砍成"无声成功"
+  bool speak(const String& text, const String& voice, const String& rate, bool interruptible = false);
   String lastError;
 };
 

@@ -86,13 +86,19 @@ bool LaapAudio::begin() {
 
 void LaapAudio::paSet(bool on) {
   // PCA9557 读-改-写 bit1(PA_EN)，保持 bit0(LCD_CS)=0
+  // 幂等提速：已在目标态直接返回——逐帧流式播放时每帧 30ms 延时会拖到 0.6x 实时
+  static bool s_paOn = false;
+  if (s_paOn == on) return;
   Wire.beginTransmission(0x19); Wire.write(0x01);
   if (Wire.endTransmission(false) != 0) return;
   uint8_t cur = 0;
   if (Wire.requestFrom((int)0x19, 1) == 1) cur = Wire.read();
   uint8_t nv = on ? (cur | 0x02) : (cur & ~0x02);
   Wire.beginTransmission(0x19); Wire.write(0x01); Wire.write(nv);
-  Wire.endTransmission();
+  if (Wire.endTransmission() == 0) {
+    s_paOn = on;
+    if (on) delay(30);   // 仅在关→开沿起振等待一次
+  }
 }
 
 void LaapAudio::setVolume(uint8_t v) {
@@ -165,8 +171,7 @@ bool LaapAudio::playPcm(const int16_t* data, size_t samples, uint32_t rate,
                         bool (*interruptCb)(void*), void* ctx) {
   if (!spkOk) return false;
   _interrupted = false;
-  paSet(true);
-  delay(30); // PA 起振
+  paSet(true);               // 起振等待已内置在 paSet 的开沿（逐帧流播不再每帧空转 30ms）
 
   static int16_t out[2 * 480];   // 480 输出样本对(10ms@48k)
   double step = (double)rate / AUD_I2S_RATE;
