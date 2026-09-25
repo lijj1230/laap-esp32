@@ -64,15 +64,36 @@ void LaapDisplay::fillCircle(int cx, int cy, int r, uint16_t c) {
   }
 }
 
+// ST7789 完整厂商上电序列（小智/BSP 同款）：精简序列喂不醒冷态屏幕时，
+// 电源(PWRCTRL/VCOM)/伽马/门驱动这些寄存器是必需的——实测冷启动黑屏的根治项
+void LaapDisplay::vendorInit() {
+  lcdCmd(0xEF); { uint8_t d[] = {0x03, 0x80, 0x02}; lcdData(d, 3); }
+  lcdCmd(0xCF); { uint8_t d[] = {0x00, 0xC1, 0x30}; lcdData(d, 3); }
+  lcdCmd(0xED); { uint8_t d[] = {0x64, 0x03, 0x12, 0x81}; lcdData(d, 4); }
+  lcdCmd(0xE8); { uint8_t d[] = {0x85, 0x00, 0x78}; lcdData(d, 3); }
+  lcdCmd(0xCB); { uint8_t d[] = {0x39, 0x2C, 0x00, 0x34, 0x02}; lcdData(d, 5); }
+  lcdCmd(0xF7); { uint8_t d[] = {0x20}; lcdData(d, 1); }
+  lcdCmd(0xEA); { uint8_t d[] = {0x00, 0x00}; lcdData(d, 2); }
+  lcdCmd(0xC0); { uint8_t d[] = {0x11}; lcdData(d, 1); }   // VRH
+  lcdCmd(0xC1); { uint8_t d[] = {0x20}; lcdData(d, 1); }   // Power ctrl 2
+  lcdCmd(0xC5); { uint8_t d[] = {0xA0, 0x3C}; lcdData(d, 2); } // VCOM
+  lcdCmd(0xC7); { uint8_t d[] = {0xB1}; lcdData(d, 1); }   // VCOMH
+  lcdCmd(0xB1); { uint8_t d[] = {0x00, 0x1A}; lcdData(d, 2); } // 帧率
+  lcdCmd(0xB6); { uint8_t d[] = {0x0A, 0xA2}; lcdData(d, 2); } // Display function
+  lcdCmd(0x26); { uint8_t d[] = {0x01}; lcdData(d, 1); }   // Gamma set
+  lcdCmd(0xE0); { uint8_t d[] = {0x0F,0x1A,0x0F,0x18,0x2F,0x28,0x20,0x22,0x1F,0x1B,0x23,0x37,0x00,0x07,0x02,0x10}; lcdData(d, 16); }
+  lcdCmd(0xE1); { uint8_t d[] = {0x0F,0x1B,0x0F,0x17,0x33,0x2C,0x29,0x2E,0x30,0x30,0x39,0x3F,0x00,0x07,0x03,0x10}; lcdData(d, 16); }
+}
+
 void LaapDisplay::begin() {
   // I2C 先行：把 PCA9557 的 LCD_CS(bit0) 拉低永久选中
   Wire.begin(SZP_I2C_SDA, SZP_I2C_SCL, 400000);
-  pca9557Write(0x03, 0xFC); // bit0(LCD_CS)/bit1(PA_EN) 输出，其余输入
-  pca9557Write(0x01, 0x00); // LCD_CS=0 选中, PA_EN=0
+  pca9557Write(0x03, 0xF8); // 低3位输出（xiaozhi BSP 同款）：bit0=LCD_CS bit1=PA_EN bit2=摄像头PWDN
+  pca9557Write(0x01, 0x03); // LCD_CS=0 选中, PA_EN=1 功放使能（原 0x00 把功放关了）
 
   pinMode(SZP_LCD_DC, OUTPUT);
   pinMode(SZP_LCD_BL, OUTPUT);
-  digitalWrite(SZP_LCD_BL, HIGH);      // 先拉满背光：让"软件活着"永远可见（亮度值稍后由 setup 应用）
+  digitalWrite(SZP_LCD_BL, LOW);       // 实战派背光反相（低=最亮，xiaozhi BSP: BACKLIGHT_OUTPUT_INVERT true）
   SPI.begin(SZP_LCD_CLK, -1, SZP_LCD_MOSI, -1);
 
   // ST7789 上电时序鲁棒化：某些上电瞬间（3V3 爬升慢/USB 供电抖动）芯片停在半睡眠，
@@ -81,6 +102,7 @@ void LaapDisplay::begin() {
   delay(200);                          // 数据手册要求 120ms，留裕量
   lcdCmd(0x11); // SLPOUT
   delay(150);                          // 数据手册要求 120ms，留裕量
+  vendorInit();                        // 冷态屏必需：电源/伽马/门驱动完整序列
   lcdCmd(0x3A); uint8_t m = 0x55; lcdData(&m, 1); // 16bit
   lcdCmd(0x36); m = 0x60; lcdData(&m, 1);         // MADCTL: MV|MX 横屏(官方同款)
   lcdCmd(0x21); // INVON 反色(官方同款)
@@ -95,7 +117,9 @@ void LaapDisplay::begin() {
 
 void LaapDisplay::setBrightness(uint8_t pct) {
   brightness = pct;
-  analogWrite(SZP_LCD_BL, (int)(255 * pct / 100));
+  // 实战派背光低电平点亮（反相）：亮度 pct 越大占空越小
+  int duty = 255 - (int)(255 * pct / 100);
+  analogWrite(SZP_LCD_BL, duty);
 }
 
 // ================= 表情：眼睛 =================

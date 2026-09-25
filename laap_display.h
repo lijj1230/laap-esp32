@@ -54,6 +54,7 @@ private:
   void fillRect(int x, int y, int w, int h, uint16_t c);
   void fillCircle(int cx, int cy, int r, uint16_t c);
   void pca9557Write(uint8_t reg, uint8_t val);
+  void vendorInit();   // ST7789 完整厂商上电序列（冷态屏必需）
   // ---- UI helpers ----
   void drawEye(int cx, int cy, int rx, int ry, int pupDx, int pupDy, int browY);
   void draw7seg(int x, int y, char ch, uint16_t c);
