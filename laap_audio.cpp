@@ -214,15 +214,10 @@ bool LaapAudio::playPcm(const int16_t* data, size_t samples, uint32_t rate,
   }
   // PA 不再逐块关断：流式播放每 24ms 一块，逐块开关会让功放永远停在启动瞬态（无声根因）。
   // 改为保持开启，静默 400ms 后由 paTick() 关闭。
+  // 注意：这里绝不能"排空麦克风"——I2SClass::available() 返回常量而非真实字节数，
+  // 逐帧排水会让每个 24ms 音频块阻塞数百毫秒（卡顿根因，2026-09-26 实测回归）。
+  // 播放期间不读 RX：FIFO 溢出丢数据无害，陈旧回声由 speak 后的 1200ms 冷却期兜住。
   _paOffMs = millis() + 400;
-  // 播放期间未吸麦克风（barge-in 关闭时）→ 排空 RX 积压，避免陈旧回声在恢复聆听时误触发 VAD
-  if (!_bargeEn) {
-    static int16_t junk[256];
-    int guard = 0;
-    while (i2s.available() > 0 && guard++ < 64) {
-      if (i2s.readBytes((char*)junk, min((size_t)i2s.available(), sizeof(junk))) <= 0) break;
-    }
-  }
   return !_interrupted;
 }
 
