@@ -337,9 +337,10 @@ void LaapWeb::handleSettingsPage() {
     "<button class='ghost' onclick='if(confirm(\"确定格式化并重启?\"))resetall(event)'>格式化并重启</button></div>"
     "<script>"
     "async function load(){const s=await (await fetch('/api/status')).json();"
-    "ssid.value=s.ssid;base.value=s.llm_base;key.value=s.llm_key_masked?'('+s.llm_key_masked+')':'';"
-    "key.placeholder=s.llm_key_masked?'已配置，留空保持不变':'未配置';"
-    "model.value=s.llm_model;agent.value=s.agent;owner.value=s.owner;persona.value=s.persona;"
+    // 大模型 Key 绝不能把掩码回显填进输入框：老写法 key.value='('+masked+')' 会被原样提交，
+    // 保存一次就把真 Key 覆盖成 "(sk-***abcd)" → 之后 401（这正是"之前正常、后来不通"的真凶）
+    "ssid.value=s.ssid;base.value=s.llm_base;key.value='';key.placeholder=s.llm_key_masked?'已配置（'+s.llm_key_masked+'），留空=保持不变':'未配置，请填写';"
+    "model.value=s.llm_model;agent.value=s.agent;owner.value=s.owner;persona.value=s.persona;"   // key 见上行：只留 placeholder 提示
     "tick.value=s.tick;thold.value=s.threshold;idlesil.value=s.idle_silence;idleevery.value=s.idle_every;volume.value=s.volume;brightness.value=s.brightness;screenoff.value=s.screen_off;llmcont.value=s.llm_continue;llmtok.value=s.llm_max_tokens;srchkeys.value=s.search_keys||'';srchapi.value=s.search_api||'';"
     "vmode.value=s.voice_mode;ttsch.value=s.tts_channel;ttsvoice.value=s.tts_voice;ttsrate.value=s.tts_rate;"
     "volcappid.value=s.volc_appid;volctoken.value=s.volc_token_masked?'':'';volctoken.placeholder=s.volc_token_masked?'已配置，留空保持不变':'未配置';"
@@ -382,6 +383,18 @@ void LaapWeb::handleSave() {
   // 手动解析 JSON body（免库）
   String b = server.arg("plain");
   auto get = [&](const char* k) -> String { return jsonField(b, k); };
+  // 掩码回显识别：网页旧版会把 "(sk-***abcd)" 这种掩码填进输入框，提交后会把真 Key 覆盖掉。
+  // 任何含 "***" 或首尾成对括号的值都不可能是真密钥 → 一律忽略，保住已存的 Key。
+  auto maskEcho = [](const String& v) -> bool {
+    if (v.indexOf("***") >= 0) return true;
+    return v.length() > 2 && v[0] == '(' && v[v.length() - 1] == ')';
+  };
+  // 密钥类字段统一走"留空=保持、掩码回显=忽略"（掩码一旦落库就再也认证不过 = 用户报的"之前正常后来不通"）
+  auto setSecret = [&](const String& v, char* dst, size_t n, const char* what) {
+    if (!v.length()) return;
+    if (maskEcho(v)) { Serial.printf("[WEB] 忽略疑似掩码回显的 %s（保住已存值）\n", what); return; }
+    strlcpy(dst, v.c_str(), n);
+  };
   // 布尔哨兵：网页发的是 JSON 数字（"wakeword_set":1，无引号）。
   // 早期写成 get(k)=="1"（只认带引号的字符串形式）→ 永远匹配不上：
   // 唤醒词/视觉/搜索词的写入（含"清空"）实际从未生效，用户看到的就是"重启后配置还原"。
@@ -402,28 +415,28 @@ void LaapWeb::handleSave() {
   if (flag("wakeword_set")) strlcpy(cfg.s.wakeWord, wakeword.c_str(), sizeof(cfg.s.wakeWord));
   if (flag("visionbase_set")) strlcpy(cfg.s.visionBase, visionbase.c_str(), sizeof(cfg.s.visionBase));
   if (flag("vlbase_set")) strlcpy(cfg.s.visionLlmBase, vlbase.c_str(), sizeof(cfg.s.visionLlmBase));
-  if (vkey.length()) strlcpy(cfg.s.visionKey, vkey.c_str(), sizeof(cfg.s.visionKey));
+  setSecret(vkey, cfg.s.visionKey, sizeof(cfg.s.visionKey), "视觉 Key");
   if (flag("vmodel_set")) strlcpy(cfg.s.visionModel, vmodel.c_str(), sizeof(cfg.s.visionModel));
   if (vmode.length()) { long v = vmode.toInt(); cfg.s.voiceMode = (uint8_t)(v < 0 ? 0 : (v > 3 ? 3 : v)); }
   if (ttsch.length()) { long v = ttsch.toInt(); cfg.s.ttsChannel = (uint8_t)(v < 0 ? 0 : (v > 3 ? 3 : v)); }
   if (ttsvoice.length()) strlcpy(cfg.s.ttsVoice, ttsvoice.c_str(), sizeof(cfg.s.ttsVoice));
   if (ttsrate.length()) strlcpy(cfg.s.ttsRate, ttsrate.c_str(), sizeof(cfg.s.ttsRate));
   if (volcappid.length()) strlcpy(cfg.s.volcAppid, volcappid.c_str(), sizeof(cfg.s.volcAppid));
-  if (volctoken.length()) strlcpy(cfg.s.volcToken, volctoken.c_str(), sizeof(cfg.s.volcToken));
+  setSecret(volctoken, cfg.s.volcToken, sizeof(cfg.s.volcToken), "火山 Token");
   if (volcvoice.length()) strlcpy(cfg.s.volcVoice, volcvoice.c_str(), sizeof(cfg.s.volcVoice));
   if (asrbase.length()) strlcpy(cfg.s.asrBase, asrbase.c_str(), sizeof(cfg.s.asrBase));
-  if (asrkey.length()) strlcpy(cfg.s.asrKey, asrkey.c_str(), sizeof(cfg.s.asrKey));
+  setSecret(asrkey, cfg.s.asrKey, sizeof(cfg.s.asrKey), "ASR Key");
   if (asrmodel.length()) strlcpy(cfg.s.asrModel, asrmodel.c_str(), sizeof(cfg.s.asrModel));
   // 备用 ASR 支持"清空"（带 _set 哨兵即写入，空=不启用）；Key 留空=保持不变
   if (flag("asr2_set")) {
     strlcpy(cfg.s.asr2Base, asr2base.c_str(), sizeof(cfg.s.asr2Base));
     strlcpy(cfg.s.asr2Model, asr2model.c_str(), sizeof(cfg.s.asr2Model));
   }
-  if (asr2key.length()) strlcpy(cfg.s.asr2Key, asr2key.c_str(), sizeof(cfg.s.asr2Key));
+  setSecret(asr2key, cfg.s.asr2Key, sizeof(cfg.s.asr2Key), "备用 ASR Key");
   if (ssid.length()) strlcpy(cfg.s.wifiSsid, ssid.c_str(), sizeof(cfg.s.wifiSsid));
   if (pass.length()) strlcpy(cfg.s.wifiPass, pass.c_str(), sizeof(cfg.s.wifiPass));
   if (base.length()) strlcpy(cfg.s.llmBase, base.c_str(), sizeof(cfg.s.llmBase));
-  if (key.length()) strlcpy(cfg.s.llmKey, key.c_str(), sizeof(cfg.s.llmKey));
+  setSecret(key, cfg.s.llmKey, sizeof(cfg.s.llmKey), "大模型 Key");
   if (model.length()) strlcpy(cfg.s.llmModel, model.c_str(), sizeof(cfg.s.llmModel));
   if (agent.length()) strlcpy(cfg.s.agentName, agent.c_str(), sizeof(cfg.s.agentName));
   if (owner.length()) strlcpy(cfg.s.ownerName, owner.c_str(), sizeof(cfg.s.ownerName));

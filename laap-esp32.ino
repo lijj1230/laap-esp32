@@ -825,6 +825,10 @@ void serialCli() {
       Serial.printf("  共 %d 个\n", found);
       Serial.println("[I2C] 已知: 0x19=PCA9557(IO扩展) 0x18=ES8311(喇叭) 0x40=ES7210(麦克风) 0x6A=QMI8658(IMU) 0x21=GC0308(摄像头)");
       Serial.println("[I2C] 触摸常见: 0x38/0x39=FT6236/FT6336  0x15=CST816  0x5D=GT911  0x48/0x49=NS2009");
+    } else if (line == "/ipbar") {
+      Serial.println("[LCD] " + display.ipBarDiag());
+      Serial.println("[LCD] 底栏构成: 左=绿天线(联网)/红感叹号(断网) ｜ 中=7段IP ｜ 右=情绪色点");
+      Serial.println("[LCD] 情绪点颜色: 豆绿=开心兴奋 雾蓝=好奇 灰蓝=焦虑 暗灰=疲惫 藕粉(偏红)=孤单 近白=平静");
     } else if (line == "/redraw") {
       display.repaint();   // 重画 表情+顶栏+底栏IP（屏幕状态异常时的复位手势）
       Serial.println("[LCD] 已重画整屏（表情 + 顶栏 + 底栏 IP）");
@@ -1150,9 +1154,15 @@ void loop() {
     }
   }
 
-  // WiFi 断线重连
+  // WiFi 断线重连 + 底栏 IP 行跟随联网状态（只有真的断网才显示红感叹号，恢复后立刻变回绿天线+IP）
   static uint32_t lastReconnect = 0;
-  if (WiFi.status() != WL_CONNECTED && !webui.inAP() && millis() - lastReconnect > 30000) {
+  static int8_t s_ipBarWifi = -1;
+  bool wifiUp = (WiFi.status() == WL_CONNECTED);
+  if ((int8_t)wifiUp != s_ipBarWifi) {
+    s_ipBarWifi = (int8_t)wifiUp;
+    display.drawIpLine(wifiUp ? WiFi.localIP().toString() : String(""), wifiUp);
+  }
+  if (!wifiUp && !webui.inAP() && millis() - lastReconnect > 30000) {
     lastReconnect = millis();
     WiFi.reconnect();
     mind.onError();

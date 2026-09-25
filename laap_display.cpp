@@ -218,6 +218,7 @@ void LaapDisplay::drawFace(const char* expr, bool thinking) {
   if (thinking) brow = -(ry + 12);
   drawEye(cx1, cy, rx, ry, pdx, pdy, brow);
   drawEye(cx2, cy, rx, ry, pdx, pdy, brow);
+  drawMoodDot();     // 底栏情绪点跟随表情（不依赖"下次画 IP 栏"才更新）
 }
 
 void LaapDisplay::blinkTick() {
@@ -449,15 +450,33 @@ void LaapDisplay::drawIpLine(const String& ip, bool wifiOk) {
     fillRect(10, UI_BAR_Y + 26, 4, 2, RGB565(255, 80, 80));
     drawIp7seg(22, UI_BAR_Y + 14, String("--.--.-.-"));
   }
-  // 右侧心情色点（当前表情对应色）
+  drawMoodDot();   // 右侧情绪色点（当前表情对应色，随表情实时变化）
+}
+
+// 底栏右侧的情绪色点：颜色 = 当前表情。drawFace 每次换表情都会调它，
+// 所以它不再是"开机画一次、之后一直不变"的老色点（用户会当成神秘红点）。
+void LaapDisplay::drawMoodDot() {
+  if (!_screenOn) return;
   String e(curExpr); e.toLowerCase();
-  uint16_t mc = CLR_TXT;
-  if (e == "happy" || e == "excited") mc = CLR_EXP;
-  else if (e == "curious") mc = CLR_CUR;
-  else if (e == "anxious") mc = CLR_SEC;
-  else if (e == "tired") mc = CLR_DIM;
-  else if (e == "lonely") mc = CLR_SOC;
+  uint16_t mc = CLR_TXT;                                   // 平静/未知 = 近白
+  if (e == "happy" || e == "excited") mc = CLR_EXP;        // 豆绿
+  else if (e == "curious") mc = CLR_CUR;                   // 雾蓝
+  else if (e == "anxious") mc = CLR_SEC;                   // 灰蓝
+  else if (e == "tired") mc = CLR_DIM;                     // 暗灰
+  else if (e == "lonely") mc = CLR_SOC;                    // 藕粉（偏红）
+  fillRect(SZP_LCD_W - 22, UI_BAR_Y + 12, 12, 12, CLR_BG); // 先擦，换色不留残影
   fillCircle(SZP_LCD_W - 16, UI_BAR_Y + 18, 4, mc);
+}
+
+String LaapDisplay::ipBarDiag() {
+  String e(curExpr); e.toLowerCase();
+  const char* moodCn = "平静(近白)";
+  if (e == "happy") moodCn = "开心(豆绿)"; else if (e == "excited") moodCn = "兴奋(豆绿)";
+  else if (e == "curious") moodCn = "好奇(雾蓝)"; else if (e == "anxious") moodCn = "焦虑(灰蓝)";
+  else if (e == "tired") moodCn = "疲惫(暗灰)"; else if (e == "lonely") moodCn = "孤单(藕粉/偏红)";
+  return String("IP=\"") + ipCache + "\" 联网=" + (ipWifiOk ? "是(左侧绿天线)" : "否(左侧红感叹号)") +
+         " 已画=" + (ipDrawn ? "是" : "否") + " | 当前表情=" + curExpr +
+         " | 右侧情绪点=" + moodCn + (devAccel > 0 ? "" : " ");
 }
 
 void LaapDisplay::drawBootScreen() {

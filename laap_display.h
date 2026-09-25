@@ -42,6 +42,7 @@ public:
   void setBrightness(uint8_t pct);
   uint8_t getBrightness() const { return brightness; }
   String lcdDiag();            // 显示子系统自诊断（串口 /lcd 调用）
+  String ipBarDiag();          // 底栏现状（IP/联网/情绪色点）自诊断（串口 /ipbar 调用）
   void clear(uint16_t c) { fillRect(0, 0, SZP_LCD_W, SZP_LCD_H, c); }
   // ---- UI ----
   void drawFace(const char* expr, bool thinking = false);
@@ -69,6 +70,7 @@ private:
   void drawGlyph3x5(int x, int y, char ch, uint16_t c, uint8_t scale);  // 3x5 点阵字符（scale 倍放大）
   int  drawText3x5(int x, int y, const char* s, uint16_t c, uint8_t scale);
   void drawTopStrip();                                    // 顶栏：时间+需求数字+设备信息
+  void drawMoodDot();                                     // 底栏右侧情绪色点（跟随当前表情实时更新）
   void draw7seg(int x, int y, char ch, uint16_t c);
   void drawIp7seg(int x, int y, const String& s);
   uint8_t brightness = 220;
