@@ -45,6 +45,7 @@ public:
 
   // ---- PA（读-改-写 PCA9557，不动 LCD_CS 位） ----
   void paSet(bool on);
+  void paTick();                     // 空闲自动关 PA（主循环调用；流式播放间隔中保持开启）
 
   // ---- 音量（ES8311 0-100；持久化由 laap_config.volume 承担） ----
   void setVolume(uint8_t v);         // 运行时改音量（Web/串口调用）
@@ -65,6 +66,7 @@ private:
   bool _vadSpeech = false;
   uint32_t _speechStartMs = 0, _silenceMs = 0;
   bool _interrupted = false, _bargeEn = true;
+  uint32_t _paOffMs = 0;                       // PA 空闲关断时刻（0=无需关）
 };
 
 extern LaapAudio audio;

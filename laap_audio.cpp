@@ -209,6 +209,16 @@ bool LaapAudio::playPcm(const int16_t* data, size_t samples, uint32_t rate,
     if (interruptCb && interruptCb(ctx)) _interrupted = true;
     if (_interrupted) break;
   }
-  paSet(false);
+  // PA 不再逐块关断：流式播放每 24ms 一块，逐块开关会让功放永远停在启动瞬态（无声根因）。
+  // 改为保持开启，静默 400ms 后由 paTick() 关闭。
+  _paOffMs = millis() + 400;
   return !_interrupted;
+}
+
+// 空闲关功放（主循环周期调用）：最后一次播放后 400ms 关断
+void LaapAudio::paTick() {
+  if (_paOffMs && (int32_t)(millis() - _paOffMs) >= 0) {
+    _paOffMs = 0;
+    paSet(false);
+  }
 }

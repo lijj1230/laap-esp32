@@ -701,6 +701,31 @@ void connectWifi() {
 // ============================================================
 //  串口 CLI
 // ============================================================
+// /pa2 用: PCA9557 PA 位 + ES8311 关键寄存器一次性回读
+static void pa2Dump(const char* tag) {
+  Wire.beginTransmission(0x19); Wire.write(0x01); Wire.endTransmission(false);
+  uint8_t pa = (Wire.requestFrom((int)0x19, 1) == 1) ? Wire.read() : 0xFF;
+  Serial.printf("[PA2·%s] PCA=0x%02X(PA=%d) ES8311:", tag, pa, (pa >> 1) & 1);
+  static const uint8_t regs[] = {0x00, 0x01, 0x02, 0x03, 0x0D, 0x0E, 0x12, 0x13, 0x14, 0x16, 0x17, 0x18, 0x32, 0x37};
+  for (uint8_t r : regs) {
+    Wire.beginTransmission(0x18); Wire.write(r); Wire.endTransmission(false);
+    uint8_t v = (Wire.requestFrom((int)0x18, 1) == 1) ? Wire.read() : 0xFF;
+    Serial.printf(" %02X=%02X", r, v);
+  }
+  Serial.println();
+}
+// playPcm 播放轮询回调: 播放中 dump 寄存器 + 每 500ms 报麦克风 RMS（喇叭真响→RMS 飙升）
+static bool pa2Probe(void* ctx) {
+  static bool s_done = false;
+  static uint32_t s_lastRms = 0;
+  if (!s_done) { s_done = true; pa2Dump("playing"); s_lastRms = millis(); }
+  if (millis() - s_lastRms > 500) {
+    s_lastRms = millis();
+    Serial.printf("[PA2·playing] micRMS=%.0f（>200=喇叭在响，≈46=物理静音）\n", audio.micRms());
+  }
+  return false;   // 永不打断
+}
+
 void serialCli() {
   while (Serial.available()) {
     String line = Serial.readStringUntil('\n');
@@ -733,6 +758,16 @@ void serialCli() {
       rb = (Wire.requestFrom((int)0x19, 1) == 1) ? Wire.read() : 0xFF;
       Serial.printf("[AUD] 播放中 PA_EN=%d（若 0 → paSet 未生效=硬件/扩展芯片问题）\n", (rb >> 1) & 1);
       audio.paSet(false);
+    } else if (line == "/pa2") {
+      // 播放中探针: 3s 长音（小缓冲循环播，不占静态 RAM）
+      Serial.println("[PA2] 3 秒 440Hz 长音…请听喇叭！");
+      audio.bargeInEnable(false);
+      pa2Dump("idle");
+      static int16_t tone1[1600];            // 100ms@16k 循环 30 次 = 3s（96KB 静态会吃穿堆）
+      for (int i = 0; i < 1600; i++) tone1[i] = (int16_t)(12000 * sinf(2 * PI * 440 * i / 16000.0));
+      for (int r = 0; r < 30; r++) audio.playPcm(tone1, 1600, 16000, pa2Probe, nullptr);
+      pa2Dump("after");
+      Serial.println("[PA2] 完成");
     } else if (line == "/imu") {
       // IMU 诊断: 扫 0x6A/0x6B + 回读 WHO_AM_I
       for (uint8_t a : {(uint8_t)0x6A, (uint8_t)0x6B}) {
@@ -801,10 +836,10 @@ void serialCli() {
         Serial.printf("[ASR] 转写失败: %s\n", err.c_str());
         // 内容/格式二分：用 1s 合成 440Hz（格式已知完好）再试一次
         Serial.println("[ASR] 用合成音复测（区分格式问题 vs 录音内容问题）…");
-        static int16_t tone[16000];
-        for (int i = 0; i < 16000; i++) tone[i] = (int16_t)(9000 * sinf(2 * PI * 440 * i / 16000.0));
+        static int16_t tone[8000];             // 0.5s@16k（32KB 静态版吃堆致 TLS 握手失败）
+        for (int i = 0; i < 8000; i++) tone[i] = (int16_t)(9000 * sinf(2 * PI * 440 * i / 16000.0));
         String err2;
-        String t2 = asr.transcribe(tone, 32000, err2);
+        String t2 = asr.transcribe(tone, 16000, err2);
         if (t2.length() || err2.indexOf("响应无") >= 0)
           Serial.println("[ASR] 合成音请求成功 → 请求格式 OK，问题在录音内容（音量/数据）");
         else
@@ -973,6 +1008,7 @@ void loop() {
     }
   }
   voice.loopTick();   // VAD 自动聆听模式
+  audio.paTick();     // 功放空闲关断（流式播放间隔中保持开启）
   llmHarvest();       // F4: 收割后台 LLM 结果
   touchGestures();    // F5: 摇晃/翻面触觉（每帧，内部自带节流）
 

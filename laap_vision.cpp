@@ -98,10 +98,11 @@ String LaapVision::look(const String& question) {
   if (!_ok) { lastError = "摄像头未就绪"; return ""; }
   if (WiFi.status() != WL_CONNECTED) { lastError = "WiFi 未连接"; return ""; }
   // 双模式：visionBase 填了走手机桥；留空则直连 OpenAI 兼容多模态接口
+  // 直连必须显式配置 visionLlmBase（避免 LLM Key 非空就把 205KB base64 打进内部堆）
   bool bridge = cfg.s.visionBase[0] != 0;
-  if (!bridge && !cfg.s.visionKey[0] && !cfg.s.llmKey[0]) {
-    lastError = "视觉未配置（填手机桥 URL 或直连 Key）"; return "";
-  }
+  bool direct = cfg.s.visionLlmBase[0] != 0;
+  if (!bridge && !direct) { lastError = "视觉未配置（填手机桥 URL 或直连视觉 base）"; return ""; }
+  if (ESP.getFreeHeap() < 120000) { lastError = "内存不足，跳过视觉"; return ""; }  // base64 需 200KB+
 
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) { lastError = "抓帧失败"; return ""; }

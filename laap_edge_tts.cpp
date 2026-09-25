@@ -102,6 +102,14 @@ static bool playMp3Stream() {
     MP3GetLastFrameInfo(dec, &fi);
     size_t samples = fi.outputSamps;
     if (samples > 0) {
+      // TTS 无声定位: 解码 PCM 响度 vs 麦克风拾音（喇叭真出声→micRms 飙升）
+      static uint32_t s_dbgCnt = 0;
+      if ((s_dbgCnt++ % 20) == 0) {
+        float pr = 0;
+        for (size_t i = 0; i < samples; i += 4) pr += (float)pcm[i] * pcm[i];
+        pr = sqrtf(pr / (samples / 4 + 1));
+        Serial.printf("[TTSDBG] pcmRms=%.0f micRms=%.0f (%u 样本)\n", pr, audio.micRms(), (unsigned)samples);
+      }
       audio.playPcm(pcm, samples, fi.samprate ? fi.samprate : 24000);
       s_playedSamps += samples;
       any = true;
