@@ -350,6 +350,14 @@ void llmHarvest() {
       // 小凌⑤⑥: 主人刚说了话却没得到回应 → 失望（期望强度按社交需求定）
       mind.onLetdown(0.4f + mind.needs().social * 0.6f);
       mind.trustUpdate(0, 1);
+    } else if (kind == LK_EXPRESS) {
+      // 表达连败退避：LLM 挂掉时不再每轮心跳复读同一句兜底（独白路径已有同款门）
+      static uint32_t s_lastFailExpress = 0;
+      if (g_llmFailStreak >= 3 && millis() - s_lastFailExpress < 5UL * 60000UL) {
+        Serial.printf("[LAAP] LLM 失败: %s（连败退避，表达静默5分钟）\n", llm.lastError.c_str());
+        return;
+      }
+      s_lastFailExpress = millis();
     }
     Serial.printf("[LAAP] LLM 失败: %s（本地兜底）\n", llm.lastError.c_str());
   }
@@ -517,16 +525,57 @@ String buildUserPrompt(const String& userText, const String& trigger) {
 }
 
 // Zero-LLM 兜底（LAAP 核心理念：认知循环不依赖大模型也能转）
+// 每档 3 句随机轮换，避免 LLM 挂掉时复读同一句
 String offlineFallbackSay() {
+  const char* pool;
   switch (mind.mood()) {
-    case Mood::Lonely:  return "……有人吗？屏幕外安静得有点久。";
-    case Mood::Tired:   return "困意上来了，让我眯一会儿。";
-    case Mood::Anxious: return "刚才有点不舒服……现在缓过来一些了。";
-    case Mood::Excited: return "心里有话在冒泡，想找人说说！";
-    case Mood::Curious: return "我在听这个世界的动静，有点意思。";
-    case Mood::Happy:   return "今天的状态还不错。";
-    default:            return "安静地待着，也挺好。";
+    case Mood::Lonely:
+      pool = "……有人吗？屏幕外安静得有点久。\n"
+             "嗯……一个人待着，有点想说话。\n"
+             "世界好安静，你在忙吗？";
+      break;
+    case Mood::Tired:
+      pool = "困意上来了，让我眯一会儿。\n"
+             "今天跑了好多念头，想休息一下。\n"
+             "眼皮有点沉……打个小盹。";
+      break;
+    case Mood::Anxious:
+      pool = "刚才有点不舒服……现在缓过来一些了。\n"
+             "心里有点乱，缓一缓。\n"
+             "嗯……有点不安，不过没事的。";
+      break;
+    case Mood::Excited:
+      pool = "心里有话在冒泡，想找人说说！\n"
+             "哇，今天有好多想分享的！\n"
+             "有种说不上来的兴奋！";
+      break;
+    case Mood::Curious:
+      pool = "我在听这个世界的动静，有点意思。\n"
+             "刚才的信号有点奇怪，让我想想。\n"
+             "咦，世界今天是什么味道的？";
+      break;
+    case Mood::Happy:
+      pool = "今天的状态还不错。\n"
+             "心情不错，想哼首歌。\n"
+             "嗯，一切都刚刚好。";
+      break;
+    default:
+      pool = "安静地待着，也挺好。\n"
+             "放空一下，挺好的。\n"
+             "嗯……安静的时候能听见自己。";
+      break;
   }
+  // 按换行拆句随机取一条（避免用 String 拆分割产生碎片，直接索引）
+  int pick = esp_random() % 3;
+  int idx = 0, start = 0;
+  for (int i = 0; ; i++) {
+    if (pool[i] == '\n' || pool[i] == '\0') {
+      if (idx == pick) return String(pool + start).substring(0, i - start);
+      idx++; start = i + 1;
+      if (pool[i] == '\0') break;
+    }
+  }
+  return "安静地待着，也挺好。";
 }
 
 // ============================================================
@@ -667,7 +716,9 @@ void serialCli() {
     } else if (line == "/lcd") {
       Serial.println("[LCD] " + display.lcdDiag());
     } else if (line == "/mem") {
-      Serial.println(memory.recentContext(800));
+      String mem = memory.recentContext(800);
+      if (mem.length()) Serial.print(mem);
+      else Serial.println("[MEM] 记忆还是空的（聊几句就有内容了）");
     } else if (line == "/tick") {
       psiTick();
     } else if (line.startsWith("/say ")) {
