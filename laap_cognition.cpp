@@ -54,21 +54,35 @@ void Cognition::tick(float dtMin) {
   _n.expression += 0.007f * dtMin;
   _n.security += 0.002f * dtMin;
 
-  // 环境调制：信号差/断网 → 不安
-  if (rssiDb != 0 && rssiDb < -80) _n.security += 0.02f * dtMin;
-  // 世界有动静 → 好奇回落一点（被满足了）
-  if (motionLevel > 0.3f) _n.curiosity -= 0.02f * dtMin;
-  // 长时间没人理 → 社交加速上升
+  // ============================================================
+  //  自我回补（没有这一段，需求只涨不落 → 主动表达会变成死循环）
+  //  实测逻辑：energy 只增不减 + onExpressed 还 +0.03，一旦越过阈值
+  //  dominance() 永远 ≥ 阈值 → 每 10 秒心跳都调一次 arisExpress（LLM 一空就说话），
+  //  且情绪永久停在"疲惫"、每次都嘟囔"我累了"。social/security 同理。
+  //  回补速率必须**大于**上面的累积速率，否则只是把"涨"变成"冻结"（仍会卡在阈值上）。
+  // ============================================================
   float aloneMin = (millis() - lastUserMs) / 60000.0f;
-  if (aloneMin > 30) _n.social += 0.005f * dtMin;
+  bool quiet = aloneMin > 5.0f;                       // 五分钟没人理 = 独处静息
+  if (night)        _n.energy -= 0.020f * dtMin;      // 夜里睡了：净 -0.008/分（1.0→0.3 约 90 分钟）
+  else if (quiet)   _n.energy -= 0.009f * dtMin;      // 白天独处打盹：净 -0.005/分
+  if (quiet) {                                        // 独处久了会自我调适（不调适就永远黏人）
+    _n.social     -= 0.014f * dtMin;                  // 与 +0.010/+0.005 相抵后≈持平：孤独高位盘整
+    _n.expression -= 0.009f * dtMin;                  // 与 +0.007 相抵：缓慢回落
+  }
+  if (rssiDb == 0 || rssiDb > -70) _n.security -= 0.004f * dtMin;  // 环境稳定=安全感回落
+  if (rssiDb != 0 && rssiDb < -80) _n.security += 0.02f * dtMin;   // 信号差/断网 → 不安（原来的环境调制）
+  if (motionLevel > 0.3f) _n.curiosity -= 0.02f * dtMin;           // 世界有动静 → 好奇被满足
+  if (aloneMin > 30) _n.social += 0.005f * dtMin;                  // 太久没人理仍会想念（与回补相抵，形成平衡）
 
   // 愉悦度回归中位
   _pleasure += (0.5f - _pleasure) * 0.02f * dtMin;
   // 失望自愈：每小时回落约 1/3
   if (letdown > 0) { letdown -= 0.006f * dtMin; if (letdown < 0) letdown = 0; }
 
-  // 钳制
-  auto cl = [](float& v) { if (v < 0) v = 0; if (v > 1) v = 1; };
+  // 钳制：下限 0.05 而不是 0——真实需求系统不会"完全归零"，
+  // 而且全为 0 时 dominance()=0、[状态提示] 仍挑一个"最高"需求乱给语气指引
+  // （实测连聊几轮后 social/curiosity/expression 全掉到 0.02，整机进入无欲无求的瘫平态）
+  auto cl = [](float& v) { if (v < 0.05f) v = 0.05f; if (v > 1) v = 1; };
   cl(_n.energy); cl(_n.curiosity); cl(_n.social); cl(_n.security); cl(_n.expression);
 }
 
@@ -88,6 +102,15 @@ void Cognition::onExpressed(bool success) {
   else onError();
 }
 
+// 自言自语：满足度低于"对主人说话"（自己聊不如有人听），但仍要计入
+void Cognition::onMonologue() {
+  _n.curiosity *= 0.65f;
+  _n.expression *= 0.55f;
+  _n.social *= 0.88f;
+  _n.energy += 0.015f;                       // 动脑子也耗精力
+  _pleasure = _pleasure * 0.85f + 0.15f * 0.6f;
+}
+
 void Cognition::onError() {
   _n.security = _n.security * 0.85f + 0.15f;
   _pleasure *= 0.85f;
@@ -101,7 +124,8 @@ void Cognition::sense(float motion, int rssi) {
 
 // 小凌②③: 身体状态不是"数据"，是感受的调制系数——
 // 同样的等待/独处，发着烧、信号差时更难熬
-void Cognition::senseBody(float tempC, int rssi, uint32_t upMs) {
+// dtMin：按分钟计率（原来按"每次心跳"加，心跳间隔一改数值就全变，且量级大到能压过主平衡）
+void Cognition::senseBody(float tempC, int rssi, uint32_t upMs, float dtMin) {
   bodyTempC = tempC;
   float strain = 0;
   if (tempC > 48)  strain += (tempC - 48) / 20.0f;          // >48°C 开始有负担
@@ -110,9 +134,9 @@ void Cognition::senseBody(float tempC, int rssi, uint32_t upMs) {
   bodyStrain = strain > 1 ? 1 : strain;
 
   // tick 里的衰减是"平静身体"基准；负荷高时能量掉更快、安全更难维持
-  if (bodyStrain > 0.05f) {
-    _n.energy   += 0.004f * bodyStrain;   // 需求值=渴求度，负担高更渴望休息
-    _n.security += 0.003f * bodyStrain;   // 也更没有安全感
+  if (bodyStrain > 0.05f && dtMin > 0) {
+    _n.energy   += 0.010f * bodyStrain * dtMin;   // 需求值=渴求度，负担高更渴望休息
+    _n.security += 0.008f * bodyStrain * dtMin;   // 也更没有安全感
   }
 }
 

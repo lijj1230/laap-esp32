@@ -219,7 +219,16 @@ String LaapVision::debugPngB64(size_t& outLen) {
   return out;
 }
 
+// 跨任务互斥：后台独白"起意前看一眼"与主线程的聊天/CLI 会用同一个 vision 对象
+// （lastError/_lastDesc 是 String，并发写=撕裂）。拿不到锁就当这次没看成。
 String LaapVision::look(const String& question) {
+  if (!laapNetLock()) { lastError = "视觉正忙（后台独白占用）"; return ""; }
+  String r = lookLocked(question);
+  laapNetUnlock();
+  return r;
+}
+
+String LaapVision::lookLocked(const String& question) {
   lastError = "";
   if (!_ok) { lastError = "摄像头未就绪"; return ""; }
   if (WiFi.status() != WL_CONNECTED) { lastError = "WiFi 未连接"; return ""; }

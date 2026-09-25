@@ -332,7 +332,10 @@ String MemorySystem::recallSmart(const String& query, int maxChars) {
       if (xe > 0) x = x.substring(0, xe);
       x = sanitizeUtf8(x);
     }
-    if (x.length()) out = out.length() ? out + "\n" + x : x;
+    // 去重 + 排除"就是这次问的这句"：连着问同一句话时，召回会把当前提问原样重复三遍，
+    // 既没信息量又把模型带回原话（实测造成复读与答非所问）
+    if (x.length() && out.indexOf(x) < 0 && !(query.length() >= 2 && x.indexOf(query) >= 0))
+      out = out.length() ? out + "\n" + x : x;
     hits[best] = hits.back(); hits.pop_back();
     if ((int)out.length() >= maxChars) break;
   }

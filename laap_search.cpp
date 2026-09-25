@@ -358,8 +358,18 @@ String LaapSearch::searchCustom(const String& q, int maxHit, int maxLen) {
   return out;
 }
 
-// ---------- 入口：URL 编码 + 主源→DDG→必应HTML 三级链 ----------
+// ---------- 入口：跨任务互斥 + URL 编码 + 主源→DDG→必应HTML 三级链 ----------
+// 为什么加锁：后台独白任务也会调 search()，而 lastError 是成员 String，
+// 两任务并发写会 String 撕裂（堆损坏/莫名重启）。拿不到锁就降级成"这次没查到"，
+// 不用长超时——调用方含主循环，等几秒会让屏幕/网页一起卡住。
 String LaapSearch::search(const String& query, int maxHit, int maxLen) {
+  if (!laapNetLock()) { lastError = "搜索正忙（后台独白占用）"; return ""; }
+  String r = searchLocked(query, maxHit, maxLen);
+  laapNetUnlock();
+  return r;
+}
+
+String LaapSearch::searchLocked(const String& query, int maxHit, int maxLen) {
   lastError = "";
   if (!_ok) { lastError = "搜索未启用"; return ""; }
   if (WiFi.status() != WL_CONNECTED) { lastError = "WiFi 未连接"; return ""; }

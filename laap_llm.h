@@ -51,4 +51,10 @@ String utf8Cut(const String& s, int len);
 // 否则半个汉字会让整个 JSON 或 LLM 请求体非法（/api/memory 曾因此吐不出合法 JSON）
 String sanitizeUtf8(const String& s);
 
+// 跨任务网络客户端互斥（搜索/视觉/连通性测试共用）：后台独白任务与主线程
+// 都会用同一批客户端对象，而它们的 lastError 等成员是 String——
+// 两任务并发写 = String 撕裂 → 堆损坏/莫名重启。拿不到就优雅降级，绝不长阻塞。
+bool laapNetLock(uint32_t ms = 400);
+void laapNetUnlock();
+
 extern LlmClient llm;

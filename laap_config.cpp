@@ -27,6 +27,7 @@ void LaapConfig::load() {
   s.screenOffSec = 60;
   s.llmContinue = 1;
   s.llmMaxTokens = 500;
+  s.llmNoThink = 1;
   s.voiceMode = 1;
   s.ttsChannel = 0;
   strlcpy(s.ttsVoice, "zh-CN-XiaoxiaoNeural", sizeof(s.ttsVoice));
@@ -53,6 +54,7 @@ void LaapConfig::load() {
   _uptimeBaseMin   = prefs.getUInt("uptmin", 0);
   s.llmContinue    = prefs.getUChar("llmcont", 1);
   s.llmMaxTokens   = prefs.getUShort("llmtok", 500);
+  s.llmNoThink     = prefs.getUChar("nothink", 1);
   laapTrustSet(prefs.getUChar("trust", 153) / 255.0f);  // 默认 0.6
   prefs.getString("srchkeys", s.searchKeys, sizeof(s.searchKeys));
   prefs.getString("srchapi", s.searchApi, sizeof(s.searchApi));
@@ -96,6 +98,7 @@ bool LaapConfig::save() {
   prefs.putUShort("screenoff", s.screenOffSec);
   prefs.putUChar("llmcont", s.llmContinue);
   prefs.putUShort("llmtok", s.llmMaxTokens);
+  prefs.putUChar("nothink", s.llmNoThink);
   prefs.putUChar("trust", (uint8_t)(laapTrust() * 255));
   prefs.putString("srchkeys", s.searchKeys);
   prefs.putString("srchapi", s.searchApi);

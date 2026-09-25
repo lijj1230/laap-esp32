@@ -1,5 +1,6 @@
 #include "laap_llm.h"
 #include "laap_config.h"
+#include <esp_heap_caps.h>   // 最大连续块（TLS 握手要一整块，不看总量）
 #include <WiFiClientSecure.h>
 #include <WiFi.h>
 
@@ -85,6 +86,17 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
                                       int maxTokens, float temperature, int depth) {
   LlmReply r;
   if (String(cfg.s.llmKey).length() == 0) { lastError = "API Key 未配置"; return r; }
+  // 内存碎片：TLS 握手要一块连续内存，只看"总空闲"会被碎片骗（实测 heap 75KB、
+  // 最大连续块只有 30 多 KB 时 connect 直接失败，而主线程新连接却能成）。
+  // 开机常态最大块就 ~39KB，所以门槛只拦"真的没救"的情况（24KB），
+  // 真正的兜底交给下面 connect 失败后的重试+退避。
+  for (int i = 0; i < 8 && heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 24000; i++)
+    vTaskDelay(pdMS_TO_TICKS(250));
+  if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 24000) {
+    lastError = String("内存碎片过多（最大连续块仅 ") +
+                String(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024) + "KB），稍后重试";
+    return r;
+  }
 
   String url = buildUrl();
   int dp = url.indexOf("://"); if (dp < 0) { lastError = "URL 无效"; return r; }
@@ -104,16 +116,31 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
     body += String("{\"role\":\"") + msgs[i].role + "\",\"content\":\"" + jsonEscape(msgs[i].content) + "\"}";
   }
   body += String("],\"max_tokens\":") + maxTokens +
-    ",\"temperature\":" + String(temperature, 2) + ",\"stream\":false}";
+    ",\"temperature\":" + String(temperature, 2) + ",\"stream\":false";
+  // 关掉思考：思考型模型（v4 系）在这些短任务上会把预算全花在推理上、正文返回空
+  // （实测 60~1600 token 都可能拿到 content=""），关掉后既快又稳。
+  // 不认这个字段的服务商一般忽略它；若报 400 就在设置页关掉这个开关。
+  if (cfg.s.llmNoThink) body += ",\"thinking\":{\"type\":\"disabled\"}";
+  body += "}";
 
-  WiFiClient *client = useTls ? (WiFiClient*)(new WiFiClientSecure) : new WiFiClient;
-  if (useTls) ((WiFiClientSecure*)client)->setInsecure(); // 端侧自签策略见 README
-  client->setTimeout(15000); // Stream 超时单位为 ms
+  // 连接重试：connect 失败不花 token（请求还没发出去），值得带退避重试两次——
+  // 碎片多时等几百毫秒回收往往就通了，比让上层收到一个"连接失败"有用得多
+  WiFiClient *client = nullptr;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    client = useTls ? (WiFiClient*)(new WiFiClientSecure) : new WiFiClient;
+    if (useTls) ((WiFiClientSecure*)client)->setInsecure(); // 端侧自签策略见 README
+    client->setTimeout(15000); // Stream 超时单位为 ms
+    if (client->connect(host.c_str(), port)) break;
+    delete client; client = nullptr;
+    Serial.printf("[LLM] 连接失败（第 %d 次），最大连续块 %uKB，%dms 后重试\n",
+                  attempt + 1,
+                  (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024),
+                  600 + attempt * 700);
+    vTaskDelay(pdMS_TO_TICKS(600 + attempt * 700));
+  }
+  if (!client) { lastError = "连接失败:" + host; return r; }
 
   uint32_t t0 = millis();
-  if (!client->connect(host.c_str(), port)) {
-    lastError = "连接失败:" + host; delete client; return r;
-  }
   String req = String("POST ") + path + " HTTP/1.1\r\nHost: " + host +
     "\r\nAuthorization: Bearer " + cfg.s.llmKey +
     "\r\nContent-Type: application/json\r\nContent-Length: " + body.length() +
@@ -162,6 +189,9 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
     String emsg;
     if (extractStringField(payload, "message", emsg)) lastError = "HTTP " + String(r.httpStatus) + ": " + emsg;
     else lastError = "HTTP " + String(r.httpStatus);
+    // 400 且开着"关闭思考"：多半是这家服务商不认 thinking 字段 → 直接告诉用户怎么关
+    if (r.httpStatus == 400 && cfg.s.llmNoThink)
+      lastError += "（若报未知参数，请在设置页关掉「关闭模型思考」）";
     return r;
   }
   if (!extractStringField(payload, "content", content)) {
@@ -188,9 +218,12 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
     else
       Serial.printf("[LLM] payload 头(无 reasoning 字段): %.400s\n", payload.c_str());
     // 只有"被截断"才值得加钱重试：上限翻倍再要一次（真·空回复重试也没用）
-    if (depth > 0 && fin0 == "length" && maxTokens < 1600) {
+    // finish=length 之外 finish=stop 也可能是同一回事：模型思考完就收尾（正文留空），
+    // 所以不再挑 finish_reason，空正文一律给一次更大的额度（实测独白成文步就是 stop+空）
+    if (depth > 0 && maxTokens < 1600) {
       int bigger = maxTokens * 2; if (bigger > 1600) bigger = 1600;
-      Serial.printf("[LLM] content 空 + finish=length → 上限 %d→%d 重试一次\n", maxTokens, bigger);
+      Serial.printf("[LLM] content 空（finish=%s）→ 上限 %d→%d 重试一次\n",
+                    fin0.c_str(), maxTokens, bigger);
       LlmReply r2 = chatMsgsContinue(msgs, count, bigger, temperature, depth - 1);
       if (r2.ok) return r2;
     }
@@ -245,6 +278,19 @@ bool LlmClient::ping(String& reply) {
   reply = lastError;
   return false;
 }
+
+// 跨任务网络客户端互斥：搜索/视觉/连通性测试共用一把锁。
+// 独立成全局（而不是各模块私有）是因为"独白流水线"会连续用搜索+视觉，
+// 而主线程的聊天可能同时用它们；共用一把锁才能把两个任务真正隔开。
+static SemaphoreHandle_t s_netMtx = nullptr;
+bool laapNetLock(uint32_t ms) {
+  if (!s_netMtx) {
+    s_netMtx = xSemaphoreCreateMutex();          // 懒创建（首次调用必在主线程 setup 之后）
+    if (!s_netMtx) return true;                  // 创建失败：不阻塞功能（退回原行为）
+  }
+  return xSemaphoreTake(s_netMtx, pdMS_TO_TICKS(ms)) == pdTRUE;
+}
+void laapNetUnlock() { if (s_netMtx) xSemaphoreGive(s_netMtx); }
 
 // UTF-8 安全截断：len 字节上限处回退到字符边界（不切碎中文）
 String utf8Cut(const String& s, int len) {

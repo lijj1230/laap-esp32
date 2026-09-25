@@ -3,6 +3,7 @@
 #include "laap_audio.h"
 #include "laap_display.h"   // 仅用于眨眼刷新保持
 #include <WiFiClientSecure.h>
+#include <esp_heap_caps.h>   // PSRAM 缓冲（别把内部堆切碎）
 #include <mbedtls/sha256.h>
 #include <time.h>
 #include "mp3dec.h"
@@ -62,16 +63,27 @@ static String jsDate() {
 
 // 流式解码播放器：16KB 环形累积缓冲 + 逐帧解码（小智式流水线）
 // 用法：mp3StreamReset() → 循环 feedMp3(块) → 每次喂后 playMp3Stream() → mp3StreamFlush()
-static uint8_t mp3StreamBuf[16 * 1024];  // MP3 帧最大 ~1.5KB，16KB 很宽裕
+// 缓冲放 PSRAM：16KB 常驻内部 RAM 会把内部堆切碎，而 TLS 握手要一整块 ~39KB——
+// 实测播报一次后最大连续块 39KB→33KB，此后所有大模型请求都"连接失败"（要等重启）
+static uint8_t* mp3Buf() {
+  static uint8_t* p = nullptr;
+  if (!p) {
+    p = (uint8_t*)heap_caps_malloc(16 * 1024, MALLOC_CAP_SPIRAM);
+    if (!p) p = (uint8_t*)malloc(16 * 1024);     // PSRAM 不可用则退回内部堆（至少还能出声）
+  }
+  return p;
+}
+#define mp3StreamBuf mp3Buf()                // 用法保持 `mp3StreamBuf[i]` 不变
+#define MP3_BUF_SIZE (16 * 1024)
 static size_t mp3StreamLen = 0;
 
 static void mp3StreamReset() { mp3StreamLen = 0; }
 static bool playMp3Stream();   // 前向声明：feedMp3 满时会先播腾空间
 
 static void feedMp3(const uint8_t* d, size_t n) {
-  if (mp3StreamLen + n > sizeof(mp3StreamBuf)) {
+  if (mp3StreamLen + n > MP3_BUF_SIZE) {
     playMp3Stream();                                     // 满：先播掉腾空间（原整块丢弃=成段杂音）
-    if (mp3StreamLen + n > sizeof(mp3StreamBuf)) n = sizeof(mp3StreamBuf) - mp3StreamLen;  // 仍放不下：截尾保帧头
+    if (mp3StreamLen + n > MP3_BUF_SIZE) n = MP3_BUF_SIZE - mp3StreamLen;  // 仍放不下：截尾保帧头
   }
   if (n == 0) return;
   memcpy(mp3StreamBuf + mp3StreamLen, d, n);
@@ -84,7 +96,13 @@ static HMP3Decoder s_mp3Dec = nullptr;
 static bool playMp3Stream() {
   if (!s_mp3Dec) { s_mp3Dec = MP3InitDecoder(); if (!s_mp3Dec) return false; }
   HMP3Decoder dec = s_mp3Dec;
-  static int16_t pcm[2 * 1152];
+  // PCM 输出缓冲也放 PSRAM（4.6KB 内部 RAM，同理切碎堆）
+  static int16_t* pcm = nullptr;
+  if (!pcm) {
+    pcm = (int16_t*)heap_caps_malloc(2 * 1152 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!pcm) pcm = (int16_t*)malloc(2 * 1152 * sizeof(int16_t));
+    if (!pcm) return false;
+  }
   bool any = false;
   int pos = 0;
   while (pos < (int)mp3StreamLen) {

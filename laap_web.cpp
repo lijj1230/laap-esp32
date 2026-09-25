@@ -317,6 +317,8 @@ void LaapWeb::handleSettingsPage() {
     "<div style='flex:1'><label>静默息屏（秒，0=常亮）</label><input id='screenoff' type='number' min='0' max='3600'></div>"
     "<div style='flex:1'><label>截断续写轮数（0=关）</label><input id='llmcont' type='number' min='0' max='3'></div>"
     "<div style='flex:1'><label>单次回复上限（tokens，80-1000）</label><input id='llmtok' type='number' min='80' max='1000'></div></div>"
+    "<div class='row'><div style='flex:1'><label><input type='checkbox' id='nothink' style='width:auto;margin-right:6px'>关闭模型思考（思考型模型只思考不答话时勾上；"
+    "请求里带 thinking:disabled，既快又稳；个别服务商不认这个参数会报 400，那就别勾）</label></div></div>"
     "<div class='row'><div style='flex:1'><label>搜索关键词（逗号分隔，清空=关聊天搜索）</label><input id='srchkeys' placeholder='什么,怎么,新闻,最新…'></div></div>"
     "<div class='row'><div style='flex:1'><label>搜索主源URL（{q}=查询词，清空=必应RSS默认）</label><input id='srchapi' placeholder='https://cn.bing.com/search?q={q}&format=rss'></div></div>"
     "<button onclick='save(event)'>保存</button> "
@@ -369,7 +371,7 @@ void LaapWeb::handleSettingsPage() {
     // 保存一次就把真 Key 覆盖成 "(sk-***abcd)" → 之后 401（这正是"之前正常、后来不通"的真凶）
     "ssid.value=s.ssid;base.value=s.llm_base;key.value='';key.placeholder=s.llm_key_masked?'已配置（'+s.llm_key_masked+'），留空=保持不变':'未配置，请填写';"
     "model.value=s.llm_model;agent.value=s.agent;owner.value=s.owner;persona.value=s.persona;"   // key 见上行：只留 placeholder 提示
-    "tick.value=s.tick;thold.value=s.threshold;idlesil.value=s.idle_silence;idleevery.value=s.idle_every;volume.value=s.volume;brightness.value=s.brightness;screenoff.value=s.screen_off;llmcont.value=s.llm_continue;llmtok.value=s.llm_max_tokens;srchkeys.value=s.search_keys||'';srchapi.value=s.search_api||'';"
+    "tick.value=s.tick;thold.value=s.threshold;idlesil.value=s.idle_silence;idleevery.value=s.idle_every;volume.value=s.volume;brightness.value=s.brightness;screenoff.value=s.screen_off;llmcont.value=s.llm_continue;llmtok.value=s.llm_max_tokens;nothink.checked=!!s.nothink;srchkeys.value=s.search_keys||'';srchapi.value=s.search_api||'';"
     "vmode.value=s.voice_mode;ttsch.value=s.tts_channel;ttsvoice.value=s.tts_voice;ttsrate.value=s.tts_rate;"
     "volcappid.value=s.volc_appid;volctoken.value=s.volc_token_masked?'':'';volctoken.placeholder=s.volc_token_masked?'已配置，留空保持不变':'未配置';"
     "volcvoice.value=s.volc_voice;asrbase.value=s.asr_base;asrkey.value='';asrkey.placeholder=s.asr_key_masked?'已配置，留空保持不变':'未配置';"
@@ -381,7 +383,7 @@ void LaapWeb::handleSettingsPage() {
     "const b=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},"
     "body:JSON.stringify({ssid:ssid.value,pass:pass.value,base:base.value,key:key.value,key_set:1,model:model.value,"
     "agent:agent.value,owner:owner.value,persona:persona.value,tick:tick.value,thold:thold.value,"
-    "idlesil:idlesil.value,idleevery:idleevery.value,volume:volume.value,brightness:brightness.value,screenoff:screenoff.value,llmcont:llmcont.value,llmtok:llmtok.value,srchkeys:srchkeys.value,srchkeys_set:1,srchapi:srchapi.value,srchapi_set:1,"
+    "idlesil:idlesil.value,idleevery:idleevery.value,volume:volume.value,brightness:brightness.value,screenoff:screenoff.value,llmcont:llmcont.value,llmtok:llmtok.value,nothink:nothink.checked?1:0,srchkeys:srchkeys.value,srchkeys_set:1,srchapi:srchapi.value,srchapi_set:1,"
     "vmode:vmode.value,ttsch:ttsch.value,ttsvoice:ttsvoice.value,ttsrate:ttsrate.value,"
     "volcappid:volcappid.value,volctoken:volctoken.value,volctoken_set:1,volcvoice:volcvoice.value,"
     "asrbase:asrbase.value,asrkey:asrkey.value,asrkey_set:1,asrmodel:asrmodel.value,asr2base:asr2base.value,asr2key:asr2key.value,asr2key_set:1,asr2model:asr2model.value,asr2_set:1,"
@@ -497,6 +499,8 @@ void LaapWeb::handleSave() {
   if (lcont.length()) { long v = lcont.toInt(); cfg.s.llmContinue = (uint8_t)(v < 0 ? 0 : (v > 3 ? 3 : v)); }
   String ltok = get("llmtok");
   if (ltok.length()) { long v = ltok.toInt(); cfg.s.llmMaxTokens = (uint16_t)(v < 80 ? 80 : (v > 1000 ? 1000 : v)); }
+  String lnt = get("nothink");
+  if (lnt.length()) cfg.s.llmNoThink = (lnt.toInt() != 0) ? 1 : 0;
   String srchkeys = get("srchkeys");
   if (flag("srchkeys_set")) strlcpy(cfg.s.searchKeys, srchkeys.c_str(), sizeof(cfg.s.searchKeys));
   String srchapi = get("srchapi");
@@ -550,6 +554,7 @@ void LaapWeb::handleStatus() {
     ",\"brightness\":" + cfg.s.brightness +
     ",\"llm_continue\":" + cfg.s.llmContinue +
     ",\"llm_max_tokens\":" + cfg.s.llmMaxTokens +
+    ",\"nothink\":" + cfg.s.llmNoThink +
     ",\"search_keys\":\"" + jsonEsc(cfg.s.searchKeys) + "\"," +
     "\"search_api\":\"" + jsonEsc(cfg.s.searchApi) + "\"," +
     "\"voice_mode\":" + cfg.s.voiceMode +
@@ -585,9 +590,14 @@ void LaapWeb::handleStatus() {
     ",\"heap_kb\":" + String(ESP.getFreeHeap() / 1024) +
     // 环任务栈历史最低余量（字节）：TTS 的 TLS 握手最吃栈，低于 2-3KB 就该警惕
     ",\"stack_min\":" + String((unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t))) +
+    // 最大连续块：TLS 握手要一整块 ~40KB，碎片多时"总空闲够"也会连不上（排障关键指标）
+    ",\"heap_max_kb\":" + String((unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024)) +
     ",\"wifi_rssi\":" + (WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) : String("0")) +
     ",\"chip_temp\":" + String(temperatureRead(), 1) +
     ",\"needs\":" + needs +
+    // 主动表达的"闸门状态"：dominance 越过 threshold 就会说话，冷却 3 分钟内不再说
+    ",\"dominance\":" + String(mind.dominance(), 2) +
+    ",\"idle\":\"" + laapIdleInfo() + "\"" +
     "}";
   server.send(200, "application/json", j);
 }
@@ -617,7 +627,10 @@ void LaapWeb::handleChatReply() {
 
 void LaapWeb::handleTest() {
   String reply;
-  bool ok = llm.ping(reply);
+  // 用局部客户端实例：全局 llm 正被后台任务用来跑对话，两个任务同时写它的
+  // lastError（String 成员）会撕裂；连通性测试不值得冒这个险，也不该占着全局那把锁
+  LlmClient probe;
+  bool ok = probe.ping(reply);
   server.send(200, "application/json",
       String("{\"ok\":") + (ok ? "true" : "false") + ",\"reply\":\"" + jsonEsc(reply) + "\"}");
 }

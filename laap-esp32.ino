@@ -26,6 +26,7 @@
 #include <ESPmDNS.h>
 #include <time.h>
 #include <esp_ota_ops.h>   // 运行槽位诊断（OTA 后确认新固件在跑）
+#include <esp_heap_caps.h> // 最大连续块（TLS 握手要一整块，总空闲量会骗人）
 #include "laap_config.h"
 #include "laap_display.h"
 #include "laap_cognition.h"
@@ -100,7 +101,9 @@ void llmHarvest();                                   // F4: 收割后台 LLM 结
 struct LlmRequest;
 bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
                const String& userText, uint8_t kind = 0);
-void arisIdleMonologue();
+bool arisIdleMonologue();       // 返回是否真的提交成功（失败不推进"已独白"状态）
+void laapResetIdleClock();      // 主人交互后重置独白计时（它自己说话不重置）
+String laapIdleInfo();          // 独白计时诊断（/api/status）
 String associativeRecall(const String& currentUserText, const String& preRecalled = "");
 String buildSystemPrompt();
 String buildUserPrompt(const String& userText, const String& trigger);
@@ -116,7 +119,17 @@ const char* laapLastExpr() { return g_lastExpr.c_str(); }
 //  主动表达（PSI 心跳触发）—— v3.3 起投递后台任务，主循环不冻结
 // ============================================================
 void arisExpress(bool forced, const String& trigger) {
-  (void)forced;                                  // 频率由调用方（阈值/事件）把关
+  // 硬性最小间隔：阈值触发的心跳每 10 秒一次，只要 dominance 卡在阈值上就会连环说话。
+  // 认知层已让需求能回落（tick 的自我回补），这里是最后一道兜底——任何路径都别想刷屏。
+  // forced=主人按了 BOOT 键（明确要求它说一句），不受冷却限制。
+  static uint32_t s_lastExpressMs = 0;
+  bool firstSinceBoot = (s_lastExpressMs == 0);      // 刚开机不该被冷却凭空堵住
+  if (!forced && !firstSinceBoot && millis() - s_lastExpressMs < 5UL * 60000UL) {
+    Serial.printf("[LAAP] 主动表达冷却中（距上次 %lu 秒，触发=%s）\n",
+                  (unsigned long)((millis() - s_lastExpressMs) / 1000), trigger.c_str());
+    return;
+  }
+  s_lastExpressMs = millis();                    // 受理即计时（失败也已占用这一轮）
   LlmMsg m[2] = {
     {"system", buildSystemPrompt()},
     {"user", buildUserPrompt("", trigger)} };
@@ -184,16 +197,21 @@ static String g_monoTopic, g_monoSight, g_monoKnow;   // 独白中间产物（�
 // 独白流水线（跑在后台 LLM 任务里：出题→看一眼→搜索→成文，纯网络无 UI）
 static String g_monoCtx;    // 提交侧（loopTask）拍的上下文快照，llmTask 只读它
 static String g_monoSys;    // 同上：buildSystemPrompt 也读 mind 全量，提交侧拍好
+static String g_monoTopics; // 同上：g_recentTopics 由收割侧（loopTask）追加，后台读会撕裂 String
 
 static LlmReply monologueGenerate() {
-  g_monoTopic = g_monoSight = g_monoKnow = "";
   LlmMsg m1[2] = {
     {"system", String("你是") + cfg.s.agentName + "，正在独立思考。基于你的性格参数与最近经历，"
                "提出一个此刻最好奇的具体问题。只回两行：第一行是问题本身（15字内，不要标点结尾）；"
                "第二行是搜索它的关键词（2到4个词，主语在前，空格分隔，不要解释）。"
-               "最近已经想过这些（不要重复）：" + g_recentTopics},
+               "最近已经想过这些（不要重复）：" + g_monoTopics},
     {"user", String("主导欲望是「") + mind.goalCn() + "」，情绪「" + mind.moodCn() + "」。想一个新问题。"} };
-  LlmReply q = llm.chatMsgs(m1, 2, 60, 0.95f);
+  // 1600 而不是 60：思考型模型（v4 系）光"想"就能吃掉上千 token，给 60 的结果是
+  // content 恒空（实测 60/120/240/600/1200 全空，reasoning_content 却涨到 6.8KB）→
+  // 独白永远起不来。一次要够，别靠翻倍重试堆三次 TLS（每次 ~40KB 内部堆，峰值掉到 14KB，
+  // 会把后面的搜索/成文连接一起拖垮）。
+  Serial.printf("[LAAP·独白] 出题中（heap %uKB）…\n", (unsigned)(ESP.getFreeHeap() / 1024));
+  LlmReply q = llm.chatMsgs(m1, 2, 1600, 0.95f);
   if (!q.ok || q.say.length() < 4) return LlmReply();  // 离线/失败就保持安静
 
   // 第一行=问题，第二行=搜索词（防主语劫持：必应按首词排序，主语要放最前）
@@ -214,8 +232,17 @@ static LlmReply monologueGenerate() {
     if (g_monoSight.length()) Serial.printf("[VISION] %s\n", g_monoSight.c_str());
   }
   g_monoKnow = laapSearch.search(query, 3, 500);
-  Serial.printf("[LAAP·独白] 话题「%s」 搜「%s」:%s\n", g_monoTopic.c_str(), query.c_str(),
-                g_monoKnow.length() ? "OK" : laapSearch.lastError.c_str());
+  Serial.printf("[LAAP·独白] 话题「%s」 搜「%s」:%s（heap %uKB）\n", g_monoTopic.c_str(), query.c_str(),
+                g_monoKnow.length() ? "OK" : laapSearch.lastError.c_str(),
+                (unsigned)(ESP.getFreeHeap() / 1024));
+
+  // 成文前的堆闸门：前面几步的 TLS 会话释放得慢（碎片），堆太低时硬发必然"连接失败"
+  // （实测 heap 14KB 时 api.deepseek.com 直接连不上）。等它回收，等不回来就这轮保持安静。
+  for (int i = 0; i < 12 && ESP.getFreeHeap() < 45000; i++) vTaskDelay(pdMS_TO_TICKS(250));
+  if (ESP.getFreeHeap() < 45000) {
+    Serial.printf("[LAAP·独白] 堆仅 %uKB，成文步放弃（下轮再来）\n", (unsigned)(ESP.getFreeHeap() / 1024));
+    return LlmReply();
+  }
 
   // recentContext 遍历 _work String 环——loopTask 的 logEvent 同时会覆写槽位，
   // 并发读会拿悬垂缓冲。在 llmTask 里只读这份提交时拍好的快照（g_monoCtx）。
@@ -267,10 +294,20 @@ bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
   }
   shape += "] last=" + String(msgs[req->nm - 1].content.length()) + "B";
   strlcpy(g_lastReqShape, shape.c_str(), sizeof(g_lastReqShape));
-  Serial.printf("[LLM] 请求 %s\n", shape.c_str());
+  Serial.printf("[LLM] 请求 %s（heap %uKB/最大块 %uKB）\n", shape.c_str(),
+                (unsigned)(ESP.getFreeHeap() / 1024),
+                (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024));
   g_llmBusy = true;
-  g_llmHasNew = false;
-  xQueueSend(g_llmQueue, &req, 0);
+  // 注意：这里**不能**清 g_llmHasNew。若上一条结果还没被 loop 收割就走到了这里，
+  // 清标志等于把那条结果直接丢了（网页聊天会一直等到超时、那句话也不会进记忆/不上屏）。
+  // 收割读的是 (g_resultKind, g_llmResult) 同一代的一对值，留着标志只会让它被正常处理。
+  if (xQueueSend(g_llmQueue, &req, 0) != pdTRUE) {
+    // 队列满（理论不该发生，但一旦发生：旧代码会漏掉这个请求 + busy 永远为真 → 全部交互停摆）
+    Serial.println("[LLM] 队列已满，本次请求放弃");
+    delete req;
+    g_llmBusy = false;
+    return false;
+  }
   return true;
 }
 
@@ -302,6 +339,7 @@ String laapInteractSearch(const String& userText) {
   // 原来先记账再取最近对话 → 同一句话既在历史里又在队尾，模型会看到主人把话说了两遍。
   mind.onUserInteraction();
   mind.trustUpdate(1, 0);      // 小凌⑥: 主人主动来找我=正向互动
+  laapResetIdleClock();        // 有人在跟它说话：独白让位，重新等静默
   display.drawFace(mind.moodKey(), true);
 
   // 本地意图工具表先行（小智 MCP 思想端侧版）：音量/亮度等指令不走 LLM
@@ -427,6 +465,7 @@ void llmHarvest() {
     }
     g_lastSay = r.say;
     g_lastExpr = r.expr.length() ? r.expr : "curious";
+    mind.onMonologue();      // 自言自语也算表达/好奇被满足（原来不算 → 需求只涨不落）
     display.drawFace(g_lastExpr.c_str());
     memory.logEvent("aris", "【自发】我刚才在想「" + g_monoTopic + "」：" + r.say);
     if (g_monoKnow.length()) memory.logEvent("world", g_monoTopic + " → " + utf8Cut(g_monoKnow, 80));  // 字节截断会切半汉字（曾污染 episodes.jsonl）
@@ -481,19 +520,28 @@ void llmHarvest() {
 //  自发独白 v3.2：主循环只做门槛判断+投递，全流程（出题→看→搜→成文）
 //  在后台 LLM 任务跑，思考期间身体（网页/串口/语音）不再冻结
 // ============================================================
-void arisIdleMonologue() {
+// 返回 true=这次真的提交出去了（调用方据此推进"已独白过一轮"）
+bool arisIdleMonologue() {
   if (g_llmFailStreak >= 2) {             // 连续失败让路（等效退避），本轮沉默
     Serial.println("[LAAP·独白] LLM 连败，本轮沉默");
-    return;
+    return false;
   }
   LlmMsg m[1] = { {"user", ""} };
-  // 提交侧拍快照：llmTask 里不再遍历 _work String 环 / mind（与 logEvent 并发=悬垂指针）
+  // 提交侧（loopTask）清中间产物：清空这个动作必须在任务开始写之前、且只由主线程做，
+  // 否则"任务重置 + 收割侧读取"同刻发生就是 String 撕裂
+  g_monoTopic = g_monoSight = g_monoKnow = "";
+  // 提交侧拍快照：llmTask 里不再遍历 _work String 环 / mind / g_recentTopics
+  // （这些都由 loopTask 并发改写，后台直接读=String 撕裂→堆损坏）
   g_monoCtx = memory.recentContext(300);
   g_monoSys = buildSystemPrompt();
-  if (llmSubmit(m, 1, 40, 0.95f, "", LK_MONO)) {
-    display.drawFace("curious", true);    // 起意表情（后台思考中）
-    Serial.println("[LAAP·独白] 起意（后台思考中）");
+  g_monoTopics = g_recentTopics;
+  if (!llmSubmit(m, 1, 40, 0.95f, "", LK_MONO)) {
+    Serial.println("[LAAP·独白] LLM 忙，本轮放弃");
+    return false;
   }
+  display.drawFace("curious", true);      // 起意表情（后台思考中）
+  Serial.println("[LAAP·独白] 起意（后台思考中）");
+  return true;
 }
 
 
@@ -615,15 +663,11 @@ String buildUserPrompt(const String& userText, const String& trigger) {
   String p = "[世界模型] " + mind.worldJson() + "\n";
   if (recall.length()) p += "[相关回忆] " + recall + "\n";
   if (ctx.length()) p += "[最近发生] " + ctx + "\n";
-  if (userText.length()) {
-    p += String("[此刻] ") + cfg.s.ownerName + "对你说：「" + userText + "」\n"
-         "先直接回应他说的这件事本身（他问什么就答什么、他说什么就接什么），"
-         "再自然带出你的状态；不要答非所问，也不要只顾自言自语。";
-  } else {
-    p += String("[此刻] 心跳周期。你的主导欲望是「") + mind.goalCn() + "」（强度" +
-         String(mind.dominance(), 2) + "），情绪是「" + mind.moodCn() + "」。主动说一句贴合状态的话。";
-  }
-  // 主导需求一行指引（把"此刻最渴什么"直接递到嘴边）
+
+  // 状态类提示必须排在"这次要回答的话"之前：模型最听最后读到的那句，
+  // 原来 [状态提示]/[忽然想起] 放在提问之后，实测把模型带跑偏——
+  // 问"你为什么想在深夜找人说话？"，它答"放空一下，挺好的。"
+  // （因为它最后读到的是"能量低，话少慵懒一点"）。
   const Needs& n = mind.needs();
   float v[5] = {n.energy, n.curiosity, n.social, n.security, n.expression};
   const char* hint[5] = {"能量低，话少慵懒一点", "好奇高，可以主动发问",
@@ -631,12 +675,24 @@ String buildUserPrompt(const String& userText, const String& trigger) {
                          "表达高，有分享欲"};
   int top = 0;
   for (int i = 1; i < 5; i++) if (v[i] > v[top]) top = i;
-  p += String("[状态提示] ") + hint[top] + "。";
+  // 只有需求真的"渴"时才给语气指引：全都很低时还提示"慵懒"会让模型干脆不答话
+  if (v[top] < 0.45f) p += "[状态提示] 状态平稳，正常回应就好。\n";
+  else                p += String("[状态提示] ") + hint[top] + "。\n";
   // F6 联想回忆：25% 概率让一段旧事漂进此刻（意识流）
   if (userText.length() && (esp_random() % 100) < 25) {
     String assoc = associativeRecall(userText, recall);
     if (assoc.length() > 20)
-      p += String("\n[忽然想起] ") + assoc + "\n（如果自然，可以提一句这段回忆）";
+      p += String("[忽然想起] ") + assoc + "\n（如果自然，可以提一句这段回忆，不必勉强）\n";
+  }
+
+  // —— 本次要回答的内容永远放最后（模型对末尾最敏感）——
+  if (userText.length()) {
+    p += String("[此刻] ") + cfg.s.ownerName + "对你说：「" + userText + "」\n";
+    p += "先直接回应他说的这件事本身（他问什么就答什么、他说什么就接什么），"
+         "再自然带出你的状态；不要答非所问，也不要只顾自言自语。";
+  } else {
+    p += String("[此刻] 心跳周期。你的主导欲望是「") + mind.goalCn() + "」（强度" +
+         String(mind.dominance(), 2) + "），情绪是「" + mind.moodCn() + "」。主动说一句贴合状态的话。";
   }
   (void)trigger;
   return p;
@@ -781,7 +837,7 @@ void psiTick() {
   if (g_imuOk) motion = imuMotionLevel();
   mind.sense(motion, (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0);
   // 小凌②③: 身体感受进内核（体温/信号/时长 → 需求衰减调制）
-  mind.senseBody(temperatureRead(), WiFi.RSSI(), millis());
+  mind.senseBody(temperatureRead(), WiFi.RSSI(), millis(), dtMin);
   laapTrustSet(mind.trust);   // 小凌⑥: 心跳时同步回写（cfg.save() 时落 NVS）
 
   display.drawNeeds(mind.needs().energy, mind.needs().curiosity, mind.needs().social,
@@ -839,7 +895,7 @@ void serialCli() {
     if (!line.length()) continue;
     laapActivity();     // 串口打字也是交互
     if (line == "/help") {
-      Serial.println("命令: /status /look(视觉识图) /search 词 /weather 城市 /touch(摇晃) /touchpad(触摸) /screen N /redraw /i2cscan /portal /mem /reflect(立刻反思) /tick /lcd /pa /imu /asrtest /reset");
+      Serial.println("命令: /status /look(视觉识图) /search 词 /weather 城市 /touch(摇晃) /touchpad(触摸) /screen N /redraw /i2cscan /portal /mem /reflect(立刻反思) /mono(立刻独白) /nothink 0|1 /tick /lcd /pa /imu /asrtest /reset");
       Serial.println("      直接打字回车 = 跟它说话（走完整对话链路）");
     } else if (line == "/touch") {
       // 触觉实测：5 秒采样，摇晃/扣翻板子看峰值与判定
@@ -1030,7 +1086,13 @@ void serialCli() {
         Serial.printf("[ASR] 转写失败: %s\n", err.c_str());
         // 内容/格式二分：用 1s 合成 440Hz（格式已知完好）再试一次
         Serial.println("[ASR] 用合成音复测（区分格式问题 vs 录音内容问题）…");
-        static int16_t tone[8000];             // 0.5s@16k（32KB 静态版吃堆致 TLS 握手失败）
+        // 0.5s@16k 合成音：放 PSRAM（16KB 常驻内部堆会切碎堆，TLS 握手要一整块）
+        static int16_t* tone = nullptr;
+        if (!tone) {
+          tone = (int16_t*)heap_caps_malloc(8000 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+          if (!tone) tone = (int16_t*)malloc(8000 * sizeof(int16_t));
+        }
+        if (!tone) { Serial.println("[ASR] 缓冲分配失败"); continue; }
         for (int i = 0; i < 8000; i++) tone[i] = (int16_t)(9000 * sinf(2 * PI * 440 * i / 16000.0));
         String err2;
         String t2 = asr.transcribe(tone, 16000, err2);
@@ -1047,6 +1109,15 @@ void serialCli() {
       psiTick();
     } else if (line.startsWith("/say ")) {
       voice.speak(line.substring(5), "calm");
+    } else if (line == "/mono") {
+      // 手动触发一轮独白（忽略"静默满 N 分"与"深夜不冒泡"这两道门槛，方便随时验证）
+      Serial.println("[LAAP·独白] 手动触发一轮（忽略静默/深夜门槛）");
+      if (arisIdleMonologue()) Serial.println("[LAAP·独白] 已提交，等后台出结果（约 10~30 秒）");
+    } else if (line.startsWith("/nothink")) {
+      String a = line.substring(8); a.trim();
+      if (a.length()) { cfg.s.llmNoThink = (a.toInt() != 0) ? 1 : 0; cfg.save(); }
+      Serial.printf("[LLM] 关闭思考 = %s（请求里%s带 thinking:disabled）\n",
+                    cfg.s.llmNoThink ? "开" : "关", cfg.s.llmNoThink ? "" : "不");
     } else if (line == "/reflect") {
       nightlyReflect(true);          // 立刻做一次夜间反思（不等 0-5 点窗口）
     } else if (line.startsWith("/vol")) {
@@ -1171,6 +1242,8 @@ void laapLocalReact(const char* kind) {
   else if (!strcmp(kind, "makeup"))   { face = "happy";   line = "哦，亮了，好受点了。"; }
   else if (!strcmp(kind, "touch"))    { face = "curious"; line = "嗯？你戳我。"; }
   Serial.printf("[触觉] 反馈[%s]: %s\n", kind, line.c_str());
+  laapResetIdleClock();      // 被摸/被摇=真人在场：独白让位（原来只有 g_lastSay 变化算数，
+                             // 而这类本地反应也改 g_lastSay，独白时钟会被自己的反应重置）
   memory.logEvent("event", line);
   g_lastSay = line;
   g_lastExpr = face;
@@ -1301,6 +1374,7 @@ void loop() {
     else if (held > 60) {
       laapActivity();                 // 按键=活动（息屏先点亮）
       mind.onButtonPress();
+      laapResetIdleClock();           // 主人按键=在场的交互
       if (voice.ready() && (VoiceMode)cfg.s.voiceMode == VoiceMode::Vad) {
         voice.setVadPaused(!voice.vadPaused());   // 自动聆听模式：短按=暂停/恢复
       } else if (voice.ready() && (VoiceMode)cfg.s.voiceMode == VoiceMode::Button) {
@@ -1340,16 +1414,26 @@ void loop() {
     if (g_lastIdleMs == 0) g_lastIdleMs = millis();
     if (millis() - g_lastIdleMs > idleGap) {
       g_lastIdleMs = millis();
-      g_idledOnce = true;
-      arisIdleMonologue();
+      if (arisIdleMonologue()) g_idledOnce = true;   // 只有真的提交出去了才算"独白过一轮"
     }
   }
-  // 任何交互都重置独白计时（用户在陪它就不插嘴，回到"等满静默"状态）
-  static String lastSeenSay;
-  if (g_lastSay != lastSeenSay) {
-    lastSeenSay = g_lastSay;
-    if (g_lastSay.length() && !g_lastSay.startsWith("【")) { g_lastIdleMs = millis(); g_idledOnce = false; }
-  }
+  // 独白计时只在"主人来找它"时重置（见 laapResetIdleClock 的调用点）。
+  // 旧实现盯着 g_lastSay 变化就重置——它自己说一句话也会重置，等于永远回到"等满静默"，
+  // 后台配的 idleEveryMin 形同虚设（实测周期永远是 idleSilenceMin）。
 
   delay(10);
+}
+
+// 主人有交互 → 重新开始"等静默"（独白让位）；它自己说话不重置
+void laapResetIdleClock() {
+  g_lastIdleMs = millis();
+  g_idledOnce = false;
+}
+
+// 独白计时诊断（/api/status 用）：一眼看出"还差多久冒泡 / 处于哪种节奏"
+String laapIdleInfo() {
+  uint32_t mins = g_lastIdleMs ? (millis() - g_lastIdleMs) / 60000UL : 0;
+  uint32_t gap = g_idledOnce ? cfg.s.idleEveryMin : cfg.s.idleSilenceMin;
+  return String("silent=") + mins + "min/" + gap + "min "
+       + (g_idledOnce ? "steady" : "first") + (g_llmFailStreak >= 2 ? " llmFail" : "");
 }

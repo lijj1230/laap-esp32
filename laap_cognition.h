@@ -27,9 +27,12 @@ public:
   void tick(float dtMin);             // PSI 心跳：需求随时间演化
   void onUserInteraction();           // 主人说话：社交/好奇释放
   void onExpressed(bool success);     // 完成一次表达
+  // 独白（自言自语）：也算"说了话"，好奇/表达/社交都该被满足一点——
+  // 原来独白走的是 LK_MONO 提前 return 的支路，完全不计入满足，需求照样只涨不落
+  void onMonologue();
   void onError();                     // LLM/网络出错：不安全感上升
   void sense(float motion, int rssi); // 世界模型传感器输入
-  void senseBody(float tempC, int rssi, uint32_t upMs); // 小凌②③: 身体状态调制系数
+  void senseBody(float tempC, int rssi, uint32_t upMs, float dtMin); // 小凌②③: 身体状态调制系数（按分钟计率）
   void onButtonPress();
 
   // ---- 小凌⑥: 对主人的信任（四通道 ΔTrust，NVS 持久化在主程序侧） ----
