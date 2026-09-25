@@ -316,6 +316,33 @@ String laapInteractSearch(const String& userText) {
     return toolReply;
   }
 
+  // 视觉：问"看到什么/看看/摄像头"时抓一帧让它看（走视觉后端，不进聊天上下文）
+  {
+    static const char* vkeys[] = {"看到", "看见", "看看", "看一眼", "摄像头", "拍照", "这是啥", "这是什么", "眼前"};
+    bool wantLook = false;
+    for (auto k : vkeys) if (userText.indexOf(k) >= 0) { wantLook = true; break; }
+    if (wantLook && vision.available()) {
+      Serial.println("[LAAP] 视觉请求：抓帧识图…");
+      display.drawFace("curious", true);
+      String d = vision.look(userText);
+      if (d.length()) {
+        vision.logSight(d);
+        g_lastSay = d; g_lastExpr = "curious";
+        g_chatReply = d; g_chatSeq++;              // 直接成品，网页可立即显示
+        memory.logEvent("user", userText);
+        memory.logEvent("aris", d);
+        laapActivity();
+        Serial.printf("[Aris·看] %s\n", d.c_str());
+        display.drawFace("curious", false);
+        voice.speak(d, "curious");
+        return d;
+      }
+      Serial.printf("[LAAP] 视觉失败（%s），交给搜索/大模型兜底\n", vision.lastError.c_str());
+    } else if (wantLook) {
+      Serial.println("[LAAP] 视觉未就绪（/api/status 的 vision_ready）");
+    }
+  }
+
   String knowledge;
   if (wantsSearch(userText)) {
     display.drawFace("curious");
@@ -486,7 +513,12 @@ String timeFeelLine() {
   else if (h < 18)       slot = "下午";
   else if (h < 23)       slot = (wd == 0 || wd == 6) ? "周末晚上" : "晚上";
   else                   slot = "深夜";
-  String line = String("[时间感] 现在是") + slot + "，星期" + wday[wd] + " " + t.tm_hour + " 点。";
+  // 精确到分钟 + 日期：只给"几点"时模型会自己编分钟（用户实测"问时间不准"），必须把钟摆给它
+  char clock[128];
+  snprintf(clock, sizeof(clock), "[时间感] 现在是%s，%d 月 %d 日 星期%s %02d:%02d。",
+           slot.c_str(), t.tm_mon + 1, t.tm_mday, wday[wd], t.tm_hour, t.tm_min);
+  String line(clock);
+  line += "（主人问时间/日期就用这个，不要猜。）";
   if (h >= 23 || h < 6)  line += "深夜了，说话轻一点、短一点，也别自言自语吵人。";
   else if (h >= 18)      line += "傍晚时分，适合聊聊天。";
   else if (h < 8)        line += "刚醒不久，世界还很安静。";
@@ -790,7 +822,7 @@ void serialCli() {
     if (!line.length()) continue;
     laapActivity();     // 串口打字也是交互
     if (line == "/help") {
-      Serial.println("命令: /status /touch(摇晃实测) /touchpad(触摸屏实测) /screen N(息屏秒) /redraw(重画整屏) /i2cscan /portal(配置热点) /mem(看记忆) /tick(手动心跳) /lcd /pa /imu /asrtest /reset(格式化)");
+      Serial.println("命令: /status /look(视觉识图) /search 词 /weather 城市 /touch(摇晃) /touchpad(触摸) /screen N /redraw /i2cscan /portal /mem /tick /lcd /pa /imu /asrtest /reset");
       Serial.println("      直接打字回车 = 跟它说话（走完整对话链路）");
     } else if (line == "/touch") {
       // 触觉实测：5 秒采样，摇晃/扣翻板子看峰值与判定
@@ -867,6 +899,32 @@ void serialCli() {
                       hits ? "触摸屏工作正常（以后点屏幕它就会回应）"
                            : "没采到触点（手没点到屏上？还是这块屏不是触摸屏）");
       }
+    } else if (line == "/lookdump") {
+      // 视觉取证：抓帧→PNG→base64 全部从串口吐出（本机解码验证 PNG 合法性/看画面内容）
+      Serial.println("[LOOKDUMP] BEGIN");
+      size_t n = 0;
+      { String b = vision.debugPngB64(n);   // 复用同一条编码链路
+        Serial.printf("[LOOKDUMP] PNG b64 %u 字节\n", (unsigned)n);
+        for (size_t i = 0; i < b.length(); i += 180) {
+          Serial.println(b.substring(i, i + 180));
+          if ((i / 180) % 20 == 19) delay(30);   // 流控：别把串口缓冲冲爆
+        } }
+      Serial.println("[LOOKDUMP] END");
+    } else if (line.startsWith("/look")) {
+      // 视觉端到端实测：抓帧 → BMP/base64 → 视觉后端 → 描述（串口全可见）
+      String q = line.length() > 5 ? line.substring(5) : String("");
+      q.trim();
+      Serial.printf("[VISION] 抓帧识图%s\n", q.length() ? ("（问题：" + q + "）").c_str() : "…");
+      uint32_t t0 = millis();
+      String d = vision.look(q);
+      if (d.length()) {
+        Serial.printf("[VISION] %s\n[VISION] 用时 %lums\n", d.c_str(), millis() - t0);
+        vision.logSight(d);
+      } else {
+        Serial.printf("[VISION] 失败: %s（%lums）\n", vision.lastError.c_str(), millis() - t0);
+      }
+      Serial.printf("[VISION] heap %uKB / psram %uKB\n",
+                    (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getFreePsram() / 1024));
     } else if (line.startsWith("/search ")) {
       // 搜索链路实测：看设备到底抓回了什么（"答非所问"时先看这里）
       String q = line.substring(8); q.trim();

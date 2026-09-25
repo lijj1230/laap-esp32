@@ -3,6 +3,7 @@
 #include "laap_display.h"
 #include "laap_config.h"
 #include "laap_llm.h"      // utf8Cut
+#include <time.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 
@@ -222,6 +223,33 @@ static String weatherReport(const String& city) {
 }
 
 String laapToolsDispatch(const String& text) {
+  // 时间/日期：直接读本机 NTP 时钟。旧链路只把"几点"写进提示词、没有分钟，
+  // 模型只能自己编 → 用户实测"问时间不准"（2026-09-26）
+  static const char* tkeys[] = {"几点", "现在时间", "什么时间", "几号", "星期几", "周几", "今天的日期", "几月几号"};
+  if (containsAny(text, tkeys, 8)) {
+    time_t now = time(nullptr);
+    if (now < 1700000000) return "我的时钟还没跟网络对上，等我联网校准一下再问我吧。";
+    struct tm t; localtime_r(&now, &t);
+    static const char* wd[] = {"日", "一", "二", "三", "四", "五", "六"};
+    char buf[80];
+    snprintf(buf, sizeof(buf), "现在是 %d 月 %d 日 星期%s，%02d:%02d。",
+             t.tm_mon + 1, t.tm_mday, wd[t.tm_wday], t.tm_hour, t.tm_min);
+    Serial.printf("[TOOLS] time → %s\n", buf);
+    return String(buf);
+  }
+  // 自身状态：直接读传感器（只认第一人称问法，避免"今天多少度"被抢答成体温）
+  static const char* skeys[] = {"运行多久", "开机多久", "你多少度", "你的温度", "你热不热",
+                                "你的信号", "内存还剩", "你醒多久"};
+  if (containsAny(text, skeys, 8)) {
+    uint32_t up = laapUptimeMin();
+    char buf[170];
+    snprintf(buf, sizeof(buf), "我这次醒来 %u 分钟（累计运行 %u 小时 %u 分），芯片体温 %.1f 度，"
+                              "WiFi 信号 %d dBm，脑子里还剩 %uKB 空地方。",
+             (unsigned)(millis() / 60000UL), (unsigned)(up / 60), (unsigned)(up % 60),
+             temperatureRead(), WiFi.RSSI(), (unsigned)(ESP.getFreeHeap() / 1024));
+    Serial.printf("[TOOLS] self → %s\n", buf);
+    return String(buf);
+  }
   // 天气优先（联网快问）：设备上"查天气"最稳的一条路
   static const char* wkeys[] = {"天气", "气温", "下雨", "下雪", "冷不冷", "热不热", "weather"};
   if (containsAny(text, wkeys, 7)) {

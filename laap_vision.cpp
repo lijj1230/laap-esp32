@@ -7,6 +7,7 @@
 #include <WiFiClientSecure.h>
 #include <Wire.h>
 #include <base64.h>
+#include <mbedtls/base64.h>   // 直接编码进 PSRAM 缓冲（核心库的 base64::encode 只返回 String，205KB 会挤爆内部堆）
 
 LaapVision vision;
 
@@ -93,6 +94,131 @@ static String deChunk(const String& payload) {
   return clean;
 }
 
+// ============================================================
+//  RGB565 帧 → 标准 PNG（zlib 用 stored 块，不需要压缩库）
+//  为什么不用 BMP：视觉 API 普遍只收 png/jpeg/webp/gif，BMP 会被拒
+//  （实测 DeepSeek 回 "You have uploaded an unsupported image"）。GC0308 没有片上
+//  JPEG 编码器，所以端侧自己拼 PNG —— stored 块虽然不压缩，但格式合法、任何后端都认。
+//  代价：320x240 真彩色 ≈231KB（比 RGB565 的 205KB 大一点），全部放 PSRAM。
+// ============================================================
+static uint32_t crcTable[256];
+static bool crcReady = false;
+static void crcEnsure() {
+  if (crcReady) return;
+  for (uint32_t n = 0; n < 256; n++) {
+    uint32_t c = n;
+    for (int k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+    crcTable[n] = c;
+  }
+  crcReady = true;
+}
+static uint32_t crc32of(const uint8_t* p, size_t n, uint32_t crc = 0xFFFFFFFFu) {
+  crcEnsure();
+  for (size_t i = 0; i < n; i++) crc = crcTable[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+  return crc;
+}
+static void putBE32(uint8_t* p, uint32_t v) { p[0]=v>>24; p[1]=v>>16; p[2]=v>>8; p[3]=v; }
+
+// 生成 PNG；成功返回 PSRAM 缓冲（调用方 free），outLen 为总字节数
+static uint8_t* rgb565ToPng(const uint8_t* src, int w, int h, size_t& outLen) {
+  const size_t rowBytes = (size_t)w * 3 + 1;          // 每行 = 1 字节 filter(0) + RGB888
+  const size_t rawLen = rowBytes * (size_t)h;
+  const size_t nBlocks = rawLen / 65535 + 1;
+  const size_t idatLen = 2 + rawLen + nBlocks * 5 + 4;   // zlib 头 + stored 块 + adler32
+  const size_t total = 8 + 25 + (8 + idatLen + 4) + 12;
+  uint8_t* buf = (uint8_t*)ps_malloc(total);
+  if (!buf) return nullptr;
+
+  uint8_t* p = buf;
+  static const uint8_t sig[8] = {0x89,'P','N','G','\r','\n',0x1A,'\n'};
+  memcpy(p, sig, 8); p += 8;
+
+  // IHDR
+  putBE32(p, 13); memcpy(p + 4, "IHDR", 4);
+  putBE32(p + 8, (uint32_t)w); putBE32(p + 12, (uint32_t)h);
+  p[16] = 8; p[17] = 2; p[18] = 0; p[19] = 0; p[20] = 0;      // 8bit 真彩色 无压缩 无隔行
+  putBE32(p + 21, crc32of(p + 4, 17) ^ 0xFFFFFFFFu);
+  p += 25;
+
+  // IDAT
+  putBE32(p, (uint32_t)idatLen); memcpy(p + 4, "IDAT", 4);
+  uint8_t* idat = p + 8;
+  idat[0] = 0x78; idat[1] = 0x01;                             // zlib: deflate, 无预设字典
+  uint8_t* d = idat + 2;
+  size_t rawLeft = rawLen, blockLeft = 0;
+  uint32_t a = 1, b = 0;                                      // adler32（对未压缩字节流）
+  // 流式写入：stored 块的边界与"行"解耦（攒满 65535 字节才开新块），于是块头数量与
+  // idatLen 的估算一致。原来按行开块 = 240 个块头，而只预留了 4 个 → 越界写崩（实测重启）。
+  auto emit = [&](uint8_t byte) {
+    if (blockLeft == 0) {
+      size_t chunk = rawLeft < 65535 ? rawLeft : 65535;
+      d[0] = (chunk == rawLeft) ? 1 : 0;                      // BFINAL 仅最后一块
+      d[1] = (uint8_t)chunk; d[2] = (uint8_t)(chunk >> 8);
+      d[3] = (uint8_t)~d[1]; d[4] = (uint8_t)~d[2];
+      d += 5; blockLeft = chunk;
+    }
+    *d++ = byte; rawLeft--; blockLeft--;
+    a += byte; if (a >= 65521) a -= 65521;
+    // b += a 最多可能到 131040（两个周期）→ 必须循环减，只减一次会让 adler32 偏大、
+    // zlib 端报 "incorrect data check"（实测就是这里错了，PNG 结构本身没问题）
+    b += a;    while (b >= 65521) b -= 65521;
+  };
+  for (int y = 0; y < h; y++) {
+    emit(0);                                                  // 每行 filter=None
+    const uint8_t* s = src + (size_t)y * w * 2;
+    for (int x = 0; x < w; x++) {
+      uint16_t v = (uint16_t)(s[1] | (s[0] << 8)); s += 2;   // GC0308 的 RGB565 是高字节在前（字节序反了会变彩虹噪点）
+      uint8_t r = (uint8_t)((v >> 11) & 0x1F), g = (uint8_t)((v >> 5) & 0x3F), bl = (uint8_t)(v & 0x1F);
+      emit((uint8_t)((r << 3) | (r >> 2)));
+      emit((uint8_t)((g << 2) | (g >> 4)));
+      emit((uint8_t)((bl << 3) | (bl >> 2)));
+    }
+  }
+  // adler32 = (b << 16) | a，zlib 大端存放。只写 a 会让解压端报 "incorrect data check"
+  { uint32_t adler = (b << 16) | a;
+    d[0] = (uint8_t)(adler >> 24); d[1] = (uint8_t)(adler >> 16);
+    d[2] = (uint8_t)(adler >> 8);  d[3] = (uint8_t)adler; }
+  d += 4;
+  putBE32(d, crc32of(idat - 4, idatLen + 4) ^ 0xFFFFFFFFu);
+  p = d + 4;
+
+  // IEND
+  putBE32(p, 0); memcpy(p + 4, "IEND", 4);
+  putBE32(p + 8, crc32of(p + 4, 4) ^ 0xFFFFFFFFu);
+  p += 12;
+
+  outLen = (size_t)(p - buf);
+  return buf;
+}
+
+// 诊断用：抓帧 → PNG → base64（与 look 同一条链路），返回 base64 文本
+String LaapVision::debugPngB64(size_t& outLen) {
+  outLen = 0;
+  if (!_ok) { lastError = "摄像头未就绪"; return ""; }
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) { lastError = "抓帧失败"; return ""; }
+  size_t pngLen = 0;
+  uint8_t* png = rgb565ToPng(fb->buf, (int)fb->width, (int)fb->height, pngLen);
+  esp_camera_fb_return(fb);
+  if (!png) { lastError = "PNG 生成失败"; return ""; }
+  size_t need = 4 * ((pngLen + 2) / 3) + 8;
+  char* b64 = (char*)ps_malloc(need);
+  if (!b64) { free(png); lastError = "PSRAM 不足"; return ""; }
+  size_t olen = 0;
+  if (mbedtls_base64_encode((unsigned char*)b64, need, &olen, png, pngLen) != 0) {
+    free(png); free(b64); lastError = "base64 失败"; return "";
+  }
+  free(png);
+  String out; out.reserve(olen + 4);
+  for (size_t i = 0; i < olen; i += 512) {           // 分块 append，避免一次性大分配
+    size_t n = (olen - i) < 512 ? (olen - i) : 512;
+    out.concat(b64 + i, n);
+  }
+  free(b64);
+  outLen = olen;
+  return out;
+}
+
 String LaapVision::look(const String& question) {
   lastError = "";
   if (!_ok) { lastError = "摄像头未就绪"; return ""; }
@@ -102,37 +228,52 @@ String LaapVision::look(const String& question) {
   bool bridge = cfg.s.visionBase[0] != 0;
   bool direct = cfg.s.visionLlmBase[0] != 0;
   if (!bridge && !direct) { lastError = "视觉未配置（填手机桥 URL 或直连视觉 base）"; return ""; }
-  if (ESP.getFreeHeap() < 120000) { lastError = "内存不足，跳过视觉"; return ""; }  // base64 需 200KB+
+  // base64 约 205KB、原始帧 150KB：都放 PSRAM。旧代码只看内部堆（90KB 时就报"内存不足"而永远跳过视觉）
+  if (ESP.getFreePsram() < 400000) { lastError = "PSRAM 不足，跳过视觉"; return ""; }
 
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) { lastError = "抓帧失败"; return ""; }
-  String b64 = base64::encode(fb->buf, fb->len);
-  esp_camera_fb_return(fb);
-  if (b64.length() > 260000) { lastError = "帧过大"; return ""; }   // body 上限保护（RGB565 QVGA≈200KB）
+  if (fb->format != PIXFORMAT_RGB565) { esp_camera_fb_return(fb); lastError = "像素格式非 RGB565"; return ""; }
 
-  String url, body, auth;                       // auth 非空则带 Bearer 头（直连用）
+  // ---- 图像封装：RGB565 → 标准 PNG（BMP 会被 API 拒，实测 DeepSeek 直接 400）
+  size_t pngLen = 0;
+  uint8_t* raw = rgb565ToPng(fb->buf, (int)fb->width, (int)fb->height, pngLen);
+  uint32_t px = fb->len;
+  esp_camera_fb_return(fb);
+  if (!raw) { lastError = "PSRAM 不足(PNG)"; return ""; }
+
+  size_t need = 4 * ((pngLen + 2) / 3) + 8;
+  char* b64 = (char*)ps_malloc(need);
+  if (!b64) { free(raw); lastError = "PSRAM 不足(b64)"; return ""; }
+  size_t olen = 0;
+  if (mbedtls_base64_encode((unsigned char*)b64, need, &olen, raw, pngLen) != 0) {
+    free(raw); free(b64); lastError = "base64 编码失败"; return "";
+  }
+  free(raw);
+  b64[olen] = 0;
+  Serial.printf("[VISION] 帧 %ux%u %uB → PNG %uB → b64 %uB（heap %uKB / psram %uKB）\n",
+                (unsigned)320, (unsigned)240, (unsigned)px, (unsigned)pngLen, (unsigned)olen,
+                (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getFreePsram() / 1024));
+
+  // ---- 请求体拆成 前缀 + b64 + 后缀 三段流式发出：205KB base64 绝不进 String（会挤爆内部堆）
+  String url, prefix, suffix, auth;
   if (bridge) {
     // 模式一：手机桥 {image, question} → {desc}
     url = cfg.s.visionBase;
-    body.reserve(b64.length() + question.length() + 64);
-    body = "{\"image\":\""; body += b64;
-    body += "\",\"question\":\""; body += LlmClient::jsonEscape(question);
-    body += "\"}";
+    prefix = "{\"image\":\"";
+    suffix = "\",\"question\":\"" + LlmClient::jsonEscape(question) + "\"}";
   } else {
-    // 模式二：直连 OpenAI 兼容多模态（OpenRouter 的 GLM-4V / Gemini Flash 等）
+    // 模式二：直连 OpenAI 兼容多模态（Gemini Flash / GLM-4V 等）
     url = cfg.s.visionLlmBase[0] ? cfg.s.visionLlmBase : "https://openrouter.ai/api/v1/chat/completions";
     const char* model = cfg.s.visionModel[0] ? cfg.s.visionModel : "google/gemini-flash-1.5";
     auth = String("Authorization: Bearer ") + (cfg.s.visionKey[0] ? cfg.s.visionKey : cfg.s.llmKey);
     String prompt = question.length()
       ? ("你是随身数字生命的一只眼睛，用一两句中文看图回答：" + LlmClient::jsonEscape(question))
       : String("你是随身数字生命的一只眼睛，用一两句中文简述照片里的场景。");
-    body.reserve(b64.length() + prompt.length() + 400);
-    body = "{\"model\":\""; body += model;
-    body += "\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"";
-    body += prompt;
-    body += "\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,";
-    body += b64;
-    body += "\"}}]}],\"max_tokens\":300}";
+    prefix = String("{\"model\":\"") + model +
+      "\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"" + prompt +
+      "\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,";
+    suffix = "\"}}]}],\"max_tokens\":300}";
   }
 
   if (!url.startsWith("http")) { lastError = "URL 无效"; return ""; }
@@ -146,11 +287,16 @@ String LaapVision::look(const String& question) {
   WiFiClient* cli = tls ? (WiFiClient*)(new WiFiClientSecure) : new WiFiClient;
   if (tls) ((WiFiClientSecure*)cli)->setInsecure();
   cli->setTimeout(20000);
-  if (!cli->connect(host.c_str(), port)) { lastError = "连接失败:" + host; delete cli; return ""; }
+  if (!cli->connect(host.c_str(), port)) { lastError = "连接失败:" + host; delete cli; free(b64); return ""; }
+  size_t clen = prefix.length() + olen + suffix.length();
   cli->print(String("POST ") + path + " HTTP/1.1\r\nHost: " + host +
              (auth.length() ? ("\r\n" + auth) : "") +
-             "\r\nContent-Type: application/json\r\nContent-Length: " + body.length() +
-             "\r\nConnection: close\r\n\r\n" + body);
+             "\r\nContent-Type: application/json\r\nContent-Length: " + String((unsigned)clen) +
+             "\r\nConnection: close\r\n\r\n");
+  cli->print(prefix);
+  cli->print(b64);       // PSRAM 里的 205KB，直接按 NUL 结尾整段发出
+  cli->print(suffix);
+  free(b64);
   String resp; resp.reserve(4096);
   uint32_t dl = millis() + 45000;
   while (cli->connected() && millis() < dl) {
@@ -168,8 +314,9 @@ String LaapVision::look(const String& question) {
   if (st != 200) {
     String emsg;
     if (LlmClient::extractStringField(payload, "message", emsg) && emsg.length())
-      lastError = "HTTP " + String(st) + ": " + emsg.substring(0, 120);
+      lastError = "HTTP " + String(st) + ": " + emsg.substring(0, 300);
     else lastError = "HTTP " + String(st);
+    Serial.printf("[VISION] 失败原文: %.400s\n", payload.c_str());   // 完整错误码便于定位
     return "";
   }
   String out;

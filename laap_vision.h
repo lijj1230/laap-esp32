@@ -17,6 +17,7 @@ public:
   String look(const String& question = "");
   // 把最近一次所见注入记忆（世界模型"视觉"通道）
   void logSight(const String& desc);
+  String debugPngB64(size_t& outLen);   // 诊断：走同一条抓帧+PNG+base64 链路并把结果交出来
   String lastError;
 private:
   bool _ok = false;
