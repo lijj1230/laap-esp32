@@ -72,17 +72,23 @@ void LaapDisplay::begin() {
 
   pinMode(SZP_LCD_DC, OUTPUT);
   pinMode(SZP_LCD_BL, OUTPUT);
+  digitalWrite(SZP_LCD_BL, HIGH);      // 先拉满背光：让"软件活着"永远可见（亮度值稍后由 setup 应用）
   SPI.begin(SZP_LCD_CLK, -1, SZP_LCD_MOSI, -1);
 
+  // ST7789 上电时序鲁棒化：某些上电瞬间（3V3 爬升慢/USB 供电抖动）芯片停在半睡眠，
+  // 表现为背光亮但整屏黑。软件复位 + 充分延时 + 二次 DISPON 兜底。
   lcdCmd(0x01); // SWRESET
-  delay(150);
+  delay(200);                          // 数据手册要求 120ms，留裕量
   lcdCmd(0x11); // SLPOUT
-  delay(120);
+  delay(150);                          // 数据手册要求 120ms，留裕量
   lcdCmd(0x3A); uint8_t m = 0x55; lcdData(&m, 1); // 16bit
   lcdCmd(0x36); m = 0x60; lcdData(&m, 1);         // MADCTL: MV|MX 横屏(官方同款)
   lcdCmd(0x21); // INVON 反色(官方同款)
   lcdCmd(0x13); // NORON
+  delay(20);
   lcdCmd(0x29); // DISPON
+  delay(20);
+  lcdCmd(0x29); // DISPON 二次兜底（个别上电第一次 DISPON 被吞）
   setBrightness(90);
   fillRect(0, 0, SZP_LCD_W, SZP_LCD_H, CLR_BG);
 }
