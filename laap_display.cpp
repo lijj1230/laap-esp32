@@ -192,26 +192,27 @@ void LaapDisplay::drawEye(int cx, int cy, int rx, int ry, int pupDx, int pupDy, 
   }
 }
 
-// ================= 布局常量（三段式） =================
-// 表情区 0-129 | 状态区 130-191 | 底栏 192-239
-#define UI_FACE_H    130
-#define UI_NEEDS_Y   134
-#define UI_NEEDS_H   54
-#define UI_BAR_Y     196
-#define UI_BAR_H     44
+// ================= 布局常量（四段式） =================
+// 表情区 0-119 | 状态行 120-133（时间+心情）| 需求条 136-194 | 底栏 196-239
+#define UI_FACE_H    120
+#define UI_STATUS_Y  121
+#define UI_NEEDS_Y   138
+#define UI_NEEDS_H   58
+#define UI_BAR_Y     200
+#define UI_BAR_H     40
 
 void LaapDisplay::drawFace(const char* expr, bool thinking) {
   strlcpy(curExpr, expr, sizeof(curExpr));
-  int cx1 = 96, cx2 = SZP_LCD_W - 96, cy = 58;
-  int rx = 46, ry = 34, pdx = 0, pdy = 0, brow = 0;
+  int cx1 = 96, cx2 = SZP_LCD_W - 96, cy = 54;
+  int rx = 44, ry = 30, pdx = 0, pdy = 0, brow = 0;
   String e(expr); e.toLowerCase();
-  if (e == "happy")   { ry = 22; pdy = 6; }
-  else if (e == "curious")  { rx = 38; ry = 40; pdx = 6; pdy = -6; }
-  else if (e == "excited")  { rx = 52; ry = 46; }
-  else if (e == "lonely")   { ry = 26; pdy = 8; brow = 0; }
-  else if (e == "anxious")  { ry = 30; brow = -(ry + 10); }
-  else if (e == "tired")    { ry = 12; pdy = 2; }
-  else                     { rx = 44; ry = 32; } // calm
+  if (e == "happy")   { ry = 20; pdy = 6; }
+  else if (e == "curious")  { rx = 36; ry = 36; pdx = 6; pdy = -6; }
+  else if (e == "excited")  { rx = 48; ry = 40; }
+  else if (e == "lonely")   { ry = 24; pdy = 8; brow = 0; }
+  else if (e == "anxious")  { ry = 27; brow = -(ry + 10); }
+  else if (e == "tired")    { ry = 11; pdy = 2; }
+  else                     { rx = 42; ry = 30; } // calm
   fillRect(0, 0, SZP_LCD_W, UI_FACE_H, CLR_BG);
   if (thinking) brow = -(ry + 12);
   drawEye(cx1, cy, rx, ry, pdx, pdy, brow);
@@ -232,8 +233,8 @@ void LaapDisplay::blinkTick() {
       else if (e == "curious") { rx = 38; ryBase = 40; }
       int ry2 = (int)(ryBase * ry / 34); if (ry2 < 2) ry2 = 2;
       fillRect(0, 0, SZP_LCD_W, UI_FACE_H, CLR_BG);
-      drawEye(96, 58, rx, ry2, 0, 0, 0);
-      drawEye(SZP_LCD_W - 96, 58, rx, ry2, 0, 0, 0);
+      drawEye(96, 54, rx, ry2, 0, 0, 0);
+      drawEye(SZP_LCD_W - 96, 54, rx, ry2, 0, 0, 0);
       if (blinkPhase >= 8) { blinking = false; drawFace(curExpr, false); }
     }
   } else if (now - lastBlink > 4000 + (esp_random() % 4000)) {
@@ -254,7 +255,60 @@ void LaapDisplay::thinkingPulse() {
   fillRect(x, 118, 6, 4, CLR_DIM);
 }
 
-// ================= 需求条（状态区：圆点图标 + 柔和圆头条） =================
+// ================= 状态行（时间点阵 + 心情点 + 聆听点） =================
+// 3x5 微点阵（数字与冒号），状态行高度 14px 内
+static const uint8_t FONT3x5[10][5] = {
+  {0x07,0x05,0x05,0x05,0x07}, // 0
+  {0x02,0x06,0x02,0x02,0x07}, // 1
+  {0x07,0x01,0x07,0x04,0x07}, // 2
+  {0x07,0x01,0x07,0x01,0x07}, // 3
+  {0x05,0x05,0x07,0x01,0x01}, // 4
+  {0x07,0x04,0x07,0x01,0x07}, // 5
+  {0x07,0x04,0x07,0x05,0x07}, // 6
+  {0x07,0x01,0x02,0x02,0x02}, // 7
+  {0x07,0x05,0x07,0x05,0x07}, // 8
+  {0x07,0x05,0x07,0x01,0x07}, // 9
+};
+
+void LaapDisplay::drawDot3x5(int x, int y, int digit, uint16_t c) {
+  if (digit < 0 || digit > 9) return;
+  for (int col = 0; col < 3; col++) {
+    for (int row = 0; row < 5; row++) {
+      if (FONT3x5[digit][row] & (0x04 >> col)) fillRect(x + col, y + row, 1, 1, c);
+    }
+  }
+}
+
+void LaapDisplay::drawStatusLine() {
+  fillRect(0, UI_STATUS_Y, SZP_LCD_W, 14, CLR_BG);
+  // 时间 HH:MM（NTP 就绪时）
+  time_t nowT = time(nullptr);
+  if (nowT > 1700000000) {
+    struct tm t;
+    localtime_r(&nowT, &t);
+    uint16_t tc = RGB565(150, 165, 185);
+    int x = 10, y = UI_STATUS_Y + 4;
+    drawDot3x5(x, y, t.tm_hour / 10, tc); x += 5;
+    drawDot3x5(x, y, t.tm_hour % 10, tc); x += 5;
+    fillRect(x, y + 3, 1, 1, tc); fillRect(x, y + 1, 1, 1, tc); x += 3; // 冒号
+    drawDot3x5(x, y, t.tm_min / 10, tc); x += 5;
+    drawDot3x5(x, y, t.tm_min % 10, tc); x += 7;
+    // 心情文字用色点表示（在时间旁）
+    String e(curExpr); e.toLowerCase();
+    uint16_t mc = CLR_TXT;
+    if (e == "happy" || e == "excited") mc = CLR_EXP;
+    else if (e == "curious") mc = CLR_CUR;
+    else if (e == "anxious") mc = CLR_SEC;
+    else if (e == "tired") mc = CLR_DIM;
+    else if (e == "lonely") mc = CLR_SOC;
+    fillCircle(x + 2, y + 2, 3, mc);
+  } else {
+    // NTP 未同步：灰色时钟点
+    fillCircle(14, UI_STATUS_Y + 6, 3, CLR_DIM);
+  }
+}
+
+// ================= 需求条（防糊：大间距 + 亮底槽 + 圆头条） =================
 void LaapDisplay::drawNeeds(float energy, float curiosity, float social, float security, float expression) {
   struct { float v; uint16_t c; } bars[5] = {
     {energy,    CLR_ENE},
@@ -263,25 +317,25 @@ void LaapDisplay::drawNeeds(float energy, float curiosity, float social, float s
     {security,  CLR_SEC},
     {expression,CLR_EXP},
   };
-  const int bx = 14;                 // 左边距
-  const int bw = SZP_LCD_W - bx - 24;
-  const int bh = 6, gap = 10;
-  fillRect(0, UI_NEEDS_Y - 4, SZP_LCD_W, UI_NEEDS_H + 8, CLR_BG);
+  const int bx = 16;                  // 左边距
+  const int bw = SZP_LCD_W - bx - 24; // 条宽
+  const int bh = 8, gap = 13;         // 8px 条高 + 13px 间距（防糊关键）
+  fillRect(0, UI_NEEDS_Y - 6, SZP_LCD_W, UI_NEEDS_H + 10, CLR_BG);
   for (int i = 0; i < 5; i++) {
     int y = UI_NEEDS_Y + i * gap;
     int cy = y + bh / 2;
-    // 左侧圆点图标（当前需求色）
-    fillCircle(bx + 3, cy, 3, bars[i].c);
-    // 底槽（暗色圆头感：两端各缩1px的细槽）
-    fillRect(bx + 12, y, bw - 12, bh, RGB565(38, 44, 60));
-    // 值条（同高同位，色条覆盖底槽）
-    int fw = (int)((bw - 12) * (bars[i].v > 1 ? 1 : bars[i].v));
-    if (fw > bh) {                      // 圆头：条两端盖同直径圆点
-      fillRect(bx + 12, y, fw, bh, bars[i].c);
-      fillCircle(bx + 12, cy, bh / 2, bars[i].c);
-      fillCircle(bx + 12 + fw, cy, bh / 2, bars[i].c);
+    // 底槽：明显比背景亮一档（RGB565 52,62,84），一眼看清轨道
+    fillRect(bx, y, bw, bh, RGB565(52, 62, 84));
+    // 左侧圆点图标
+    fillCircle(bx - 6, cy, 3, bars[i].c);
+    // 值条（圆头）
+    int fw = (int)(bw * (bars[i].v > 1 ? 1 : bars[i].v));
+    if (fw > bh) {
+      fillRect(bx, y, fw, bh, bars[i].c);
+      fillCircle(bx, cy, bh / 2, bars[i].c);
+      fillCircle(bx + fw, cy, bh / 2, bars[i].c);
     } else if (fw > 0) {
-      fillRect(bx + 12, y, fw, bh, bars[i].c);
+      fillRect(bx, y, fw, bh, bars[i].c);
     }
   }
 }

@@ -730,6 +730,20 @@ void serialCli() {
       rb = (Wire.requestFrom((int)0x19, 1) == 1) ? Wire.read() : 0xFF;
       Serial.printf("[AUD] 播放中 PA_EN=%d（若 0 → paSet 未生效=硬件/扩展芯片问题）\n", (rb >> 1) & 1);
       audio.paSet(false);
+    } else if (line == "/imu") {
+      // IMU 诊断: 扫 0x6A/0x6B + 回读 WHO_AM_I
+      for (uint8_t a : {(uint8_t)0x6A, (uint8_t)0x6B}) {
+        Wire.beginTransmission(a);
+        bool ack = (Wire.endTransmission() == 0);
+        Serial.printf("[IMU] 0x%02X %s", a, ack ? "ACK" : "no resp");
+        if (ack) {
+          Wire.beginTransmission(a); Wire.write(0x00); Wire.endTransmission(false);
+          uint8_t id = Wire.requestFrom((int)a, 1) == 1 ? Wire.read() : 0xFF;
+          Serial.printf(" WHO_AM_I=0x%02X (QMI8658 期望 0x05)", id);
+        }
+        Serial.println();
+      }
+      Serial.printf("[IMU] g_imuOk=%d\n", g_imuOk);
     } else if (line == "/mem") {
       String mem = memory.recentContext(800);
       if (mem.length()) Serial.print(mem);
@@ -882,6 +896,10 @@ void loop() {
   serialCli();
   memory.embedTick();   // 语义向量懒补（15s 限速，断网自动退关键词）
   display.blinkTick();
+  { // 状态行（时间/心情点）每秒刷新一次
+    static uint32_t s_lastStatus = 0;
+    if (millis() - s_lastStatus > 1000) { s_lastStatus = millis(); display.drawStatusLine(); }
+  }
   voice.loopTick();   // VAD 自动聆听模式
   llmHarvest();       // F4: 收割后台 LLM 结果
   touchGestures();    // F5: 摇晃/翻面触觉（每帧，内部自带节流）

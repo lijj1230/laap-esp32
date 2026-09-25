@@ -24,7 +24,10 @@ static int rd(uint8_t reg, uint8_t* buf, int n) {
   Wire.beginTransmission(QMI_ADDR);
   Wire.write(reg);
   if (Wire.endTransmission(false) != 0) return -1;
-  return Wire.requestFrom((int)QMI_ADDR, n) == n ? 0 : -2;
+  if (Wire.requestFrom((int)QMI_ADDR, n) != n) return -2;
+  for (int i = 0; i < n; i++) buf[i] = Wire.read();   // 必须读出：否则残留数据污染下次读取
+  Wire.endTransmission(true);
+  return 0;
 }
 
 bool imuInit() {
@@ -34,11 +37,17 @@ bool imuInit() {
     delay(30);
   }
   if (id != 0x05) return false;
-  wr(REG_RESET, 0xB0); delay(15);
+  wr(REG_RESET, 0xB0); delay(20);
   wr(REG_CTRL1, 0x40);       // 地址自增
   wr(REG_CTRL7, 0x03);       // 使能加速度+陀螺仪
   wr(REG_CTRL2, 0x95);       // ACC 4g 250Hz
   wr(REG_CTRL3, 0xD5);       // GYR 512dps 250Hz
+  delay(30);
+  uint8_t chk = 0;
+  if (rd(REG_CTRL7, &chk, 1) == 0 && chk != 0x03) {
+    Serial.printf("[IMU] CTRL7 回读 0x%02X != 0x03，配置未生效\n", chk);
+    return false;
+  }
   g_ok = true;
   return true;
 }

@@ -59,9 +59,8 @@ bool LaapVision::begin() {
   c.sccb_i2c_port = 0;
   c.pin_pwdn = -1; c.pin_reset = -1;    // PWDN 手动经 PCA9557
   c.xclk_freq_hz = 24000000;
-  c.pixel_format = PIXFORMAT_JPEG;
-  c.frame_size   = FRAMESIZE_QVGA;      // 320x240，GC0308 拍足够
-  c.jpeg_quality = 14;
+  c.pixel_format = PIXFORMAT_RGB565;    // GC0308 不支持片上 JPEG（实测报错），RGB565 直出
+  c.frame_size   = FRAMESIZE_QVGA;      // 320x240，RGB565=150KB/帧，PSRAM 装得下
   c.fb_count = 1;
   c.grab_mode = CAMERA_GRAB_LATEST;
   c.fb_location = CAMERA_FB_IN_PSRAM;
@@ -108,7 +107,7 @@ String LaapVision::look(const String& question) {
   if (!fb) { lastError = "抓帧失败"; return ""; }
   String b64 = base64::encode(fb->buf, fb->len);
   esp_camera_fb_return(fb);
-  if (b64.length() > 200000) { lastError = "帧过大"; return ""; }   // body 上限保护
+  if (b64.length() > 260000) { lastError = "帧过大"; return ""; }   // body 上限保护（RGB565 QVGA≈200KB）
 
   String url, body, auth;                       // auth 非空则带 Bearer 头（直连用）
   if (bridge) {
