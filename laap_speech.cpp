@@ -105,6 +105,7 @@ static int httpsPost(const String& url, const String& contentType, const uint8_t
   String req = String("POST ") + path + " HTTP/1.1\r\nHost: " + host +
     (bearer ? String("\r\nAuthorization: Bearer ") + bearer : "") +
     "\r\nContent-Type: " + contentType +
+    "\r\nUser-Agent: LAAP/3.2\r\nAccept: application/json" +
     "\r\nContent-Length: " + bodyLen + "\r\nConnection: close\r\n\r\n";
   c->print(req);
   const int CHUNK = 4096;
@@ -113,7 +114,13 @@ static int httpsPost(const String& url, const String& contentType, const uint8_t
   while (sent < bodyLen) {
     int n = (bodyLen - sent > CHUNK) ? CHUNK : (bodyLen - sent);
     memcpy(buf, body + sent, n);
-    c->write(buf, n);
+    // 短写保护：write 可能少写（socket 缓冲满），必须补写完，否则 multipart 截断→服务端 500
+    size_t w = 0;
+    while (w < (size_t)n) {
+      int k = c->write(buf + w, n - w);
+      if (k <= 0) { c->stop(); return -3; }   // 连接断了
+      w += k;
+    }
     sent += n;
   }
   String resp;
@@ -126,6 +133,10 @@ static int httpsPost(const String& url, const String& contentType, const uint8_t
   c->stop();
   int sp = resp.indexOf(' ');
   int code = sp > 0 ? resp.substring(sp + 1, sp + 4).toInt() : 0;
+  if (code != 200 && code > 0) {
+    // 非 200 打印原始响应（头+正文前 220 字符），服务端错误正文一看便知
+    Serial.printf("[NET] %s → HTTP %d\n%.220s\n", path.c_str(), code, resp.c_str());
+  }
   int bs = resp.indexOf("\r\n\r\n");
   // chunked 简单拼接（复用 LLM 客户端同款逻辑）
   String payload = bs > 0 ? resp.substring(bs + 4) : resp;

@@ -35,6 +35,8 @@
 #include "laap_audio.h"
 #include "laap_voice.h"
 #include "laap_speech.h"
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include "laap_search.h"
 #include "laap_vision.h"
 #include "laap_tools.h"
@@ -745,6 +747,34 @@ void serialCli() {
         Serial.println();
       }
       Serial.printf("[IMU] g_imuOk=%d\n", g_imuOk);
+    } else if (line == "/asrkey") {
+      // ASR Key 账户探针: 同一 Key 打 SiliconFlow chat 接口（区分端点故障 vs 账户问题）
+      if (!String(cfg.s.asrKey).length()) { Serial.println("[ASRKEY] asrKey 未配置"); }
+      else {
+        WiFiClientSecure sec; sec.setInsecure(); sec.setTimeout(15);
+        HTTPClient http;
+        String base(cfg.s.asrBase);
+        while (base.endsWith("/")) base.remove(base.length() - 1);
+        http.begin(sec, base + "/chat/completions");
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("Authorization", String("Bearer ") + cfg.s.asrKey);
+        http.setTimeout(15000);
+        int code = http.POST("{\"model\":\"Qwen/Qwen2.5-7B-Instruct\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":4}");
+        String body = http.getString();
+        Serial.printf("[ASRKEY] 同Key打chat → %d\n%.150s\n", code, body.c_str());
+        http.end();
+      }
+    } else if (line == "/llmfromasr") {
+      // LLM 切到 SiliconFlow（用 ASR 的 Key/base——/asrkey 已验证其有效且有余额）
+      if (!String(cfg.s.asrKey).length()) { Serial.println("[LLM] asrKey 未配置，无法迁移"); }
+      else {
+        strlcpy(cfg.s.llmBase, "https://api.siliconflow.cn/v1", sizeof(cfg.s.llmBase));
+        strlcpy(cfg.s.llmModel, "Qwen/Qwen2.5-7B-Instruct", sizeof(cfg.s.llmModel));
+        strlcpy(cfg.s.llmKey, cfg.s.asrKey, sizeof(cfg.s.llmKey));
+        cfg.save();
+        Serial.println("[LLM] 已切到 SiliconFlow(Qwen2.5-7B)，Key 复用 ASR 的（已验证有效）");
+        Serial.println("[LLM] 串口发句话测试，或网页改模型（deepseek-ai/DeepSeek-V3.1 等）");
+      }
     } else if (line == "/asrtest") {
       // ASR 端到端诊断: 录 5s（请对着板子说话）→ RMS 判定麦克风 → SiliconFlow 转写
       if (!audio.micOk) { Serial.println("[ASR] 无麦克风"); continue; }
@@ -769,6 +799,16 @@ void serialCli() {
         Serial.println(laapInteractSearch(text));
       } else {
         Serial.printf("[ASR] 转写失败: %s\n", err.c_str());
+        // 内容/格式二分：用 1s 合成 440Hz（格式已知完好）再试一次
+        Serial.println("[ASR] 用合成音复测（区分格式问题 vs 录音内容问题）…");
+        static int16_t tone[16000];
+        for (int i = 0; i < 16000; i++) tone[i] = (int16_t)(9000 * sinf(2 * PI * 440 * i / 16000.0));
+        String err2;
+        String t2 = asr.transcribe(tone, 32000, err2);
+        if (t2.length() || err2.indexOf("响应无") >= 0)
+          Serial.println("[ASR] 合成音请求成功 → 请求格式 OK，问题在录音内容（音量/数据）");
+        else
+          Serial.printf("[ASR] 合成音也失败(%s) → 请求格式/传输层问题\n", err2.c_str());
       }
     } else if (line == "/mem") {
       String mem = memory.recentContext(800);
