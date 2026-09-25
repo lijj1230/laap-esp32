@@ -361,10 +361,15 @@ esp_err_t es8311_voice_volume_set(es8311_handle_t dev, int volume, int *volume_s
     if (volume == 0) {
         reg32 = 0;
     } else {
-        /* ES8311 DAC 音量寄存器: 0x00=-95.5dB, 0xBF=0dB, 0xFF=+32dB。
-           原生 0-100→0-0xFF 映射会让 100% 落在 +32dB —— 数字满幅信号被硬削波（实测"破音"根因）。
-           重映射 0-100 → 0x00-0xBF：0dB 封顶，留足动态余量。 */
-        reg32 = (volume * 0xBF) / 100;
+        /* ES8311 DAC 音量寄存器: 0x00=-95.5dB, 0xBF=0dB, 0xFF=+32dB，0.5dB/级。
+           ① 不要映射到 0xFF：100% 落在 +32dB 会让数字满幅信号硬削波（"破音"根因）。
+           ② 也不要"线性映射到寄存器值"——那等于线性 dB：70% 就是 0x85=-29dB（满幅的 3.5%），
+              用户体感是"喇叭没声音"（2026-09-26 用"播测试音+麦克风回环"定位到这里）。
+              改成平方律衰减：100%→0dB、70%≈-5.4dB、50%≈-15dB、20%≈-38dB，接近常见音量旋钮手感。 */
+        int p = 100 - volume;                  /* 0..100 */
+        int att_db = (60 * p * p) / 10000;     /* 0..60 dB */
+        reg32 = 0xBF - att_db * 2;             /* 0.5dB/级 */
+        if (reg32 < 0) reg32 = 0;
     }
 
     // provide user with real volume set

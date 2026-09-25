@@ -1,6 +1,7 @@
 #include "laap_edge_tts.h"
 #include "laap_ws.h"
 #include "laap_audio.h"
+uint32_t laapI2sBytes();   // 诊断：I2S 实写字节（laap_audio.cpp）
 #include "laap_display.h"   // 仅用于眨眼刷新保持
 #include <WiFiClientSecure.h>
 #include <esp_heap_caps.h>   // PSRAM 缓冲（别把内部堆切碎）
@@ -93,6 +94,9 @@ static void feedMp3(const uint8_t* d, size_t n) {
 // 把缓冲里所有完整帧解码播掉；半帧残余留在缓冲头等下一块
 // 解码器全局持久化：MP3 位池跨帧引用前帧数据，每调用重建丢状态→后续帧解码失败/爆音
 static HMP3Decoder s_mp3Dec = nullptr;
+// "没声音"诊断：收到多少音频字节 / 解出多少帧 / 样本峰值（0=解出来就是静音）
+static uint32_t s_ttsBytes = 0, s_ttsFrames = 0, s_ttsSamples = 0;
+static int s_ttsPeak = 0;
 static bool playMp3Stream() {
   if (!s_mp3Dec) { s_mp3Dec = MP3InitDecoder(); if (!s_mp3Dec) return false; }
   HMP3Decoder dec = s_mp3Dec;
@@ -119,6 +123,10 @@ static bool playMp3Stream() {
     MP3GetLastFrameInfo(dec, &fi);
     size_t samples = fi.outputSamps;
     if (samples > 0) {
+      int pk = 0;
+      for (size_t i = 0; i < samples; i++) { int a = pcm[i] < 0 ? -pcm[i] : pcm[i]; if (a > pk) pk = a; }
+      if (pk > s_ttsPeak) s_ttsPeak = pk;
+      s_ttsFrames++; s_ttsSamples += samples;
       audio.playPcm(pcm, samples, fi.samprate ? fi.samprate : 24000);
       any = true;
     }
@@ -136,6 +144,7 @@ static bool mp3StreamFlush() { return playMp3Stream(); }
 
 bool EdgeTts::speak(const String& text, const String& voice, const String& rate, bool interruptible) {
   lastError = "";
+  s_ttsBytes = s_ttsFrames = s_ttsSamples = 0; s_ttsPeak = 0;
   time_t now = time(nullptr);
   if (now < 1700000000) { lastError = "NTP 未同步，无法生成鉴权"; return false; }
 
@@ -195,6 +204,7 @@ bool EdgeTts::speak(const String& text, const String& voice, const String& rate,
       if (n < 2) continue;
       size_t hdrLen = ((size_t)d[0] << 8) | d[1];
       if (hdrLen + 2 > n) continue;
+      s_ttsBytes += (uint32_t)(n - hdrLen - 2);
       feedMp3(d + hdrLen + 2, n - hdrLen - 2);
       if (playMp3Stream()) audioRecv = true;
       lastProgress = millis();
@@ -202,8 +212,17 @@ bool EdgeTts::speak(const String& text, const String& voice, const String& rate,
     }
   }
   ws.stop();
-  if (!audioRecv) { lastError = lastError.length() ? lastError : "未收到音频"; return false; }
+  if (!audioRecv) {
+    Serial.printf("[TTS] 没解出音频：收到 %uB / 解码 %u 帧（%s）\n",
+                  (unsigned)s_ttsBytes, (unsigned)s_ttsFrames,
+                  lastError.length() ? lastError.c_str() : "无错误信息");
+    lastError = lastError.length() ? lastError : "未收到音频";
+    return false;
+  }
   if (audio.interrupted()) return true;      // 被打断：算成功（说了半截）
   mp3StreamFlush();
+  Serial.printf("[TTS] 音频 %uB → 解码 %u 帧/%u 样本，峰值 %d，I2S 实写 %uB\n",
+                (unsigned)s_ttsBytes, (unsigned)s_ttsFrames, (unsigned)s_ttsSamples, s_ttsPeak,
+                (unsigned)laapI2sBytes());
   return true;
 }

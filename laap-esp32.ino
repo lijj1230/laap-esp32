@@ -895,7 +895,7 @@ void serialCli() {
     if (!line.length()) continue;
     laapActivity();     // 串口打字也是交互
     if (line == "/help") {
-      Serial.println("命令: /status /look(视觉识图) /search 词 /weather 城市 /touch(摇晃) /touchpad(触摸) /screen N /redraw /i2cscan /portal /mem /reflect(立刻反思) /mono(立刻独白) /nothink 0|1 /tick /lcd /pa /imu /asrtest /reset");
+      Serial.println("命令: /status /look(视觉识图) /search 词 /weather 城市 /touch(摇晃) /touchpad(触摸) /screen N /redraw /i2cscan /portal /mem /reflect(立刻反思) /mono(立刻独白) /nothink 0|1 /beep(回环测声) /tick /lcd /pa /imu /asrtest /reset");
       Serial.println("      直接打字回车 = 跟它说话（走完整对话链路）");
     } else if (line == "/touch") {
       // 触觉实测：5 秒采样，摇晃/扣翻板子看峰值与判定
@@ -1046,6 +1046,33 @@ void serialCli() {
       rb = (Wire.requestFrom((int)0x19, 1) == 1) ? Wire.read() : 0xFF;
       Serial.printf("[AUD] 播放中 PA_EN=%d（若 0 → paSet 未生效=硬件/扩展芯片问题）\n", (rb >> 1) & 1);
       audio.paSet(false);
+    } else if (line == "/beep") {
+      // 喇叭→麦克风 回环实测：解码与 I2S 写入都正常却"没声音"时，用它分清
+      // "真没出声" vs "出了声但你听不到"（板载喇叭与麦克风同板，声音会漏进麦）
+      static int16_t tone[1600];                 // 440Hz 100ms@16k
+      for (int i = 0; i < 1600; i++) tone[i] = (int16_t)(12000 * sinf(2 * PI * 440 * i / 16000));
+      audio.recordStart(2);
+      audio.paSet(true);
+      float base = 0, peak = 0;
+      for (int r = 0; r < 12; r++) {
+        audio.playPcm(tone, 1600, 16000);
+        audio.recordTick();
+        float rms = audio.micRms();
+        if (r == 0) base = rms;
+        if (r > 1 && rms > peak) peak = rms;
+      }
+      audio.recordStop();
+      audio.paSet(false);
+      Serial.printf("[AUD] 回环：首段RMS=%.0f 播放中峰值RMS=%.0f → %s\n", base, peak,
+                    peak > base + 80 ? "喇叭确实在出声（声音进了麦克风）"
+                                     : "喇叭没出声（数字链路正常 → 查功放/喇叭/编解码器输出）");
+      // ES8311 关键寄存器回读（0x18）：0x31=DAC静音/音量控制 0x32=DAC音量 0x0D/0x0E=DAC电源 0x12=系统
+      for (uint8_t r : {(uint8_t)0x31, (uint8_t)0x32, (uint8_t)0x0D, (uint8_t)0x0E, (uint8_t)0x12, (uint8_t)0x37}) {
+        Wire.beginTransmission(0x18); Wire.write(r);
+        uint8_t v = 0xFF;
+        if (Wire.endTransmission(false) == 0 && Wire.requestFrom((int)0x18, 1) == 1) v = Wire.read();
+        Serial.printf("[AUD] ES8311 reg 0x%02X = 0x%02X\n", r, v);
+      }
     } else if (line == "/imu") {
       // IMU 诊断: 扫 0x6A/0x6B + 回读 WHO_AM_I
       for (uint8_t a : {(uint8_t)0x6A, (uint8_t)0x6B}) {
@@ -1121,16 +1148,20 @@ void serialCli() {
     } else if (line == "/reflect") {
       nightlyReflect(true);          // 立刻做一次夜间反思（不等 0-5 点窗口）
     } else if (line.startsWith("/vol")) {
-      int v = line.substring(4).toInt();
-      if (v >= 0 && v <= 100) {
+      // 必须区分"查询"和"设置"：旧代码对空参数 `"".toInt()`=0 也放行，
+      // 于是打一句 /vol 查询就把音量写成 0 并落盘 → 整机静音（且重启也不恢复）
+      String arg = line.substring(4); arg.trim();
+      int v = arg.length() ? arg.toInt() : -1;
+      if (arg.length() && v >= 0 && v <= 100) {
         audio.setVolume((uint8_t)v); cfg.s.volume = (uint8_t)v; cfg.save();
         Serial.printf("[LAAP] 音量 %d%%\n", v);
       } else {
         Serial.printf("[LAAP] 当前音量 %d%%（用法: /vol 0-100）\n", audio.volume());
       }
     } else if (line.startsWith("/bright")) {
-      int v = line.substring(7).toInt();
-      if (v >= 5 && v <= 100) {
+      String arg = line.substring(7); arg.trim();
+      int v = arg.length() ? arg.toInt() : -1;
+      if (arg.length() && v >= 5 && v <= 100) {
         display.setBrightness((uint8_t)v); cfg.s.brightness = (uint8_t)v; cfg.save();
         Serial.printf("[LAAP] 亮度 %d%%\n", v);
       } else {
@@ -1197,8 +1228,10 @@ void setup() {
   else if (String(cfg.s.wifiSsid).length() == 0) { webui.beginAP(); display.drawIpLine("", false); }
 
   voice.begin();   // 音频管线 + 编解码器 + VAD 校准
-  // 音量 0 防护：NVS 被写成 0（网页异常提交过一次）会导致永久静音，开机钳回 30
-  if (cfg.s.volume == 0) { cfg.s.volume = 30; cfg.save(); }
+  // 音量 0：以前"部分保存会把音量写成 0"（哨兵 bug，已修），所以开机要钳回 30；
+  // 现在 0 只可能来自明确设置（网页/CLI），再改写就等于吞掉用户的静音选择——
+  // 改为只提示一句，并告诉怎么恢复（"没声音"最常见的原因就是这里被写成 0）
+  if (cfg.s.volume == 0) Serial.println("[LAAP] 注意：音量被设为 0（静音）。/vol 80 或后台设置可恢复");
   audio.setVolume(cfg.s.volume);  // 应用持久化音量（ES8311）
   display.setBrightness(cfg.s.brightness);  // 应用持久化亮度（背光 PWM）
   mind.trust = laapTrust();        // 小凌⑥: 启动时取回持久化信任值

@@ -167,6 +167,9 @@ void LaapAudio::vadCalibrate(uint32_t ms) {
 }
 
 // 线性插值重采样 rate→48k，写双声道
+// I2S 实写字节数（诊断"没声音"：解码正常但这里为 0 就是 I2S/编解码器/功放段的问题）
+uint32_t s_i2sBytes = 0;
+uint32_t laapI2sBytes() { return s_i2sBytes; }
 bool LaapAudio::playPcm(const int16_t* data, size_t samples, uint32_t rate,
                         bool (*interruptCb)(void*), void* ctx) {
   if (!spkOk) return false;
@@ -196,7 +199,7 @@ bool LaapAudio::playPcm(const int16_t* data, size_t samples, uint32_t rate,
       if (pos <= idx) pos = idx + 1; // 防死循环
       idx = (size_t)pos;
     }
-    if (m > 0) i2s.write((uint8_t*)out, m * 4);
+    if (m > 0) s_i2sBytes += i2s.write((uint8_t*)out, m * 4);   // 记账：I2S 实写字节（0=写不进去，硬件层问题）
 
     // 打断监测：仅在 barge-in 开启时才吸麦克风（默认关——播放时不动麦克风，
     // 避免 I2S 全双工 RX/TX 竞争与"自己听见自己"的回环干扰）
