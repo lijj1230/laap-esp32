@@ -47,8 +47,11 @@ public:
   void drawIpLine(const String& ip, bool wifiOk);
   void drawBootScreen();
   void blinkTick();                       // loop 里调用，眨眼动画
-  void drawListenState(bool listening);   // 屏角聆听状态点（绿=在听 灰=暂停）
+  void drawListenState(bool listening);   // 屏角聆听状态点（只在真正聆听时显示）
   void thinkingPulse();                   // “思考中”动画步进
+  void setScreenOn(bool on);              // 静默息屏（关背光，屏内容保留）
+  bool screenOn() const { return _screenOn; }
+  void repaint();                         // 重画整屏（唤醒/装死后恢复：表情 + 顶栏）
 private:
   // ---- 底层 ST7789 ----
   void lcdCmd(uint8_t c);
@@ -60,12 +63,13 @@ private:
   void vendorInit();   // ST7789 完整厂商上电序列（冷态屏必需）
   // ---- UI helpers ----
   void drawEye(int cx, int cy, int rx, int ry, int pupDx, int pupDy, int browY);
-  void drawGlyph3x5(int x, int y, char ch, uint16_t c);   // 3x5 微点阵字符
-  int  drawText3x5(int x, int y, const char* s, uint16_t c);
+  void drawGlyph3x5(int x, int y, char ch, uint16_t c, uint8_t scale);  // 3x5 点阵字符（scale 倍放大）
+  int  drawText3x5(int x, int y, const char* s, uint16_t c, uint8_t scale);
   void drawTopStrip();                                    // 顶栏：时间+需求数字+设备信息
   void draw7seg(int x, int y, char ch, uint16_t c);
   void drawIp7seg(int x, int y, const String& s);
   uint8_t brightness = 220;
+  bool _screenOn = true;              // 息屏期间跳过全部绘图（背光已关，画面不刷新）
   uint32_t lastBlink = 0; bool blinking = false; uint8_t blinkPhase = 0;
   uint8_t thinkStep = 0;
   char curExpr[16] = "calm";

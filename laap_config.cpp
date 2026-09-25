@@ -24,6 +24,7 @@ void LaapConfig::load() {
   s.idleEveryMin = 20;
   s.volume = 70;
   s.brightness = 90;
+  s.screenOffSec = 60;
   s.llmContinue = 1;
   s.llmMaxTokens = 220;
   s.voiceMode = 1;
@@ -48,6 +49,8 @@ void LaapConfig::load() {
   s.idleEveryMin   = prefs.getUShort("idleevery", 20);
   s.volume         = prefs.getUChar("vol", 70);
   s.brightness     = prefs.getUChar("bright", 90);
+  s.screenOffSec   = prefs.getUShort("screenoff", 60);
+  _uptimeBaseMin   = prefs.getUInt("uptmin", 0);
   s.llmContinue    = prefs.getUChar("llmcont", 1);
   s.llmMaxTokens   = prefs.getUShort("llmtok", 220);
   laapTrustSet(prefs.getUChar("trust", 153) / 255.0f);  // 默认 0.6
@@ -90,6 +93,7 @@ bool LaapConfig::save() {
   prefs.putUShort("idleevery", s.idleEveryMin);
   prefs.putUChar("vol", s.volume);
   prefs.putUChar("bright", s.brightness);
+  prefs.putUShort("screenoff", s.screenOffSec);
   prefs.putUChar("llmcont", s.llmContinue);
   prefs.putUShort("llmtok", s.llmMaxTokens);
   prefs.putUChar("trust", (uint8_t)(laapTrust() * 255));
@@ -120,6 +124,12 @@ bool LaapConfig::save() {
 // 轻量保存：只写信任值（心跳里周期调用，避免整盘 30+ 键重写磨损 NVS）
 void LaapConfig::saveTrust() {
   prefs.putUChar("trust", (uint8_t)(laapTrust() * 255));
+}
+
+// 累计运行时长落盘（同样只写一个键；5 分钟一次 + 重启前一次，磨损可忽略）
+void LaapConfig::saveUptime(uint32_t totalMin) {
+  _uptimeBaseMin = totalMin;
+  prefs.putUInt("uptmin", totalMin);
 }
 
 void LaapConfig::reset() {

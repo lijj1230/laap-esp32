@@ -13,6 +13,32 @@
 
 LaapWeb webui;
 
+// 本地小工具：取 JSON 字段原值（容错 "k":"v" 与 "k": "v" 两种写法，数字/布尔按原文返回）。
+// 早期只匹配无空格的 "k":" 形式：遇到带空格 JSON 会解析成空串，配上 _set 哨兵会静默清空配置。
+static String jsonField(const String& b, const char* k) {
+  String pat = String("\"") + k + "\":";
+  int i = b.indexOf(pat);
+  if (i < 0) return "";
+  int j = i + pat.length();
+  while (j < (int)b.length() && (b[j] == ' ' || b[j] == '\t')) j++;
+  if (j >= (int)b.length()) return "";
+  if (b[j] != '"') {                       // 数字 / true / false / null
+    String v;
+    while (j < (int)b.length() && b[j] != ',' && b[j] != '}') { v += b[j]; j++; }
+    v.trim();
+    return v == "null" ? String("") : v;
+  }
+  j++;                                     // 跳过开引号
+  String v;
+  while (j < (int)b.length()) {
+    char c = b[j];
+    if (c == '\\' && j + 1 < (int)b.length()) { v += b[j + 1]; j += 2; continue; }
+    if (c == '"') break;
+    v += c; j++;
+  }
+  return v;
+}
+
 // 本地小工具：JSON 字符串转义
 static String jsonEsc(const String& s) {
   String o; o.reserve(s.length() + 8);
@@ -65,6 +91,8 @@ async function refresh(){
   document.getElementById('goal').textContent=s.goal;
   document.getElementById('gen').textContent='G'+s.generation+' · '+s.cycles+'次心跳';
   document.getElementById('last').textContent=s.last_say||'（还没说过话）';
+  const tot=s.uptime_total_min||0,cur=Math.round((s.uptime_s||0)/60);
+  document.getElementById('upt').textContent=Math.floor(tot/60)+' 小时 '+(tot%60)+' 分（本次开机 '+cur+' 分，累计跨重启）';
   document.getElementById('net').textContent=s.ap?'配置热点 '+s.ap_ssid:(s.wifi_ok?'WiFi 已连接 '+s.ip:'WiFi 断开');
   document.getElementById('model').textContent=s.llm_model+' @ '+s.llm_base;
   const vc=document.getElementById('voicecard');
@@ -83,12 +111,22 @@ async function sendChat(){
  const t=document.getElementById('chatin').value.trim();if(!t)return;
  document.getElementById('chatin').value='';
  const log=document.getElementById('chatlog');
- log.innerHTML+='<div class="me">我: '+t.replace(/</g,'&lt;')+'</div>';log.scrollTop=1e9;
- log.innerHTML+='<div class="sys">思考中…</div>';log.scrollTop=1e9;
+ const me=document.createElement('div');me.className='me';me.textContent='我: '+t;
+ const tip=document.createElement('div');tip.className='sys';tip.textContent='思考中…';
+ log.appendChild(me);log.appendChild(tip);log.scrollTop=1e9;
  try{
   const r=await (await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})})).json();
-  log.innerHTML+='<div class="aris">Aris: '+r.reply.replace(/</g,'&lt;')+'</div>';
- }catch(e){log.innerHTML+='<div class="sys">请求失败</div>';}
+  if(r.pending){
+   // 后台 LLM 思考中：轮询成品（最多 30 次 × 1.5s ≈ 45 秒）
+   let got=false;
+   for(let i=0;i<30;i++){
+    await new Promise(s=>setTimeout(s,1500));
+    const q=await (await fetch('/api/chat/reply')).json();
+    if(q.seq>r.seq){got=true;tip.className='aris';tip.textContent='Aris: '+q.reply;break;}
+   }
+   if(!got)tip.textContent='（还在想，稍后看上面"它最近说"）';
+  }else{tip.className='aris';tip.textContent='Aris: '+r.reply;}
+ }catch(e){tip.textContent='请求失败';}
  log.scrollTop=1e9;refresh();
 }
 </script>)html";
@@ -99,6 +137,7 @@ void LaapWeb::registerRoutes() {
   server.on("/memory", HTTP_GET, [this]() { handleMemoryPage(); });
   server.on("/api/status", HTTP_GET, [this]() { handleStatus(); });
   server.on("/api/chat", HTTP_POST, [this]() { handleChat(); });
+  server.on("/api/chat/reply", HTTP_GET, [this]() { handleChatReply(); });
   server.on("/api/test", HTTP_POST, [this]() { handleTest(); });
   server.on("/api/save", HTTP_POST, [this]() { handleSave(); });
   server.on("/api/memory", HTTP_GET, [this]() { handleMemoryApi(); });
@@ -211,7 +250,8 @@ void LaapWeb::handleRoot() {
       "</div></div>"
       "<div class='card'><div class='k' style='color:#8b95a8;font-size:12px'>内在需求（驱动它的一切行为）</div><div id='bars'></div></div>"
       "<div class='card'><div class='k' style='color:#8b95a8;font-size:12px'>它最近说</div><div class='v' id='last' style='margin-top:6px'>…</div>"
-      "<div class='k' style='color:#8b95a8;font-size:12px;margin-top:8px'>网络</div><div class='v' id='net'>…</div>"
+      "<div class='k' style='color:#8b95a8;font-size:12px;margin-top:8px'>运行时长</div><div class='v' id='upt'>…</div>"
+    "<div class='k' style='color:#8b95a8;font-size:12px;margin-top:8px'>网络</div><div class='v' id='net'>…</div>"
       "<div class='k' style='color:#8b95a8;font-size:12px;margin-top:8px'>大模型</div><div class='v' id='model'>…</div></div>"
       "<div class='card' id='voicecard' style='display:none'><div class='row' style='align-items:center'>"
       "<div style='flex:1'><span class='k' style='color:#8b95a8;font-size:12px'>语音聆听</span><div class='v' id='listenstate'>…</div></div>"
@@ -246,6 +286,7 @@ void LaapWeb::handleSettingsPage() {
     "<div style='flex:1'><label>独白间隔（分，0=关）</label><input id='idleevery' type='number' min='0' max='240'></div>"
     "<div style='flex:1'><label>喇叭音量（0-100）</label><input id='volume' type='number' min='0' max='100'></div>"
     "<div style='flex:1'><label>屏幕亮度（0-100）</label><input id='brightness' type='number' min='5' max='100'></div>"
+    "<div style='flex:1'><label>静默息屏（秒，0=常亮）</label><input id='screenoff' type='number' min='0' max='3600'></div>"
     "<div style='flex:1'><label>截断续写轮数（0=关）</label><input id='llmcont' type='number' min='0' max='3'></div>"
     "<div style='flex:1'><label>单次回复上限（tokens，80-1000）</label><input id='llmtok' type='number' min='80' max='1000'></div></div>"
     "<div class='row'><div style='flex:1'><label>搜索关键词（逗号分隔，清空=关聊天搜索）</label><input id='srchkeys' placeholder='什么,怎么,新闻,最新…'></div></div>"
@@ -299,7 +340,7 @@ void LaapWeb::handleSettingsPage() {
     "ssid.value=s.ssid;base.value=s.llm_base;key.value=s.llm_key_masked?'('+s.llm_key_masked+')':'';"
     "key.placeholder=s.llm_key_masked?'已配置，留空保持不变':'未配置';"
     "model.value=s.llm_model;agent.value=s.agent;owner.value=s.owner;persona.value=s.persona;"
-    "tick.value=s.tick;thold.value=s.threshold;idlesil.value=s.idle_silence;idleevery.value=s.idle_every;volume.value=s.volume;brightness.value=s.brightness;llmcont.value=s.llm_continue;llmtok.value=s.llm_max_tokens;srchkeys.value=s.search_keys||'';srchapi.value=s.search_api||'';"
+    "tick.value=s.tick;thold.value=s.threshold;idlesil.value=s.idle_silence;idleevery.value=s.idle_every;volume.value=s.volume;brightness.value=s.brightness;screenoff.value=s.screen_off;llmcont.value=s.llm_continue;llmtok.value=s.llm_max_tokens;srchkeys.value=s.search_keys||'';srchapi.value=s.search_api||'';"
     "vmode.value=s.voice_mode;ttsch.value=s.tts_channel;ttsvoice.value=s.tts_voice;ttsrate.value=s.tts_rate;"
     "volcappid.value=s.volc_appid;volctoken.value=s.volc_token_masked?'':'';volctoken.placeholder=s.volc_token_masked?'已配置，留空保持不变':'未配置';"
     "volcvoice.value=s.volc_voice;asrbase.value=s.asr_base;asrkey.value='';asrkey.placeholder=s.asr_key_masked?'已配置，留空保持不变':'未配置';"
@@ -311,10 +352,10 @@ void LaapWeb::handleSettingsPage() {
     "const b=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},"
     "body:JSON.stringify({ssid:ssid.value,pass:pass.value,base:base.value,key:key.value,model:model.value,"
     "agent:agent.value,owner:owner.value,persona:persona.value,tick:tick.value,thold:thold.value,"
-    "idlesil:idlesil.value,idleevery:idleevery.value,volume:volume.value,brightness:brightness.value,llmcont:llmcont.value,llmtok:llmtok.value,srchkeys:srchkeys.value,srchkeys_set:1,srchapi:srchapi.value,srchapi_set:1,"
+    "idlesil:idlesil.value,idleevery:idleevery.value,volume:volume.value,brightness:brightness.value,screenoff:screenoff.value,llmcont:llmcont.value,llmtok:llmtok.value,srchkeys:srchkeys.value,srchkeys_set:1,srchapi:srchapi.value,srchapi_set:1,"
     "vmode:vmode.value,ttsch:ttsch.value,ttsvoice:ttsvoice.value,ttsrate:ttsrate.value,"
     "volcappid:volcappid.value,volctoken:volctoken.value,volcvoice:volcvoice.value,"
-    "asrbase:asrbase.value,asrkey:asrkey.value,asrmodel:asrmodel.value,asr2base:asr2base.value,asr2key:asr2key.value,asr2model:asr2model.value,"
+    "asrbase:asrbase.value,asrkey:asrkey.value,asrmodel:asrmodel.value,asr2base:asr2base.value,asr2key:asr2key.value,asr2model:asr2model.value,asr2_set:1,"
     "wakeword:wakeword.value,visionbase:visionbase.value,vlbase:vlbase.value,vkey:vkey.value,vmodel:vmodel.value,"
     "wakeword_set:1,visionbase_set:1,vlbase_set:1,vmodel_set:1})});"
     "const r=await b.json();alert(r.msg);}"
@@ -340,19 +381,13 @@ void LaapWeb::handleSettingsPage() {
 void LaapWeb::handleSave() {
   // 手动解析 JSON body（免库）
   String b = server.arg("plain");
-  auto get = [&](const char* k) -> String {
-    String pat = String("\"") + k + "\":\"";
-    int i = b.indexOf(pat);
-    if (i < 0) return "";
-    int j = i + pat.length();
-    String v;
-    while (j < (int)b.length()) {
-      char c = b[j];
-      if (c == '\\' && j + 1 < (int)b.length()) { v += b[j + 1]; j += 2; continue; }
-      if (c == '"') break;
-      v += c; j++;
-    }
-    return v;
+  auto get = [&](const char* k) -> String { return jsonField(b, k); };
+  // 布尔哨兵：网页发的是 JSON 数字（"wakeword_set":1，无引号）。
+  // 早期写成 get(k)=="1"（只认带引号的字符串形式）→ 永远匹配不上：
+  // 唤醒词/视觉/搜索词的写入（含"清空"）实际从未生效，用户看到的就是"重启后配置还原"。
+  auto flag = [&](const char* k) -> bool {
+    String v = jsonField(b, k);
+    return v.length() > 0 && v[0] == '1';
   };
   String ssid = get("ssid"), pass = get("pass"), base = get("base"), key = get("key"),
          model = get("model"), agent = get("agent"), owner = get("owner"), persona = get("persona");
@@ -364,11 +399,11 @@ void LaapWeb::handleSave() {
   String wakeword = get("wakeword"), visionbase = get("visionbase");
   String vlbase = get("vlbase"), vkey = get("vkey"), vmodel = get("vmodel");
   // 唤醒词/视觉支持"清空"：带 _set 哨兵字段即写入（空=关闭）；直连 Key 留空=保持/复用
-  if (get("wakeword_set") == "1") strlcpy(cfg.s.wakeWord, wakeword.c_str(), sizeof(cfg.s.wakeWord));
-  if (get("visionbase_set") == "1") strlcpy(cfg.s.visionBase, visionbase.c_str(), sizeof(cfg.s.visionBase));
-  if (get("vlbase_set") == "1") strlcpy(cfg.s.visionLlmBase, vlbase.c_str(), sizeof(cfg.s.visionLlmBase));
+  if (flag("wakeword_set")) strlcpy(cfg.s.wakeWord, wakeword.c_str(), sizeof(cfg.s.wakeWord));
+  if (flag("visionbase_set")) strlcpy(cfg.s.visionBase, visionbase.c_str(), sizeof(cfg.s.visionBase));
+  if (flag("vlbase_set")) strlcpy(cfg.s.visionLlmBase, vlbase.c_str(), sizeof(cfg.s.visionLlmBase));
   if (vkey.length()) strlcpy(cfg.s.visionKey, vkey.c_str(), sizeof(cfg.s.visionKey));
-  if (get("vmodel_set") == "1") strlcpy(cfg.s.visionModel, vmodel.c_str(), sizeof(cfg.s.visionModel));
+  if (flag("vmodel_set")) strlcpy(cfg.s.visionModel, vmodel.c_str(), sizeof(cfg.s.visionModel));
   if (vmode.length()) { long v = vmode.toInt(); cfg.s.voiceMode = (uint8_t)(v < 0 ? 0 : (v > 3 ? 3 : v)); }
   if (ttsch.length()) { long v = ttsch.toInt(); cfg.s.ttsChannel = (uint8_t)(v < 0 ? 0 : (v > 3 ? 3 : v)); }
   if (ttsvoice.length()) strlcpy(cfg.s.ttsVoice, ttsvoice.c_str(), sizeof(cfg.s.ttsVoice));
@@ -379,9 +414,12 @@ void LaapWeb::handleSave() {
   if (asrbase.length()) strlcpy(cfg.s.asrBase, asrbase.c_str(), sizeof(cfg.s.asrBase));
   if (asrkey.length()) strlcpy(cfg.s.asrKey, asrkey.c_str(), sizeof(cfg.s.asrKey));
   if (asrmodel.length()) strlcpy(cfg.s.asrModel, asrmodel.c_str(), sizeof(cfg.s.asrModel));
-  if (asr2base.length()) strlcpy(cfg.s.asr2Base, asr2base.c_str(), sizeof(cfg.s.asr2Base));
+  // 备用 ASR 支持"清空"（带 _set 哨兵即写入，空=不启用）；Key 留空=保持不变
+  if (flag("asr2_set")) {
+    strlcpy(cfg.s.asr2Base, asr2base.c_str(), sizeof(cfg.s.asr2Base));
+    strlcpy(cfg.s.asr2Model, asr2model.c_str(), sizeof(cfg.s.asr2Model));
+  }
   if (asr2key.length()) strlcpy(cfg.s.asr2Key, asr2key.c_str(), sizeof(cfg.s.asr2Key));
-  if (asr2model.length()) strlcpy(cfg.s.asr2Model, asr2model.c_str(), sizeof(cfg.s.asr2Model));
   if (ssid.length()) strlcpy(cfg.s.wifiSsid, ssid.c_str(), sizeof(cfg.s.wifiSsid));
   if (pass.length()) strlcpy(cfg.s.wifiPass, pass.c_str(), sizeof(cfg.s.wifiPass));
   if (base.length()) strlcpy(cfg.s.llmBase, base.c_str(), sizeof(cfg.s.llmBase));
@@ -390,9 +428,10 @@ void LaapWeb::handleSave() {
   if (agent.length()) strlcpy(cfg.s.agentName, agent.c_str(), sizeof(cfg.s.agentName));
   if (owner.length()) strlcpy(cfg.s.ownerName, owner.c_str(), sizeof(cfg.s.ownerName));
   if (persona.length()) strlcpy(cfg.s.persona, persona.c_str(), sizeof(cfg.s.persona));
+  // 只在真的带了字段时才改（原来无条件 toInt()：缺少 tick/thold 的部分保存会把它们打成下限 10）
   String tick = get("tick"), thold = get("thold");
-  { long v = tick.toInt(); cfg.s.tickSec = (uint32_t)(v < 10 ? 10 : (v > 3600 ? 3600 : v)); }
-  { long v = thold.toInt(); cfg.s.threshold = (uint8_t)(v < 10 ? 10 : (v > 95 ? 95 : v)); }
+  if (tick.length()) { long v = tick.toInt(); cfg.s.tickSec = (uint32_t)(v < 10 ? 10 : (v > 3600 ? 3600 : v)); }
+  if (thold.length()) { long v = thold.toInt(); cfg.s.threshold = (uint8_t)(v < 10 ? 10 : (v > 95 ? 95 : v)); }
   String idls = get("idlesil"), idev = get("idleevery");
   if (idls.length()) { long v = idls.toInt(); cfg.s.idleSilenceMin = (uint16_t)(v < 1 ? 1 : (v > 240 ? 240 : v)); }
   if (idev.length()) { long v = idev.toInt(); cfg.s.idleEveryMin = (uint16_t)(v < 0 ? 0 : (v > 240 ? 240 : v)); }
@@ -408,14 +447,16 @@ void LaapWeb::handleSave() {
     cfg.s.brightness = (uint8_t)v;
     display.setBrightness((uint8_t)v);    // 立即生效（下限5防全黑找不到设置页）
   }
+  String soff = get("screenoff");
+  if (soff.length()) { long v = soff.toInt(); cfg.s.screenOffSec = (uint16_t)(v < 0 ? 0 : (v > 3600 ? 3600 : v)); }
   String lcont = get("llmcont");
   if (lcont.length()) { long v = lcont.toInt(); cfg.s.llmContinue = (uint8_t)(v < 0 ? 0 : (v > 3 ? 3 : v)); }
   String ltok = get("llmtok");
   if (ltok.length()) { long v = ltok.toInt(); cfg.s.llmMaxTokens = (uint16_t)(v < 80 ? 80 : (v > 1000 ? 1000 : v)); }
   String srchkeys = get("srchkeys");
-  if (get("srchkeys_set") == "1") strlcpy(cfg.s.searchKeys, srchkeys.c_str(), sizeof(cfg.s.searchKeys));
+  if (flag("srchkeys_set")) strlcpy(cfg.s.searchKeys, srchkeys.c_str(), sizeof(cfg.s.searchKeys));
   String srchapi = get("srchapi");
-  if (get("srchapi_set") == "1") strlcpy(cfg.s.searchApi, srchapi.c_str(), sizeof(cfg.s.searchApi));
+  if (flag("srchapi_set")) strlcpy(cfg.s.searchApi, srchapi.c_str(), sizeof(cfg.s.searchApi));
   cfg.save();
   if (_ap) { // 配置门户里保存 → 直接重启进 STA
     server.send(200, "application/json", "{\"ok\":true,\"msg\":\"已保存，3 秒后重启生效\"}");
@@ -488,7 +529,9 @@ void LaapWeb::handleStatus() {
     "\"vision_ready\":" + (vision.available() ? "true" : "false") +
     ",\"voice_ready\":" + (voice.ready() ? "true" : "false") +
     ",\"vad_paused\":" + (voice.vadPaused() ? "true" : "false") +
+    ",\"screen_off\":" + cfg.s.screenOffSec +
     ",\"uptime_s\":" + String(millis() / 1000) +
+    ",\"uptime_total_min\":" + String(laapUptimeMin()) +
     ",\"heap_kb\":" + String(ESP.getFreeHeap() / 1024) +
     ",\"wifi_rssi\":" + (WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) : String("0")) +
     ",\"chip_temp\":" + String(temperatureRead(), 1) +
@@ -499,20 +542,25 @@ void LaapWeb::handleStatus() {
 
 void LaapWeb::handleChat() {
   String b = server.arg("plain");
-  int i = b.indexOf("\"text\":\"");
-  String text;
-  if (i >= 0) {
-    int j = i + 8;  // "text":" 共 8 字符，值从 i+8 起（原 7 是 off-by-one）
-    while (j < (int)b.length()) {
-      char c = b[j];
-      if (c == '\\' && j + 1 < (int)b.length()) { text += b[j + 1]; j += 2; continue; }
-      if (c == '"') break;
-      text += c; j++;
-    }
-  }
+  String text = jsonField(b, "text");   // 容错 "text":"…" / "text": "…"
   if (!text.length()) { server.send(400, "application/json", "{\"ok\":false,\"reply\":\"空消息\"}"); return; }
-  String reply = laapInteractSearch(text);   // 带联网搜索
-  server.send(200, "application/json", String("{\"ok\":true,\"reply\":\"") + jsonEsc(reply) + "\"}");
+  uint32_t seq0 = laapChatSeq();
+  String reply = laapInteractSearch(text);   // 带联网搜索；LLM 阶段是异步投递
+  if (laapChatPending()) {
+    // 只有受理回执（"……"）：真回复由后台 LLM 任务产出，网页轮询 /api/chat/reply 取。
+    // 这样主循环不冻结（旧写法要么同步阻塞 20~60 秒，要么页面永远停在"……"）。
+    server.send(200, "application/json",
+        String("{\"ok\":true,\"pending\":true,\"seq\":") + String(seq0) + "}");
+    return;
+  }
+  server.send(200, "application/json",
+      String("{\"ok\":true,\"pending\":false,\"reply\":\"") + jsonEsc(reply) + "\"}");
+}
+
+void LaapWeb::handleChatReply() {
+  server.send(200, "application/json",
+      String("{\"ok\":true,\"seq\":") + String(laapChatSeq()) +
+      ",\"reply\":\"" + jsonEsc(laapChatReply()) + "\"}");
 }
 
 void LaapWeb::handleTest() {
@@ -571,6 +619,7 @@ void LaapWeb::handleReset() {
 }
 
 void LaapWeb::handleReboot() {
+  laapUptimePersist();   // 重启前把累计运行时长落盘（否则这一截时长白丢）
   server.send(200, "application/json", "{\"ok\":true}");
   delay(300);
   ESP.restart();
@@ -590,17 +639,7 @@ void LaapWeb::handleListenToggle() {
 
 void LaapWeb::handleSpeak() {
   String b = server.arg("plain");
-  int i = b.indexOf("\"text\":\"");
-  String text;
-  if (i >= 0) {
-    int j = i + 8;  // "text":" 共 8 字符，值从 i+8 起（原 7 是 off-by-one）
-    while (j < (int)b.length()) {
-      char c = b[j];
-      if (c == '\\' && j + 1 < (int)b.length()) { text += b[j + 1]; j += 2; continue; }
-      if (c == '"') break;
-      text += c; j++;
-    }
-  }
+  String text = jsonField(b, "text");
   if (!text.length()) { server.send(400, "application/json", "{\"ok\":false}"); return; }
   voice.speak(text, "calm");
   server.send(200, "application/json", "{\"ok\":true}");

@@ -26,6 +26,7 @@ private:
   void handleSave();
   void handleStatus();
   void handleChat();
+  void handleChatReply();   // 异步 LLM 的成品轮询（网页聊天不再只看到"……"）
   void handleTest();
   void handleMemoryPage();
   void handleMemoryApi();
@@ -49,3 +50,7 @@ extern LaapWeb webui;
 String laapLastSay();
 String laapInteractSearch(const String& userText);
 const char* laapLastExpr();
+// 聊天回复是异步产生的（主循环不冻结）：网页拿到受理回执后轮询这两个
+uint32_t laapChatSeq();       // 每次有新的聊天成品回复 +1
+String laapChatReply();       // 最近一条聊天成品回复
+bool laapChatPending();       // 上一次 laapInteractSearch 是否丢给了后台 LLM

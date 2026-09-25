@@ -47,6 +47,29 @@ static uint32_t g_lastTickMs = 0;
 static uint32_t g_lastConsumeMs = 0;   // 上次记忆压缩
 static bool g_imuOk = false;
 
+// 聊天成品回复（网页聊天异步取件：受理回执 + seq，页面轮询 /api/chat/reply）
+static uint32_t g_chatSeq = 0;
+static String g_chatReply;
+static bool g_chatPending = false;
+uint32_t laapChatSeq() { return g_chatSeq; }
+String laapChatReply() { return g_chatReply; }
+bool laapChatPending() { return g_chatPending; }
+
+// 静默息屏 / 累计运行时长
+static uint32_t g_lastActivityMs = 0;      // 最近一次"值得亮屏"的活动
+static uint32_t g_uptimeBaseMin = 0;       // 开机时读回的累计运行分钟（NVS）
+uint32_t laapUptimeMin() { return g_uptimeBaseMin + millis() / 60000UL; }
+void laapUptimePersist() { cfg.saveUptime(laapUptimeMin()); }
+
+// 点亮屏幕（任何交互调用）：息屏时恢复背光 + 记活动时刻
+void laapActivity() {
+  g_lastActivityMs = millis();
+  if (!display.screenOn()) {
+    display.setScreenOn(true);
+    Serial.println("[LAAP] 交互唤醒屏幕");
+  }
+}
+
 // 自发独白（idle monologue）：无交互时自己想+查+说
 // v3.2：频率后台可配（idleSilenceMin/idleEveryMin），全流程走后台 LLM 任务不卡主循环
 static uint32_t g_lastIdleMs = 0;
@@ -240,6 +263,8 @@ static String searchQueryOf(const String& text) {
 
 
 String laapInteractSearch(const String& userText) {
+  laapActivity();                      // 有人跟它说话 = 活动（息屏则唤醒）
+  g_chatPending = false;
   memory.logEvent("user", userText);
   mind.onUserInteraction();
   mind.trustUpdate(1, 0);      // 小凌⑥: 主人主动来找我=正向互动
@@ -249,6 +274,7 @@ String laapInteractSearch(const String& userText) {
   String toolReply = laapToolsDispatch(userText);
   if (toolReply.length()) {
     g_lastSay = toolReply; g_lastExpr = "calm";
+    g_chatReply = toolReply; g_chatSeq++;        // 本地工具直答=已成品（网页可直接显示）
     memory.logEvent("aris", toolReply);
     Serial.printf("[Aris] %s\n", toolReply.c_str());
     display.drawFace("calm");
@@ -284,8 +310,9 @@ String laapInteractSearch(const String& userText) {
   // F4: 丢给后台 LLM 任务，立即返回"思考中"；loop 里 llmHarvest() 收割
   if (llmSubmit(msgs, nm, cfg.s.llmMaxTokens, 0.85f, userText)) {
     g_pendingUserText = userText;
+    g_chatPending = true;                         // 网页据此改为轮询 /api/chat/reply
     display.drawFace("curious", true);            // 思考中表情
-    return "……";                                   // 受理回执（Web 端显示省略号）
+    return "……";                                   // 受理回执（真回复异步产出）
   }
   Serial.println("[LAAP] LLM 忙，上一条稍后重试");
   return "让我把刚才的想完……";
@@ -364,6 +391,8 @@ void llmHarvest() {
   }
   g_lastSay = say;
   g_lastExpr = r.ok ? r.expr : mind.moodKey();
+  if (kind == LK_CHAT) { g_chatReply = say; g_chatSeq++; }   // 聊天成品：网页轮询取件
+  laapActivity();                                            // 它开口说话=活动
   memory.logEvent("aris", say);
   Serial.printf(kind == LK_EXPRESS ? "[Aris·自发] %s\n" : "[Aris] %s\n", say.c_str());
   display.drawNeeds(mind.needs().energy, mind.needs().curiosity, mind.needs().social,
@@ -704,8 +733,41 @@ void serialCli() {
     String line = Serial.readStringUntil('\n');
     line.trim();
     if (!line.length()) continue;
+    laapActivity();     // 串口打字也是交互
     if (line == "/help") {
-      Serial.println("命令: /status /portal(进配置热点) /mem(看记忆) /tick(手动心跳) /say 文字(朗读) /reset(格式化)");
+      Serial.println("命令: /status /touch(触觉实测) /screen N(息屏秒) /portal(进配置热点) /mem(看记忆) /tick(手动心跳) /lcd /pa /imu /asrtest /reset(格式化)");
+      Serial.println("      直接打字回车 = 跟它说话（走完整对话链路）");
+    } else if (line == "/touch") {
+      // 触觉实测：5 秒采样，摇晃/扣翻板子看峰值与判定
+      if (!g_imuOk) Serial.println("[触觉] IMU 未初始化（/imu 查 I2C）");
+      else {
+        Serial.println("[触觉] 5 秒采样中：现在摇晃板子，或把它扣在桌上…");
+        float peak = 0; int shakes = 0, downs = 0;
+        uint32_t t0 = millis();
+        while (millis() - t0 < 5000) {
+          float x, y, z; imuReadAccel(x, y, z);
+          float mag = sqrtf(x * x + y * y + z * z);
+          if (mag > peak) peak = mag;
+          if (fabsf(mag - 1.0f) > 0.55f) shakes++;
+          if (z < -0.75f) downs++;
+          delay(20);
+        }
+        Serial.printf("[触觉] 峰值 |a|=%.2fg，强晃样本 %d，扣伏样本 %d\n", peak, shakes, downs);
+        Serial.printf("[触觉] 判定阈值：|a|-1 超 ±0.55 记一次晃(3次/1.5秒=撒娇)；z<-0.75=扣伏(生气)\n");
+        Serial.printf("[触觉] 结果：%s\n",
+                      downs > 10 ? "扣伏已识别" : (shakes >= 3 ? "晃动已识别" : "本次没测到动作（幅度太小？）"));
+      }
+    } else if (line == "/screen") {
+      Serial.printf("[LCD] 静默息屏 %u 秒（0=常亮），当前背光=%s 亮度=%u%%\n",
+                    cfg.s.screenOffSec, display.screenOn() ? "亮" : "灭", display.getBrightness());
+      Serial.println("[LCD] 用法: /screen 60  → 60 秒无交互息屏并保存");
+    } else if (line.startsWith("/screen ")) {
+      int v = line.substring(8).toInt();
+      if (v < 0) v = 0; if (v > 3600) v = 3600;
+      cfg.s.screenOffSec = (uint16_t)v;
+      cfg.save();
+      g_lastActivityMs = millis();
+      Serial.printf("[LCD] 静默 %d 秒后息屏（0=常亮），已保存\n", v);
     } else if (line == "/status") {
       Serial.println("[世界模型] " + mind.worldJson());
       Serial.println("[语义记忆] " + memory.semantic());
@@ -823,6 +885,7 @@ void setup() {
   memory.begin();
   cfg.begin();
   cfg.load();
+  g_uptimeBaseMin = cfg.uptimeBase();   // 累计运行时长（跨重启累计，单位分钟）
 
   display.begin();  // Wire(I2C) 在 display.begin 里初始化——必须先于 vision
   display.drawBootScreen();
@@ -863,6 +926,7 @@ void setup() {
   pinMode(BTN_PIN, INPUT_PULLUP);
   g_lastTickMs = millis();
   g_lastConsumeMs = millis();
+  g_lastActivityMs = millis();     // 开机先亮 cfg.s.screenOffSec 秒，之后静默才息屏
 
   // F4: LLM 后台任务（核 1，栈 12KB —— TLS+String 操作吃栈）
   g_llmQueue = xQueueCreate(2, sizeof(LlmRequest*));
@@ -898,6 +962,7 @@ void touchGestures() {
       g_shakeCount = 0; g_shakeWindowMs = 0;
       if (!g_facedown) {
         Serial.println("[触觉] 摇晃 → 撒娇反应");
+        laapActivity();
         mind.onUserInteraction();
         arisExpress(true, "tickle");      // 主人在逗它
       }
@@ -915,14 +980,20 @@ void touchGestures() {
     mind.onError();                        // 安全需求受挫
   } else if (!down && g_facedown) {
     g_facedown = false;
+    laapActivity();                        // 被翻回来=有人在动它
     if (millis() - g_facedownMs > 2000) {  // 扣了 2 秒以上才算真生气过
       Serial.println("[触觉] 翻回来了 → 和好");
       memory.logEvent("event", "被翻回来了，气消了一半。");
       arisExpress(true, "makeup");
     }
   }
+  // 扣伏期间闭眼装死：只在状态切换时画一帧（原来每帧 clear = 10ms 一次全屏 SPI 空转）
+  static bool s_deadPainted = false;
   if (g_facedown) {
-    display.clear(0);                      // 扣伏期间闭眼装死
+    if (!s_deadPainted) { display.clear(0); s_deadPainted = true; }
+  } else if (s_deadPainted) {
+    s_deadPainted = false;
+    display.repaint();
   }
 }
 
@@ -938,13 +1009,30 @@ void loop() {
       display.drawStatusLine(temperatureRead(),
                              (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0,
                              ESP.getFreeHeap() / 1024,
-                             millis() / 60000);
+                             laapUptimeMin());   // 累计运行（跨重启，不再每次开机归零）
     }
   }
   voice.loopTick();   // VAD 自动聆听模式
   audio.paTick();     // 功放空闲关断（流式播放间隔中保持开启）
   llmHarvest();       // F4: 收割后台 LLM 结果
   touchGestures();    // F5: 摇晃/翻面触觉（每帧，内部自带节流）
+
+  // 有人对着麦克风说话 = 活动（VAD 电平沿触发，避免每帧刷屏）
+  { static bool s_wasSpeech = false;
+    bool sp = audio.vadSpeaking();
+    if (sp && !s_wasSpeech) laapActivity();
+    s_wasSpeech = sp; }
+
+  // 静默息屏：screenOffSec 秒无活动关背光；任何交互（说话/按键/摇晃/网页对话）立即点亮
+  if (cfg.s.screenOffSec > 0 && display.screenOn() &&
+      millis() - g_lastActivityMs > (uint32_t)cfg.s.screenOffSec * 1000UL) {
+    display.setScreenOn(false);
+    Serial.println("[LAAP] 静默息屏（交互即唤醒）");
+  }
+
+  // 累计运行时长：每 5 分钟落盘一次（单键写入，NVS 磨损可忽略）
+  { static uint32_t s_lastUpSave = 0;
+    if (millis() - s_lastUpSave > 300000UL) { s_lastUpSave = millis(); laapUptimePersist(); } }
 
   // BOOT 键: 短按=主动表达 长按4s=配置热点 长按10s=格式化
   bool pressed = (digitalRead(BTN_PIN) == LOW);
@@ -955,6 +1043,7 @@ void loop() {
     if (held > 10000) { Serial.println("[LAAP] 恢复出厂"); display.clear(0); cfg.reset(); ESP.restart(); }
     else if (held > 4000) { if (!webui.inAP()) webui.beginAP(); }
     else if (held > 60) {
+      laapActivity();                 // 按键=活动（息屏先点亮）
       mind.onButtonPress();
       if (voice.ready() && (VoiceMode)cfg.s.voiceMode == VoiceMode::Vad) {
         voice.setVadPaused(!voice.vadPaused());   // 自动聆听模式：短按=暂停/恢复

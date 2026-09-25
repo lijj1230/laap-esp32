@@ -170,9 +170,9 @@ String LaapDisplay::lcdDiag() {
 
 void LaapDisplay::setBrightness(uint8_t pct) {
   brightness = pct;
-  // 实战派背光低电平点亮（反相）：亮度 pct 越大占空越小
+  // 实战派背光低电平点亮（反相）：亮度 pct 越大占空越小；息屏期间保持全灭
   int duty = 255 - (int)(255 * pct / 100);
-  analogWrite(SZP_LCD_BL, duty);
+  analogWrite(SZP_LCD_BL, _screenOn ? duty : 255);
 }
 
 // ================= 表情：眼睛 =================
@@ -202,7 +202,8 @@ void LaapDisplay::drawEye(int cx, int cy, int rx, int ry, int pupDx, int pupDy, 
 #define UI_BAR_H     36
 
 void LaapDisplay::drawFace(const char* expr, bool thinking) {
-  strlcpy(curExpr, expr, sizeof(curExpr));
+  strlcpy(curExpr, expr, sizeof(curExpr));   // 息屏也要记住表情，唤醒时补画
+  if (!_screenOn) return;
   int cx1 = 96, cx2 = SZP_LCD_W - 96, cy = (UI_FACE_TOP + UI_FACE_BOT) / 2;
   int rx = 44, ry = 30, pdx = 0, pdy = 0, brow = 0;
   String e(expr); e.toLowerCase();
@@ -220,6 +221,7 @@ void LaapDisplay::drawFace(const char* expr, bool thinking) {
 }
 
 void LaapDisplay::blinkTick() {
+  if (!_screenOn) return;
   uint32_t now = millis();
   if (blinking) {
     if (now - lastBlink > 60) {
@@ -242,14 +244,34 @@ void LaapDisplay::blinkTick() {
   }
 }
 
+// 屏幕开关：关=背光灭（面板内容保留，不必整屏重画）
+void LaapDisplay::setScreenOn(bool on) {
+  if (_screenOn == on) return;
+  _screenOn = on;
+  if (on) {
+    setBrightness(brightness);     // 恢复用户设定亮度（setBrightness 内部按 _screenOn 决定占空）
+    repaint();                     // 息屏期间表情/顶栏变化补画一帧
+  } else {
+    analogWrite(SZP_LCD_BL, 255);  // 反相背光：255 占空=最暗
+  }
+}
+
+void LaapDisplay::repaint() {
+  if (!_screenOn) return;
+  drawFace(curExpr, false);
+  drawTopStrip();
+}
+
 void LaapDisplay::drawListenState(bool listening) {
-  listenDot = listening ? 1 : 0;
-  // 顶栏右上角小圆点：绿=在听 灰=暂停（drawTopStrip 每秒重画时保留）
-  fillRect(304, 4, 14, 10, CLR_BG);
-  fillCircle(310, 9, 3, listening ? CLR_EXP : CLR_DIM);
+  int8_t want = listening ? 1 : -1;   // 不在听=不显示（原来恒画灰点，看着像一直在收声）
+  if (want == listenDot) return;
+  listenDot = want;
+  fillRect(SZP_LCD_W - 18, 1, 18, 17, CLR_BG);       // 只清右上角这一小块
+  if (listenDot > 0) fillCircle(SZP_LCD_W - 8, 9, 4, CLR_EXP);
 }
 
 void LaapDisplay::thinkingPulse() {
+  if (!_screenOn) return;
   thinkStep = (thinkStep + 1) % 6;
   int x = 134 + thinkStep * 9;
   int y = UI_FACE_BOT - 24;           // 表情区底部（眼下）
@@ -283,7 +305,8 @@ static const struct { char ch; uint8_t g[5]; } GLYPH3x5[] = {
   {'h', {0x04,0x04,0x07,0x05,0x05}},
 };
 
-void LaapDisplay::drawGlyph3x5(int x, int y, char ch, uint16_t c) {
+// scale=1 时 3x5 像素；scale=2/3 时每点放大成方块（顶栏用 2~3 倍，原 3x5 太小看不清）
+void LaapDisplay::drawGlyph3x5(int x, int y, char ch, uint16_t c, uint8_t scale) {
   const uint8_t* g = nullptr;
   if (ch >= '0' && ch <= '9') g = FONT3x5[ch - '0'];
   else {
@@ -292,55 +315,59 @@ void LaapDisplay::drawGlyph3x5(int x, int y, char ch, uint16_t c) {
   if (!g) return;
   for (int col = 0; col < 3; col++)
     for (int row = 0; row < 5; row++)
-      if (g[row] & (0x04 >> col)) fillRect(x + col, y + row, 1, 1, c);
+      if (g[row] & (0x04 >> col))
+        fillRect(x + col * scale, y + row * scale, scale, scale, c);
 }
 
-int LaapDisplay::drawText3x5(int x, int y, const char* s, uint16_t c) {
+int LaapDisplay::drawText3x5(int x, int y, const char* s, uint16_t c, uint8_t scale) {
   for (; *s; s++) {
-    drawGlyph3x5(x, y, *s, c);
-    x += (*s == '.') ? 3 : 4;
+    drawGlyph3x5(x, y, *s, c, scale);
+    x += (int)(((*s == '.') ? 3 : 4) * scale);
   }
   return x;
 }
 
 // ================= 顶栏（时间 + 需求数字 + 设备信息 + 聆听点） =================
+// 版面：行1 时间(3x 放大) + 右侧五个需求数字(2x)；行2 设备信息(2x)。
+// 需求数字按固定 38px 槽位排布，数字位数变化时不会左右抖动。
 void LaapDisplay::drawTopStrip() {
+  if (!_screenOn) return;
   fillRect(0, 0, SZP_LCD_W, UI_TOP_H, CLR_BG);
   fillRect(0, UI_TOP_H - 1, SZP_LCD_W, 1, CLR_DIM);   // 分隔线
 
-  const uint16_t tc = RGB565(160, 175, 195);
-  const uint16_t dc = RGB565(110, 122, 145);
+  const uint16_t tc = RGB565(180, 195, 215);
+  const uint16_t dc = RGB565(120, 134, 158);
 
-  // ---- 行1 (y=3): 时间 + 五个需求数字 ----
-  int x = 6, y1 = 3;
+  // ---- 行1 (y=1): 时间 3x 放大（9x15 像素，远处也看得清） ----
   time_t nowT = time(nullptr);
   if (nowT > 1700000000) {
     struct tm t;
     localtime_r(&nowT, &t);
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
-    x = drawText3x5(x, y1, buf, tc) + 5;
+    char tbuf[8];
+    snprintf(tbuf, sizeof(tbuf), "%02d:%02d", t.tm_hour, t.tm_min);
+    drawText3x5(6, 1, tbuf, tc, 3);
   } else {
-    x = drawText3x5(x, y1, "--:--", dc) + 5;
+    drawText3x5(6, 1, "--:--", dc, 3);
   }
   // 需求数字：彩点 + 百分数（能量/好奇/社交/安全/表达）
   const uint16_t colors[5] = {CLR_ENE, CLR_CUR, CLR_SOC, CLR_SEC, CLR_EXP};
+  int nx = 74;
   for (int i = 0; i < 5; i++) {
-    fillCircle(x + 2, y1 + 2, 2, colors[i]);
-    char buf[6];
-    snprintf(buf, sizeof(buf), "%d", needPct[i]);
-    x = drawText3x5(x + 6, y1, buf, colors[i]) + 7;
+    fillCircle(nx + 3, 9, 3, colors[i]);
+    char nbuf[6];
+    snprintf(nbuf, sizeof(nbuf), "%d", needPct[i]);
+    drawText3x5(nx + 9, 4, nbuf, colors[i], 2);
+    nx += 38;
   }
-  // 聆听点（右上角）
-  if (listenDot >= 0)
-    fillCircle(SZP_LCD_W - 8, 6, 3, listenDot ? CLR_EXP : CLR_DIM);
+  // 聆听点（右上角，仅真正在听时出现——原来常亮会让人以为一直在收声）
+  if (listenDot > 0) fillCircle(SZP_LCD_W - 8, 9, 4, CLR_EXP);
 
-  // ---- 行2 (y=18): 设备信息 47C -47dB 168KB 2h13m ----
+  // ---- 行2 (y=20): 设备信息 47C -45dB 90KB 12h30m（2x） ----
   char buf[48];
   snprintf(buf, sizeof(buf), "%dC %ddB %uKB %uh%02um",
            (int)devTemp, devRssi, (unsigned)devHeapKb,
            (unsigned)(devUpMin / 60), (unsigned)(devUpMin % 60));
-  drawText3x5(6, 18, buf, dc);
+  drawText3x5(6, 20, buf, dc, 2);
 }
 
 void LaapDisplay::drawStatusLine(float tempC, int rssi, uint32_t heapKb, uint32_t upMin) {
@@ -395,6 +422,7 @@ void LaapDisplay::drawIp7seg(int x, int y, const String& s) {
 }
 
 void LaapDisplay::drawIpLine(const String& ip, bool wifiOk) {
+  if (!_screenOn) return;
   // 底栏：分隔线 + 天线/感叹号 + IP（7段数码），UI_BAR_H=36 内布局
   fillRect(0, UI_BAR_Y - 2, SZP_LCD_W, UI_BAR_H + 2, CLR_BG);
   fillRect(0, UI_BAR_Y - 2, SZP_LCD_W, 1, CLR_DIM);   // 分隔线

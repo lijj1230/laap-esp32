@@ -104,18 +104,21 @@ void LaapVoice::setVadPaused(bool paused) {
   if (_vadPaused == paused) return;
   _vadPaused = paused;
   Serial.printf("[VOICE] 自动聆听 %s\n", paused ? "已暂停（BOOT 短按恢复）" : "恢复中");
-  display.drawListenState(!paused);
+  // 状态点由 loopTick 统一维护（暂停即灭），这里不直接画，避免与 loopTick 打架
 }
 
 void LaapVoice::loopTick() {
-  if (!_ready || _busy) return;
+  if (!_ready) return;
   bool vadMode = ((VoiceMode)cfg.s.voiceMode == VoiceMode::Vad);
-  static bool s_lastDrawn = true;
-  bool wantListening = vadMode && !_vadPaused;
+  // 聆听点只在"确实在收声"时亮：暂停 / 说话中 / 播报冷却期都算不在听。
+  // （原来 按键模式 也会画一个灰点常驻，看着像一直在录）
+  bool wantListening = vadMode && !_vadPaused && !_busy && ((int32_t)(millis() - _cooldownMs) >= 0);
+  static bool s_lastDrawn = false;
   if (wantListening != s_lastDrawn) {
     display.drawListenState(wantListening);
     s_lastDrawn = wantListening;
   }
+  if (_busy) return;
   // ASR 预热：仅"上次对话后 5 分钟内"的空闲期进行，且已有活连接就跳过——
   // 防止长期无人时高频握手（服务商 WAF 可能盯上陌生 TLS 风暴）
   static uint32_t s_warmMs = 0;

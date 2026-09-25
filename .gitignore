@@ -6,3 +6,4 @@ firmware/*merged*.bin
 
 # 运行期临时文件
 *.log
+.tmp/

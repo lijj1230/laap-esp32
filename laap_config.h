@@ -18,6 +18,7 @@ struct LaapSettings {
   uint16_t idleEveryMin   = 20;                     // 独白间隔(分钟，0=关闭独白)
   uint8_t volume = 70;                              // 喇叭音量(0-100, ES8311)
   uint8_t brightness = 90;                          // 屏幕亮度(0-100, 背光PWM)
+  uint16_t screenOffSec = 60;                       // 静默息屏秒数(0=不息屏)
   uint8_t llmContinue = 1;                          // 输出截断自动续写轮数(0=关, 最多3)
   uint16_t llmMaxTokens = 220;                      // 单次回复 maxTokens(80-1000, 聊天/表达/独白共用)
   // 小凌⑥: 信任标量（NVS 键 trust，0..255 ↔ 0..1）——读写走 laapTrust()/laapTrustSet()
@@ -55,10 +56,18 @@ public:
   void reset();                 // 恢复出厂（清空 NVS + 记忆文件）
   bool provisioned() const { return _provisioned; }
   LaapSettings s;
+  // 累计运行时长（跨重启）：开机读回 base，运行中周期性 base+本机 millis() 落盘
+  uint32_t uptimeBase() const { return _uptimeBaseMin; }
+  void saveUptime(uint32_t totalMin);
 private:
   Preferences prefs;
   bool _provisioned = false;
+  uint32_t _uptimeBaseMin = 0;
 };
+
+// 定义在 laap-esp32.ino：累计运行分钟数 / 立即落盘（重启前调用，少丢一截时长）
+uint32_t laapUptimeMin();
+void laapUptimePersist();
 
 extern LaapConfig cfg;
 
