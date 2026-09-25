@@ -34,6 +34,7 @@
 #include "laap_imu.h"
 #include "laap_audio.h"
 #include "laap_voice.h"
+#include "laap_speech.h"
 #include "laap_search.h"
 #include "laap_vision.h"
 #include "laap_tools.h"
@@ -744,6 +745,31 @@ void serialCli() {
         Serial.println();
       }
       Serial.printf("[IMU] g_imuOk=%d\n", g_imuOk);
+    } else if (line == "/asrtest") {
+      // ASR 端到端诊断: 录 5s（请对着板子说话）→ RMS 判定麦克风 → SiliconFlow 转写
+      if (!audio.micOk) { Serial.println("[ASR] 无麦克风"); continue; }
+      Serial.println("[ASR] 录音 5 秒…请说话！");
+      audio.recordStart(5);
+      uint32_t t0 = millis();
+      while (millis() - t0 < 5000) { audio.recordTick(); delay(5); }
+      size_t got = audio.recordBytes();
+      audio.recordStop();
+      // RMS 判定（16bit PCM）
+      float rms = 0; int n = got / 2;
+      const int16_t* p = audio.recordData();
+      for (int i = 0; i < n; i += 16) rms += (float)p[i] * p[i];
+      rms = sqrtf(rms / (n / 16 + 1));
+      Serial.printf("[ASR] 采样 %u 字节, RMS=%.0f（<50=无声, >300=正常说话）\n", got, rms);
+      if (rms < 50) { Serial.println("[ASR] 麦克风疑似无声（查 ES7210/增益）"); continue; }
+      String err;
+      String text = asr.transcribe(audio.recordData(), got, err);
+      if (text.length()) {
+        Serial.printf("[ASR] 识别结果: 「%s」\n", text.c_str());
+        Serial.println("[ASR] ✓ 全链路正常，送 AI 回复：");
+        Serial.println(laapInteractSearch(text));
+      } else {
+        Serial.printf("[ASR] 转写失败: %s\n", err.c_str());
+      }
     } else if (line == "/mem") {
       String mem = memory.recentContext(800);
       if (mem.length()) Serial.print(mem);
@@ -896,9 +922,15 @@ void loop() {
   serialCli();
   memory.embedTick();   // 语义向量懒补（15s 限速，断网自动退关键词）
   display.blinkTick();
-  { // 状态行（时间/心情点）每秒刷新一次
+  { // 顶栏（时间/需求数字/设备信息）每秒刷新
     static uint32_t s_lastStatus = 0;
-    if (millis() - s_lastStatus > 1000) { s_lastStatus = millis(); display.drawStatusLine(); }
+    if (millis() - s_lastStatus > 1000) {
+      s_lastStatus = millis();
+      display.drawStatusLine(temperatureRead(),
+                             (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0,
+                             ESP.getFreeHeap() / 1024,
+                             millis() / 60000);
+    }
   }
   voice.loopTick();   // VAD 自动聆听模式
   llmHarvest();       // F4: 收割后台 LLM 结果

@@ -192,18 +192,18 @@ void LaapDisplay::drawEye(int cx, int cy, int rx, int ry, int pupDx, int pupDy, 
   }
 }
 
-// ================= 布局常量（四段式） =================
-// 表情区 0-119 | 状态行 120-133（时间+心情）| 需求条 136-194 | 底栏 196-239
-#define UI_FACE_H    120
-#define UI_STATUS_Y  121
-#define UI_NEEDS_Y   138
-#define UI_NEEDS_H   58
-#define UI_BAR_Y     200
-#define UI_BAR_H     40
+// ================= 布局常量（顶栏信息密集 + 大表情居中 + 底部 IP） =================
+// 顶栏 0-35: 行1=时间+需求数字(彩点+%)  行2=设备信息(温度/RSSI/内存/运行时长)
+// 表情区 38-198: 眼睛垂直居中 | 底栏 204-239: IP
+#define UI_TOP_H     36
+#define UI_FACE_TOP  40
+#define UI_FACE_BOT  198
+#define UI_BAR_Y     204
+#define UI_BAR_H     36
 
 void LaapDisplay::drawFace(const char* expr, bool thinking) {
   strlcpy(curExpr, expr, sizeof(curExpr));
-  int cx1 = 96, cx2 = SZP_LCD_W - 96, cy = 54;
+  int cx1 = 96, cx2 = SZP_LCD_W - 96, cy = (UI_FACE_TOP + UI_FACE_BOT) / 2;
   int rx = 44, ry = 30, pdx = 0, pdy = 0, brow = 0;
   String e(expr); e.toLowerCase();
   if (e == "happy")   { ry = 20; pdy = 6; }
@@ -213,7 +213,7 @@ void LaapDisplay::drawFace(const char* expr, bool thinking) {
   else if (e == "anxious")  { ry = 27; brow = -(ry + 10); }
   else if (e == "tired")    { ry = 11; pdy = 2; }
   else                     { rx = 42; ry = 30; } // calm
-  fillRect(0, 0, SZP_LCD_W, UI_FACE_H, CLR_BG);
+  fillRect(0, UI_FACE_TOP, SZP_LCD_W, UI_FACE_BOT - UI_FACE_TOP, CLR_BG);
   if (thinking) brow = -(ry + 12);
   drawEye(cx1, cy, rx, ry, pdx, pdy, brow);
   drawEye(cx2, cy, rx, ry, pdx, pdy, brow);
@@ -232,9 +232,9 @@ void LaapDisplay::blinkTick() {
       else if (e == "excited") { rx = 52; ryBase = 46; }
       else if (e == "curious") { rx = 38; ryBase = 40; }
       int ry2 = (int)(ryBase * ry / 34); if (ry2 < 2) ry2 = 2;
-      fillRect(0, 0, SZP_LCD_W, UI_FACE_H, CLR_BG);
-      drawEye(96, 54, rx, ry2, 0, 0, 0);
-      drawEye(SZP_LCD_W - 96, 54, rx, ry2, 0, 0, 0);
+      fillRect(0, UI_FACE_TOP, SZP_LCD_W, UI_FACE_BOT - UI_FACE_TOP, CLR_BG);
+      drawEye(96, (UI_FACE_TOP + UI_FACE_BOT) / 2, rx, ry2, 0, 0, 0);
+      drawEye(SZP_LCD_W - 96, (UI_FACE_TOP + UI_FACE_BOT) / 2, rx, ry2, 0, 0, 0);
       if (blinkPhase >= 8) { blinking = false; drawFace(curExpr, false); }
     }
   } else if (now - lastBlink > 4000 + (esp_random() % 4000)) {
@@ -243,20 +243,21 @@ void LaapDisplay::blinkTick() {
 }
 
 void LaapDisplay::drawListenState(bool listening) {
-  // 状态区右上角小圆点：绿=在听 灰=暂停
-  fillRect(304, UI_NEEDS_Y - 2, 14, 14, CLR_BG);
-  fillCircle(310, UI_NEEDS_Y + 5, 4, listening ? CLR_EXP : CLR_DIM);
+  listenDot = listening ? 1 : 0;
+  // 顶栏右上角小圆点：绿=在听 灰=暂停（drawTopStrip 每秒重画时保留）
+  fillRect(304, 4, 14, 10, CLR_BG);
+  fillCircle(310, 9, 3, listening ? CLR_EXP : CLR_DIM);
 }
 
 void LaapDisplay::thinkingPulse() {
   thinkStep = (thinkStep + 1) % 6;
   int x = 134 + thinkStep * 9;
-  fillRect(134, 118, 54, 4, CLR_BG);
-  fillRect(x, 118, 6, 4, CLR_DIM);
+  int y = UI_FACE_BOT - 24;           // 表情区底部（眼下）
+  fillRect(134, y, 54, 4, CLR_BG);
+  fillRect(x, y, 6, 4, CLR_DIM);
 }
 
-// ================= 状态行（时间点阵 + 心情点 + 聆听点） =================
-// 3x5 微点阵（数字与冒号），状态行高度 14px 内
+// ================= 3x5 微点阵（数字 + 设备信息所需字符） =================
 static const uint8_t FONT3x5[10][5] = {
   {0x07,0x05,0x05,0x05,0x07}, // 0
   {0x02,0x06,0x02,0x02,0x07}, // 1
@@ -269,75 +270,92 @@ static const uint8_t FONT3x5[10][5] = {
   {0x07,0x05,0x07,0x05,0x07}, // 8
   {0x07,0x05,0x07,0x01,0x07}, // 9
 };
+// 字母/符号字形（键: 字符 → 5 行 3bit）
+static const struct { char ch; uint8_t g[5]; } GLYPH3x5[] = {
+  {':', {0x00,0x02,0x00,0x02,0x00}},
+  {'.', {0x00,0x00,0x00,0x00,0x02}},
+  {'-', {0x00,0x00,0x07,0x00,0x00}},
+  {'C', {0x07,0x04,0x04,0x04,0x07}},
+  {'K', {0x05,0x05,0x06,0x05,0x05}},
+  {'B', {0x06,0x05,0x06,0x05,0x06}},
+  {'d', {0x01,0x01,0x07,0x05,0x07}},
+  {'m', {0x00,0x07,0x05,0x05,0x05}},
+  {'h', {0x04,0x04,0x07,0x05,0x05}},
+};
 
-void LaapDisplay::drawDot3x5(int x, int y, int digit, uint16_t c) {
-  if (digit < 0 || digit > 9) return;
-  for (int col = 0; col < 3; col++) {
-    for (int row = 0; row < 5; row++) {
-      if (FONT3x5[digit][row] & (0x04 >> col)) fillRect(x + col, y + row, 1, 1, c);
-    }
+void LaapDisplay::drawGlyph3x5(int x, int y, char ch, uint16_t c) {
+  const uint8_t* g = nullptr;
+  if (ch >= '0' && ch <= '9') g = FONT3x5[ch - '0'];
+  else {
+    for (auto& e : GLYPH3x5) if (e.ch == ch) { g = e.g; break; }
   }
+  if (!g) return;
+  for (int col = 0; col < 3; col++)
+    for (int row = 0; row < 5; row++)
+      if (g[row] & (0x04 >> col)) fillRect(x + col, y + row, 1, 1, c);
 }
 
-void LaapDisplay::drawStatusLine() {
-  fillRect(0, UI_STATUS_Y, SZP_LCD_W, 14, CLR_BG);
-  // 时间 HH:MM（NTP 就绪时）
+int LaapDisplay::drawText3x5(int x, int y, const char* s, uint16_t c) {
+  for (; *s; s++) {
+    drawGlyph3x5(x, y, *s, c);
+    x += (*s == '.') ? 3 : 4;
+  }
+  return x;
+}
+
+// ================= 顶栏（时间 + 需求数字 + 设备信息 + 聆听点） =================
+void LaapDisplay::drawTopStrip() {
+  fillRect(0, 0, SZP_LCD_W, UI_TOP_H, CLR_BG);
+  fillRect(0, UI_TOP_H - 1, SZP_LCD_W, 1, CLR_DIM);   // 分隔线
+
+  const uint16_t tc = RGB565(160, 175, 195);
+  const uint16_t dc = RGB565(110, 122, 145);
+
+  // ---- 行1 (y=3): 时间 + 五个需求数字 ----
+  int x = 6, y1 = 3;
   time_t nowT = time(nullptr);
   if (nowT > 1700000000) {
     struct tm t;
     localtime_r(&nowT, &t);
-    uint16_t tc = RGB565(150, 165, 185);
-    int x = 10, y = UI_STATUS_Y + 4;
-    drawDot3x5(x, y, t.tm_hour / 10, tc); x += 5;
-    drawDot3x5(x, y, t.tm_hour % 10, tc); x += 5;
-    fillRect(x, y + 3, 1, 1, tc); fillRect(x, y + 1, 1, 1, tc); x += 3; // 冒号
-    drawDot3x5(x, y, t.tm_min / 10, tc); x += 5;
-    drawDot3x5(x, y, t.tm_min % 10, tc); x += 7;
-    // 心情文字用色点表示（在时间旁）
-    String e(curExpr); e.toLowerCase();
-    uint16_t mc = CLR_TXT;
-    if (e == "happy" || e == "excited") mc = CLR_EXP;
-    else if (e == "curious") mc = CLR_CUR;
-    else if (e == "anxious") mc = CLR_SEC;
-    else if (e == "tired") mc = CLR_DIM;
-    else if (e == "lonely") mc = CLR_SOC;
-    fillCircle(x + 2, y + 2, 3, mc);
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
+    x = drawText3x5(x, y1, buf, tc) + 5;
   } else {
-    // NTP 未同步：灰色时钟点
-    fillCircle(14, UI_STATUS_Y + 6, 3, CLR_DIM);
+    x = drawText3x5(x, y1, "--:--", dc) + 5;
   }
+  // 需求数字：彩点 + 百分数（能量/好奇/社交/安全/表达）
+  const uint16_t colors[5] = {CLR_ENE, CLR_CUR, CLR_SOC, CLR_SEC, CLR_EXP};
+  for (int i = 0; i < 5; i++) {
+    fillCircle(x + 2, y1 + 2, 2, colors[i]);
+    char buf[6];
+    snprintf(buf, sizeof(buf), "%d", needPct[i]);
+    x = drawText3x5(x + 6, y1, buf, colors[i]) + 7;
+  }
+  // 聆听点（右上角）
+  if (listenDot >= 0)
+    fillCircle(SZP_LCD_W - 8, 6, 3, listenDot ? CLR_EXP : CLR_DIM);
+
+  // ---- 行2 (y=18): 设备信息 47C -47dB 168KB 2h13m ----
+  char buf[48];
+  snprintf(buf, sizeof(buf), "%dC %ddB %uKB %uh%02um",
+           (int)devTemp, devRssi, (unsigned)devHeapKb,
+           (unsigned)(devUpMin / 60), (unsigned)(devUpMin % 60));
+  drawText3x5(6, 18, buf, dc);
 }
 
-// ================= 需求条（防糊：大间距 + 亮底槽 + 圆头条） =================
+void LaapDisplay::drawStatusLine(float tempC, int rssi, uint32_t heapKb, uint32_t upMin) {
+  devTemp = tempC; devRssi = rssi; devHeapKb = heapKb; devUpMin = upMin;
+  drawTopStrip();
+}
+
+// ================= 需求 → 顶栏数字 =================
 void LaapDisplay::drawNeeds(float energy, float curiosity, float social, float security, float expression) {
-  struct { float v; uint16_t c; } bars[5] = {
-    {energy,    CLR_ENE},
-    {curiosity, CLR_CUR},
-    {social,    CLR_SOC},
-    {security,  CLR_SEC},
-    {expression,CLR_EXP},
-  };
-  const int bx = 16;                  // 左边距
-  const int bw = SZP_LCD_W - bx - 24; // 条宽
-  const int bh = 8, gap = 13;         // 8px 条高 + 13px 间距（防糊关键）
-  fillRect(0, UI_NEEDS_Y - 6, SZP_LCD_W, UI_NEEDS_H + 10, CLR_BG);
+  float v[5] = {energy, curiosity, social, security, expression};
   for (int i = 0; i < 5; i++) {
-    int y = UI_NEEDS_Y + i * gap;
-    int cy = y + bh / 2;
-    // 底槽：明显比背景亮一档（RGB565 52,62,84），一眼看清轨道
-    fillRect(bx, y, bw, bh, RGB565(52, 62, 84));
-    // 左侧圆点图标
-    fillCircle(bx - 6, cy, 3, bars[i].c);
-    // 值条（圆头）
-    int fw = (int)(bw * (bars[i].v > 1 ? 1 : bars[i].v));
-    if (fw > bh) {
-      fillRect(bx, y, fw, bh, bars[i].c);
-      fillCircle(bx, cy, bh / 2, bars[i].c);
-      fillCircle(bx + fw, cy, bh / 2, bars[i].c);
-    } else if (fw > 0) {
-      fillRect(bx, y, fw, bh, bars[i].c);
-    }
+    int p = (int)((v[i] < 0 ? 0 : (v[i] > 1 ? 1 : v[i])) * 100);
+    if (p != needPct[i]) { needPct[i] = p; }
   }
+  drawTopStrip();
 }
 
 // ================= 7 段数码 IP 行 =================
@@ -377,22 +395,22 @@ void LaapDisplay::drawIp7seg(int x, int y, const String& s) {
 }
 
 void LaapDisplay::drawIpLine(const String& ip, bool wifiOk) {
-  // 底栏：分隔线 + 天线/感叹号 + IP（7段数码）
-  fillRect(0, UI_BAR_Y - 4, SZP_LCD_W, UI_BAR_H + 8, CLR_BG);
-  fillRect(0, UI_BAR_Y - 4, SZP_LCD_W, 1, CLR_DIM);   // 分隔线
+  // 底栏：分隔线 + 天线/感叹号 + IP（7段数码），UI_BAR_H=36 内布局
+  fillRect(0, UI_BAR_Y - 2, SZP_LCD_W, UI_BAR_H + 2, CLR_BG);
+  fillRect(0, UI_BAR_Y - 2, SZP_LCD_W, 1, CLR_DIM);   // 分隔线
   if (wifiOk) {
     // 小天线图标
-    fillRect(8, UI_BAR_Y + 32, 2, 4, CLR_EXP);
-    fillRect(11, UI_BAR_Y + 29, 2, 7, CLR_EXP);
-    fillRect(14, UI_BAR_Y + 26, 2, 10, CLR_EXP);
-    drawIp7seg(22, UI_BAR_Y + 20, ip);
+    fillRect(8, UI_BAR_Y + 30, 2, 4, CLR_EXP);
+    fillRect(11, UI_BAR_Y + 27, 2, 7, CLR_EXP);
+    fillRect(14, UI_BAR_Y + 24, 2, 10, CLR_EXP);
+    drawIp7seg(22, UI_BAR_Y + 14, ip);
   } else {
     // 感叹号
-    fillRect(10, UI_BAR_Y + 22, 4, 8, RGB565(255, 80, 80));
-    fillRect(10, UI_BAR_Y + 32, 4, 2, RGB565(255, 80, 80));
-    drawIp7seg(22, UI_BAR_Y + 20, String("--.--.-.-"));
+    fillRect(10, UI_BAR_Y + 16, 4, 8, RGB565(255, 80, 80));
+    fillRect(10, UI_BAR_Y + 26, 4, 2, RGB565(255, 80, 80));
+    drawIp7seg(22, UI_BAR_Y + 14, String("--.--.-.-"));
   }
-  // 右侧心情文字条（当前表情对应小色点）
+  // 右侧心情色点（当前表情对应色）
   String e(curExpr); e.toLowerCase();
   uint16_t mc = CLR_TXT;
   if (e == "happy" || e == "excited") mc = CLR_EXP;
@@ -400,13 +418,13 @@ void LaapDisplay::drawIpLine(const String& ip, bool wifiOk) {
   else if (e == "anxious") mc = CLR_SEC;
   else if (e == "tired") mc = CLR_DIM;
   else if (e == "lonely") mc = CLR_SOC;
-  fillCircle(SZP_LCD_W - 16, UI_BAR_Y + 22, 4, mc);
+  fillCircle(SZP_LCD_W - 16, UI_BAR_Y + 18, 4, mc);
 }
 
 void LaapDisplay::drawBootScreen() {
   fillRect(0, 0, SZP_LCD_W, SZP_LCD_H, CLR_BG);
   drawFace("calm", true);
-  // 底部三个渐变方块（LAAP 色标），对齐新布局底栏
+  // 表情区下部三个色块（LAAP 色标）
   for (int i = 0; i < 3; i++)
-    fillRect(126 + i * 26, UI_BAR_Y + 14, 18, 18, i == 0 ? CLR_CUR : (i == 1 ? CLR_SOC : CLR_EXP));
+    fillRect(126 + i * 26, UI_FACE_BOT - 26, 18, 18, i == 0 ? CLR_CUR : (i == 1 ? CLR_SOC : CLR_EXP));
 }
