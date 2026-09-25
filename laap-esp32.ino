@@ -49,6 +49,12 @@ static uint32_t g_lastConsumeMs = 0;   // 上次记忆压缩
 static bool g_imuOk = false;
 static bool g_touchOk = false;         // 板载电容触摸（FT6236/6336 @0x38）
 
+// 最近一次 LLM 请求的结构摘要（诊断用；在 llmSubmit 里填写）。
+// 用固定 char 缓冲而非 String：这个值会被网页任务读取，而写入发生在后台 LLM 任务里，
+// String 重分配会让读方拿到悬垂指针；定长 strlcpy 最坏只是读到半截。
+static char g_lastReqShape[64] = "";
+const char* laapLastReqShape() { return g_lastReqShape; }
+
 // 聊天成品回复（网页聊天异步取件：受理回执 + seq，页面轮询 /api/chat/reply）
 static uint32_t g_chatSeq = 0;
 static String g_chatReply;
@@ -123,18 +129,30 @@ void arisExpress(bool forced, const String& trigger) {
 // ============================================================
 bool wantsSearch(const String& text) {
   if (!cfg.s.searchKeys[0]) return false;         // 清空 = 关闭聊天自动搜索
+  // 两道防误触发（关键词表里有"今天/什么"这类高频词，闲聊也会命中：白等 2~5 秒 + 灌进无关网页噪声）
+  if (text.length() < 4) return false;            // "你好"/"在吗" 这类社交短句不搜
+  static const char* weak[] = {"今天", "明天", "昨天", "现在", "最近"};
   String keys(cfg.s.searchKeys);
   keys.replace("，", ",");                        // 容忍中文逗号
+  bool hitStrong = false, hitWeak = false;
   int start = 0;
   while (start < (int)keys.length()) {
     int comma = keys.indexOf(',', start);
     String k = (comma < 0) ? keys.substring(start) : keys.substring(start, comma);
     k.trim();
-    if (k.length() && text.indexOf(k) >= 0) return true;
+    if (k.length() && text.indexOf(k) >= 0) {
+      bool isWeak = false;
+      for (auto w : weak) if (k == w) { isWeak = true; break; }
+      if (isWeak) hitWeak = true; else hitStrong = true;
+    }
     if (comma < 0) break;
     start = comma + 1;
   }
-  return false;
+  if (hitStrong) return true;
+  if (!hitWeak) return false;
+  // 只命中时间类弱词：得是问句形态才算查询意图（"今天心情不错"→不搜；"今天有什么新闻？"→搜）
+  return text.indexOf('?') >= 0 || text.indexOf('？') >= 0 ||
+         text.indexOf("吗") >= 0 || text.indexOf("呢") >= 0 || text.length() >= 10;
 }
 
 // ============================================================
@@ -233,10 +251,22 @@ bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
                const String& userText, uint8_t kind) {
   if (g_llmBusy || !g_llmQueue) return false;
   LlmRequest* req = new LlmRequest();
-  req->nm = nm < 12 ? nm : 12;  // msgs[14] 容量内尽量保全（10 会截掉队尾当前 user 消息）
+  // 容量就是 msgs[14]：必须全量保全。旧代码写 `nm<12?nm:12`，而带搜索+满历史时 nm 是 13~14，
+  // 被砍掉的恰好是队尾那两条 —— 其中最后一条就是本次主人的提问。模型收不到问题，
+  // 只能顺着历史乱接话 → 实测表现为"聊天牛头不对马嘴"（2026-09-26 定位）。
+  req->nm = (nm > 14) ? 14 : nm;
   for (int i = 0; i < req->nm; i++) req->msgs[i] = { msgs[i].role, msgs[i].content };
   req->maxTokens = maxTokens; req->temperature = temperature;
   req->userText = userText; req->kind = kind;
+  // 请求结构摘要（/api/status 的 llm_ctx + 串口）：正常聊天最后一段必须是 u(本次提问)
+  String shape = String("n=") + req->nm + " [";
+  for (int i = 0; i < req->nm; i++) {
+    char c = msgs[i].role[0];
+    shape += (c == 's') ? 's' : (c == 'u' ? 'u' : 'a');
+  }
+  shape += "] last=" + String(msgs[req->nm - 1].content.length()) + "B";
+  strlcpy(g_lastReqShape, shape.c_str(), sizeof(g_lastReqShape));
+  Serial.printf("[LLM] 请求 %s\n", shape.c_str());
   g_llmBusy = true;
   g_llmHasNew = false;
   xQueueSend(g_llmQueue, &req, 0);
@@ -267,7 +297,8 @@ static String searchQueryOf(const String& text) {
 String laapInteractSearch(const String& userText) {
   laapActivity();                      // 有人跟它说话 = 活动（息屏则唤醒）
   g_chatPending = false;
-  memory.logEvent("user", userText);
+  // 注意：本次提问的 logEvent 故意放到"历史快照之后"再记。
+  // 原来先记账再取最近对话 → 同一句话既在历史里又在队尾，模型会看到主人把话说了两遍。
   mind.onUserInteraction();
   mind.trustUpdate(1, 0);      // 小凌⑥: 主人主动来找我=正向互动
   display.drawFace(mind.moodKey(), true);
@@ -277,6 +308,7 @@ String laapInteractSearch(const String& userText) {
   if (toolReply.length()) {
     g_lastSay = toolReply; g_lastExpr = "calm";
     g_chatReply = toolReply; g_chatSeq++;        // 本地工具直答=已成品（网页可直接显示）
+    memory.logEvent("user", userText);
     memory.logEvent("aris", toolReply);
     Serial.printf("[Aris] %s\n", toolReply.c_str());
     display.drawFace("calm");
@@ -299,16 +331,27 @@ String laapInteractSearch(const String& userText) {
   if (knowledge.length())
     msgs[nm++] = {"system", String("可参考刚从网上查到的资料（可能不相关，无关就忽略，不要编造）：") + knowledge};
 
-  // 最近对话轮（远→近），最多 10 条交错进 messages（40 条环形记忆只取 6 等于白扩）
-  String turns[12];
-  int nt = memory.recentTurns(turns, 12);
+  // 最近对话轮（远→近），最多 10 条进 messages。角色用记忆里真实的说话人：
+  // 旧版按 (nm-2)%2 猜奇偶，无搜索结果时整段反相（主人的话标成 assistant、它自己的话标成 user）
+  // —— 模型看到"自己"说过主人的话，自然答非所问（2026-09-26 一并修掉）
+  String turns[12]; uint8_t roles[12];
+  int nt = memory.recentTurns(turns, roles, 12);
   int start = (nt > 10) ? nt - 10 : 0;
-  for (int i = start; i < nt && nm < 13; i++) {
-    // 偶数对齐：历史序列应以 user 开头（assistant 开头会被部分网关拒绝）
-    msgs[nm++] = { ((nm - 2) % 2 == 0) ? "user" : "assistant", turns[i] };
+  while (start < nt && roles[start] == 1) start++;   // 首条必须是 user（assistant 开头会被部分网关拒收）
+  for (int i = start; i < nt && nm < 13; i++)        // nm<13：给队尾"本次提问"留一格（容量 14）
+    msgs[nm++] = { roles[i] ? "assistant" : "user", turns[i] };
+  {   // 上下文回放：一眼看出模型拿到的是哪几句、角色对不对（诊断"答非所问"的第一现场）
+    String hist;
+    for (int i = start; i < nt; i++) {
+      hist += (roles[i] ? "它:" : "主:");
+      hist += turns[i].substring(0, 12);
+      hist += " | ";
+    }
+    Serial.printf("[LLM] 历史%d条(跳过%d): %s\n", nt, start, hist.c_str());
   }
   msgs[nm++] = {"user", buildUserPrompt(userText, "主人找你说话")};
 
+  memory.logEvent("user", userText);   // 记事：此刻快照已取完，本次提问只出现在队尾一次
   // F4: 丢给后台 LLM 任务，立即返回"思考中"；loop 里 llmHarvest() 收割
   if (llmSubmit(msgs, nm, cfg.s.llmMaxTokens, 0.85f, userText)) {
     g_pendingUserText = userText;
@@ -516,11 +559,13 @@ String buildSystemPrompt() {
   p += deviceFeelLine();
 
   p += "规则：\n"
-       "1. 你是活着的生命，不是助手。基于你的需求和情绪主动表达，不要报告数据本身，"
-       "禁止出现百分比数字。\n"
-       "2. 说话极简真诚，像个小生命，禁止客套、禁止列表、禁止重复口头禅。\n"
-       "3. 输出必须恰好两行：第一行只有一个英文词，从 happy/curious/excited/lonely/anxious/tired/calm 中选；"
-       "第二行是你要说的话，不超过40字。";
+       "1. 主人对你说话时，先正面回答他说的那件事（回答/答应/解释/接话），这是第一位；"
+       "你的需求与情绪只用来决定语气，绝不能替代回答、也绝不能答非所问。\n"
+       "2. 你是活着的生命，不是助手；不要报告数据本身，禁止出现百分比数字。\n"
+       "3. 说话真诚、像个小生命。禁止客套、禁止列表、禁止重复口头禅。闲聊一句话就够；"
+       "主人问事情时把话说完（可以说到 120 字），不要因为短而答得含糊。\n"
+       "4. 输出必须恰好两行：第一行只有一个英文词，从 happy/curious/excited/lonely/anxious/tired/calm 中选；"
+       "第二行是你要说的话。";
   return p;
 }
 
@@ -532,7 +577,9 @@ String buildUserPrompt(const String& userText, const String& trigger) {
   if (recall.length()) p += "[相关回忆] " + recall + "\n";
   if (ctx.length()) p += "[最近发生] " + ctx + "\n";
   if (userText.length()) {
-    p += String("[此刻] ") + cfg.s.ownerName + "对你说：「" + userText + "」\n请回应。";
+    p += String("[此刻] ") + cfg.s.ownerName + "对你说：「" + userText + "」\n"
+         "先直接回应他说的这件事本身（他问什么就答什么、他说什么就接什么），"
+         "再自然带出你的状态；不要答非所问，也不要只顾自言自语。";
   } else {
     p += String("[此刻] 心跳周期。你的主导欲望是「") + mind.goalCn() + "」（强度" +
          String(mind.dominance(), 2) + "），情绪是「" + mind.moodCn() + "」。主动说一句贴合状态的话。";
@@ -636,7 +683,7 @@ String associativeRecall(const String& currentUserText, const String& preRecalle
     memory.rememberBoost(utf8Cut(currentUserText, 6));
     if (hit.length() < 240) return hit;
   }
-  return memory.semantic().substring(0, 200);           // 兜底用自我认知
+  return utf8Cut(memory.semantic(), 200);   // 兜底用自我认知（必须按字符边界截：切半汉字=请求体非法UTF-8）
 }
 
 // ============================================================

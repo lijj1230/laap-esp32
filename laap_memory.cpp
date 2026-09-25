@@ -135,8 +135,10 @@ String MemorySystem::recentContext(int maxChars) {
   return out;
 }
 
-// F3: 工作记忆原始条目（近→远），只取 user|aris，供真多轮 messages 用
-int MemorySystem::recentTurns(String* out, int max) const {
+// F3: 工作记忆原始条目（近→远），只取 user|aris，供真多轮 messages 用。
+// roles 并行输出说话人（0=主人 1=它自己）：调用方必须用它标 role，
+// 别再按序号奇偶猜——历史里可能连着两条 user（上一轮它没答上），猜错就整段角色反相。
+int MemorySystem::recentTurns(String* out, uint8_t* roles, int max) const {
   int n = 0;
   for (int i = _workLen - 1; i >= 0 && n < max; i--) {
     int idx = (_workHead - 1 - i + WORK_MAX * 2) % WORK_MAX;
@@ -147,10 +149,14 @@ int MemorySystem::recentTurns(String* out, int max) const {
     // 独白也进对话轮：用户问"你刚才在想什么"要能接上（v3.12 前"【自发】"被排除，问必茫然）
     out[n] = e.substring(e.indexOf(':') + 1);
     if (out[n].length() > 160) out[n] = utf8Cut(out[n], 160);
+    if (roles) roles[n] = isAris ? 1 : 0;
     n++;
   }
-  // out 现在是近→远；翻转为远→近（对话时序）
-  for (int a = 0, b = n - 1; a < b; a++, b--) { String t = out[a]; out[a] = out[b]; out[b] = t; }
+  // out 现在是近→远；翻转为远→近（对话时序），roles 同步翻转
+  for (int a = 0, b = n - 1; a < b; a++, b--) {
+    String t = out[a]; out[a] = out[b]; out[b] = t;
+    if (roles) { uint8_t r = roles[a]; roles[a] = roles[b]; roles[b] = r; }
+  }
   return n;
 }
 

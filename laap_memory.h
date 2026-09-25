@@ -14,7 +14,8 @@ public:
   void logEvent(const char* role, const String& text);   // user|aris|event → 双写
   String recentContext(int maxChars = 600);              // 工作记忆（近→远）
   // F3: 工作记忆原始条目（近→远顺序, 最多 max 条, 只含 user|aris 角色）
-  int recentTurns(String* out, int max) const;
+  // 近 max 轮对话（远→近），roles 并行输出说话人：0=主人 1=它自己（调用方据此标 role，别再靠奇偶猜）
+  int recentTurns(String* out, uint8_t* roles, int max) const;
   String searchEpisodic(const String& query, int maxChars = 300); // 关键词回忆
   // 智能回忆（Mem0 式多信号）：优先语义向量召回（embedOk 时），退关键词+重要度加权
   String recallSmart(const String& query, int maxChars = 300);

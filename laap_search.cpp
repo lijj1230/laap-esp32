@@ -143,7 +143,7 @@ String LaapSearch::searchDdg(const String& q, int maxHit, int maxLen) {
     merged += rel;
   }
   merged.trim();
-  if (merged.length() > maxLen) merged = merged.substring(0, maxLen);
+  if ((int)merged.length() > maxLen) merged = utf8Cut(merged, maxLen);   // 字节截断会把汉字切半→请求体非法UTF-8
   if (!merged.length()) lastError = "DDG 无结果";
   return merged;
 }
@@ -201,7 +201,7 @@ String LaapSearch::searchBing(const String& q, int maxHit, int maxLen) {
     if ((int)out.length() > maxLen) break;
   }
   if (!out.length()) lastError = "Bing 无结果";
-  if ((int)out.length() > maxLen) out = out.substring(0, maxLen);
+  if ((int)out.length() > maxLen) out = utf8Cut(out, maxLen);   // 同上：必须回退到字符边界
   return out;
 }
 
@@ -262,7 +262,7 @@ String LaapSearch::searchRss(const String& q, int maxHit, int maxLen) {
     if ((int)out.length() > maxLen) break;
   }
   if (!out.length()) lastError = "RSS 无结果";
-  if ((int)out.length() > maxLen) out = out.substring(0, maxLen);
+  if ((int)out.length() > maxLen) out = utf8Cut(out, maxLen);   // 同上：必须回退到字符边界
   return out;
 }
 
@@ -354,7 +354,7 @@ String LaapSearch::searchCustom(const String& q, int maxHit, int maxLen) {
     }
   }
   if (!out.length()) lastError = "主源 无结果";
-  if ((int)out.length() > maxLen) out = out.substring(0, maxLen);
+  if ((int)out.length() > maxLen) out = utf8Cut(out, maxLen);   // 同上：必须回退到字符边界
   return out;
 }
 

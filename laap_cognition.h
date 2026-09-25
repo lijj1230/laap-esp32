@@ -50,7 +50,7 @@ public:
   String traitsLine() const;          // 性格参数行（喂给 LLM）
 
   // ---- 进化 ----
-  void evolveAfterChat(int userWords);
+  void evolveAfterChat(int userBytes);   // UTF-8 字节数
   void saveEvolution();
   uint32_t generation() const { return _gen; }
   uint32_t cycles() const { return _cycles; }

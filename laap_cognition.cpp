@@ -218,9 +218,9 @@ String Cognition::traitsLine() const {
 }
 
 // ================= 进化（赫布式微调） =================
-void Cognition::evolveAfterChat(int userWords) {
+void Cognition::evolveAfterChat(int userBytes) {
   _chats++;
-  if (userWords > 10) _sociability += 0.006f;   // 深聊 → 更外向
+  if (userBytes >= 24) _sociability += 0.006f;  // 深聊 → 更外向（入参是 UTF-8 字节数：24B≈8 个汉字）
   _openness += 0.003f;                           // 每次交流 → 更开放
   _pleasure = _pleasure * 0.7f + 0.3f * 0.9f;
   auto cl = [](float& v) { if (v < 0.05f) v = 0.05f; if (v > 0.95f) v = 0.95f; };

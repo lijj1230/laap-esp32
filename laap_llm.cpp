@@ -166,9 +166,20 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
   }
   if (!extractStringField(payload, "content", content)) {
     lastError = "响应无 content";
+    // 诊断：思考模型（v4 系列默认思考）可能把正文放 reasoning_content，
+    // 把原始响应头打出来，便于判断"答非所问/空回复"是模型侧还是解析侧
+    Serial.printf("[LLM] 响应无 content，payload 头: %.200s\n", payload.c_str());
     return r;
   }
 
+  {   // 原文取证：判断"答非所问/截断/空回复"的第一现场
+    String fin;
+    extractStringField(payload, "finish_reason", fin);
+    if (content.length() == 0)
+      Serial.printf("[LLM] 警告: content 为空（finish=%s，思考吃满 max_tokens？）\n", fin.c_str());
+    else
+      Serial.printf("[LLM] 原文(finish=%s): %.160s\n", fin.c_str(), content.c_str());
+  }
   // 期望两行: 表情词\n要说的话（宽松解析）
   content.trim();
   int nl = content.indexOf('\n');
@@ -198,7 +209,8 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
     }
   }
 
-  if (r.say.length() > 240) r.say = utf8Cut(r.say, 240);      // 续写拼接后放宽上限（回退到 UTF-8 边界）
+  // 上限 600B≈200 汉字：原来 240B 会把正常回答切在半句话上（"台词被腰斩"）
+  if (r.say.length() > 600) r.say = utf8Cut(r.say, 600);
   r.ok = true;
   lastError = "";
   // 回绕改造后无起始时刻需要

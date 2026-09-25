@@ -237,7 +237,7 @@ void LaapWeb::handleRoot() {
       "<button onclick='save(event)'>赋予生命</button></form>"
       "<script>async function save(e){e.preventDefault();"
       "const b=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},"
-      "body:JSON.stringify({ssid:ssid.value,pass:pass.value,base:base.value,key:key.value,model:model.value,agent:agent.value})});"
+      "body:JSON.stringify({ssid:ssid.value,pass:pass.value,base:base.value,key:key.value,key_set:1,model:model.value,agent:agent.value})});"
       "const r=await b.json();alert(r.msg);if(r.ok)setTimeout(()=>location.reload(),3000);}"
       "</script>");
   } else {
@@ -351,13 +351,13 @@ void LaapWeb::handleSettingsPage() {
     "vmodel.value=s.vision_model||'';}"
     "async function save(e){e.preventDefault();"
     "const b=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},"
-    "body:JSON.stringify({ssid:ssid.value,pass:pass.value,base:base.value,key:key.value,model:model.value,"
+    "body:JSON.stringify({ssid:ssid.value,pass:pass.value,base:base.value,key:key.value,key_set:1,model:model.value,"
     "agent:agent.value,owner:owner.value,persona:persona.value,tick:tick.value,thold:thold.value,"
     "idlesil:idlesil.value,idleevery:idleevery.value,volume:volume.value,brightness:brightness.value,screenoff:screenoff.value,llmcont:llmcont.value,llmtok:llmtok.value,srchkeys:srchkeys.value,srchkeys_set:1,srchapi:srchapi.value,srchapi_set:1,"
     "vmode:vmode.value,ttsch:ttsch.value,ttsvoice:ttsvoice.value,ttsrate:ttsrate.value,"
-    "volcappid:volcappid.value,volctoken:volctoken.value,volcvoice:volcvoice.value,"
-    "asrbase:asrbase.value,asrkey:asrkey.value,asrmodel:asrmodel.value,asr2base:asr2base.value,asr2key:asr2key.value,asr2model:asr2model.value,asr2_set:1,"
-    "wakeword:wakeword.value,visionbase:visionbase.value,vlbase:vlbase.value,vkey:vkey.value,vmodel:vmodel.value,"
+    "volcappid:volcappid.value,volctoken:volctoken.value,volctoken_set:1,volcvoice:volcvoice.value,"
+    "asrbase:asrbase.value,asrkey:asrkey.value,asrkey_set:1,asrmodel:asrmodel.value,asr2base:asr2base.value,asr2key:asr2key.value,asr2key_set:1,asr2model:asr2model.value,asr2_set:1,"
+    "wakeword:wakeword.value,visionbase:visionbase.value,vlbase:vlbase.value,vkey:vkey.value,vkey_set:1,vmodel:vmodel.value,"
     "wakeword_set:1,visionbase_set:1,vlbase_set:1,vmodel_set:1})});"
     "const r=await b.json();alert(r.msg);}"
     "async function otaup(e){e.preventDefault();const f=document.getElementById('otabin').files[0];"
@@ -415,28 +415,28 @@ void LaapWeb::handleSave() {
   if (flag("wakeword_set")) strlcpy(cfg.s.wakeWord, wakeword.c_str(), sizeof(cfg.s.wakeWord));
   if (flag("visionbase_set")) strlcpy(cfg.s.visionBase, visionbase.c_str(), sizeof(cfg.s.visionBase));
   if (flag("vlbase_set")) strlcpy(cfg.s.visionLlmBase, vlbase.c_str(), sizeof(cfg.s.visionLlmBase));
-  setSecret(vkey, cfg.s.visionKey, sizeof(cfg.s.visionKey), "视觉 Key");
+  if (flag("vkey_set")) setSecret(vkey, cfg.s.visionKey, sizeof(cfg.s.visionKey), "视觉 Key");
   if (flag("vmodel_set")) strlcpy(cfg.s.visionModel, vmodel.c_str(), sizeof(cfg.s.visionModel));
   if (vmode.length()) { long v = vmode.toInt(); cfg.s.voiceMode = (uint8_t)(v < 0 ? 0 : (v > 3 ? 3 : v)); }
   if (ttsch.length()) { long v = ttsch.toInt(); cfg.s.ttsChannel = (uint8_t)(v < 0 ? 0 : (v > 3 ? 3 : v)); }
   if (ttsvoice.length()) strlcpy(cfg.s.ttsVoice, ttsvoice.c_str(), sizeof(cfg.s.ttsVoice));
   if (ttsrate.length()) strlcpy(cfg.s.ttsRate, ttsrate.c_str(), sizeof(cfg.s.ttsRate));
   if (volcappid.length()) strlcpy(cfg.s.volcAppid, volcappid.c_str(), sizeof(cfg.s.volcAppid));
-  setSecret(volctoken, cfg.s.volcToken, sizeof(cfg.s.volcToken), "火山 Token");
+  if (flag("volctoken_set")) setSecret(volctoken, cfg.s.volcToken, sizeof(cfg.s.volcToken), "火山 Token");
   if (volcvoice.length()) strlcpy(cfg.s.volcVoice, volcvoice.c_str(), sizeof(cfg.s.volcVoice));
   if (asrbase.length()) strlcpy(cfg.s.asrBase, asrbase.c_str(), sizeof(cfg.s.asrBase));
-  setSecret(asrkey, cfg.s.asrKey, sizeof(cfg.s.asrKey), "ASR Key");
+  if (flag("asrkey_set")) setSecret(asrkey, cfg.s.asrKey, sizeof(cfg.s.asrKey), "ASR Key");
   if (asrmodel.length()) strlcpy(cfg.s.asrModel, asrmodel.c_str(), sizeof(cfg.s.asrModel));
   // 备用 ASR 支持"清空"（带 _set 哨兵即写入，空=不启用）；Key 留空=保持不变
   if (flag("asr2_set")) {
     strlcpy(cfg.s.asr2Base, asr2base.c_str(), sizeof(cfg.s.asr2Base));
     strlcpy(cfg.s.asr2Model, asr2model.c_str(), sizeof(cfg.s.asr2Model));
   }
-  setSecret(asr2key, cfg.s.asr2Key, sizeof(cfg.s.asr2Key), "备用 ASR Key");
+  if (flag("asr2key_set")) setSecret(asr2key, cfg.s.asr2Key, sizeof(cfg.s.asr2Key), "备用 ASR Key");
   if (ssid.length()) strlcpy(cfg.s.wifiSsid, ssid.c_str(), sizeof(cfg.s.wifiSsid));
   if (pass.length()) strlcpy(cfg.s.wifiPass, pass.c_str(), sizeof(cfg.s.wifiPass));
   if (base.length()) strlcpy(cfg.s.llmBase, base.c_str(), sizeof(cfg.s.llmBase));
-  setSecret(key, cfg.s.llmKey, sizeof(cfg.s.llmKey), "大模型 Key");
+  if (flag("key_set")) setSecret(key, cfg.s.llmKey, sizeof(cfg.s.llmKey), "大模型 Key");
   if (model.length()) strlcpy(cfg.s.llmModel, model.c_str(), sizeof(cfg.s.llmModel));
   if (agent.length()) strlcpy(cfg.s.agentName, agent.c_str(), sizeof(cfg.s.agentName));
   if (owner.length()) strlcpy(cfg.s.ownerName, owner.c_str(), sizeof(cfg.s.ownerName));
@@ -539,6 +539,7 @@ void LaapWeb::handleStatus() {
     "\",\"vision_llm_base\":\"" + jsonEsc(cfg.s.visionLlmBase) +
     "\",\"vision_key_masked\":\"" + (String(cfg.s.visionKey).length() ? "已配置" : "") +
     "\",\"vision_model\":\"" + jsonEsc(cfg.s.visionModel) + "\"," +
+    "\"llm_ctx\":\"" + String(laapLastReqShape()) + "\"," +
     "\"vision_ready\":" + (vision.available() ? "true" : "false") +
     ",\"voice_ready\":" + (voice.ready() ? "true" : "false") +
     ",\"vad_paused\":" + (voice.vadPaused() ? "true" : "false") +

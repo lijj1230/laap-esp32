@@ -50,6 +50,7 @@ extern LaapWeb webui;
 String laapLastSay();
 String laapInteractSearch(const String& userText);
 const char* laapLastExpr();
+const char* laapLastReqShape();   // 最近一次 LLM 请求的消息结构（诊断"答非所问"用）
 // 聊天回复是异步产生的（主循环不冻结）：网页拿到受理回执后轮询这两个
 uint32_t laapChatSeq();       // 每次有新的聊天成品回复 +1
 String laapChatReply();       // 最近一条聊天成品回复
