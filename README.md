@@ -102,6 +102,8 @@ python -m esptool --chip esp32s3 --port COM5 --baud 921600 write_flash ^
 ## 六、日常交互
 
 - **串口**（115200，CDC On Boot Enabled 后 USB-C 直接是串口）：打字和它说话；`/help` 看命令
+  （`/status` 看状态、`/mem` 看最近记忆、`/reflect` 立刻做一次夜间反思、`/look` 看图、`/weather 城市` 查天气、
+  `/touch` 摇晃检测、`/touchpad` 触摸、`/screen N` 静默息屏秒数、`/redraw` 重绘、`/i2cscan` 扫 I2C、`/asrtest` 语音链路自检）
 - **BOOT 键**：短按 = 让它现在就说一句；按住 4s = 重开配置热点；按住 10s = 恢复出厂
 - **屏幕**：眼睛形状 = 情绪（眯眼=开心，下垂=孤独，眉毛=焦虑…会眨眼）；
   两列色条 = 需求（橙=能量 青=好奇 粉=社交 蓝=安全 绿=表达，越长越强烈）
@@ -155,7 +157,7 @@ cloud.siliconflow.cn 注册领 Key，后台填 `https://api.siliconflow.cn/v1` +
 
 | # | 能力 | 说明 |
 |---|---|---|
-| 1 | **OTA 空中升级** | 后台"固件升级"卡片上传 .bin，写完自动重启，记忆保留——从此升级不用连线 |
+| 1 | **OTA 空中升级** | 后台"固件升级"卡片上传 .bin，写完自动重启、记忆保留、槽位自动轮换（ota_0↔ota_1）；**必须用双 OTA 槽分区表**（`partitions.csv`），单应用分区表下 `Update.begin()` 拿不到可写槽，升级必失败 |
 | 2 | **时间感** | NTP 时段注入（清晨/深夜/周末），深夜语气轻、不冒泡吵人 |
 | 3 | **真·对话记忆** | 最近 6 轮按 user/assistant 结构化发送，"它/那个"指代接得上 |
 | 4 | **非阻塞思考** | LLM 调用进 FreeRTOS 核 1 后台任务，等回复期间照常眨眼/听/刷网页 |
@@ -170,6 +172,18 @@ cloud.siliconflow.cn 注册领 Key，后台填 `https://api.siliconflow.cn/v1` +
 - **直连模式**：手机桥 URL **留空**，配 `直连 API Key`（留空复用大模型 Key）+ `直连视觉模型`（留空=google/gemini-flash-1.5）；`视觉直连 Base` 可改任意 OpenAI 兼容地址（如自己的 GLM-4V 网关）。直连请求体 ~25KB（QVGA JPEG base64），PSRAM 无压力。
 - 两个都填时手机桥优先；都空=不用眼睛（其余功能不受影响）。
 
+## 七·七、记忆备份 / 恢复 / 搬家（v3.2 新增）
+
+记忆页多了两个按钮，**导出记忆**下载一份纯文本备份（含情景记忆 + 自我认知 + 性格进化），
+**导入记忆**把它恢复回来（覆盖当前记忆，导入前建议先导出一份）。
+
+- 文件是可读文本，分段标记：`###SEMANTIC` / `###EPISODES`（每行一条 JSONL）/ `###EVOLUTION`
+- 导入按段生效：备份里没有的段就保持原样（只恢复性格不会清空记忆），格式不认识会拒绝导入而不是清空
+- 情景记忆 / 语义 / 性格会在导入后立即生效（含重建对话上下文与性格参数），不用重启
+- 向量缓存（`/mem/emb.bin`）会自动重建——它和行序绑死，换记忆必须重算
+- 用途：换板子搬家、改分区表前后迁移、刷机前留一手、清空记忆前存档
+- 命令行也有：`GET /api/memexport` 下载，`POST /api/memimport`（multipart `file`）导入
+
 ## 八、常见问题
 
 | 现象 | 处理 |
@@ -181,6 +195,9 @@ cloud.siliconflow.cn 注册领 Key，后台填 `https://api.siliconflow.cn/v1` +
 | Web 打不开 | 用 IP 直连（屏幕底部）；Windows 的 .local 解析偶尔抽风 |
 | 它不说话 | 后台"测试大模型连通"看报错；OpenAI 需代理，国内用 DeepSeek/GLM |
 | 想清空重来 | 后台"格式化并重启"，或 BOOT 长按 10s |
+| 升级后"没变化" | 看串口首行 `固件构建 <日期> <时间>` 与 `运行分区 ota_0/ota_1`：这两行才说明跑的是哪一版、在哪个槽 |
+| 回复空白/答非所问 | 思考型模型（v4 系）会把 token 花在思考上，正文返回空；固件会自动翻倍重试一次，仍空就调大后台"单次回复上限" |
+| 连 WiFi 后突然重启 | 看串口有没有 `Stack canary ... (loopTask)`：环任务栈不够（TTS 的 TLS 握手最吃栈），`build_opt.h` 已设 20KB |
 | TLS 校验 | 固件用 `setInsecure()`（不做证书校验）——家庭玩具可接受，公网部署请自行加 CA |
 
 ## 九、进阶：跑完整版 LAAP（PC 端）
@@ -213,11 +230,12 @@ laap-esp32/
 ├── laap_speech.*       v2: ASR multipart + 火山 TTS 备选
 ├── laap_voice.*        v2: 语音编排（通道回退/打断/模式）
 ├── laap_search.*       v2.1: DuckDuckGo 免 Key 联网搜索（先搜后答 + 独白查证）
-├── laap_vision.*       v3.1: GC0308 摄像头，双模式（手机桥 / 直连 OpenRouter 多模态）
-├── partitions.csv      16MB 分区表（3MB APP + 13MB LittleFS）
+├── laap_vision.*       v3.1: GC0308 摄像头（RGB565 → 端侧编码成合法 PNG），双模式（手机桥 / 直连多模态）
+├── partitions.csv      16MB 分区表（双 OTA 槽 2MB×2 + 11.9MB LittleFS；OTA 必需）
+├── build_opt.h         编译开关（环任务栈 20KB：TTS 的 TLS 握手峰值要 6-8KB，默认 8KB 会栈溢出重启）
 ├── flash_laap.bat      Windows 一键烧录
 └── src/vendor/         v2: es8311/es7210 驱动(Apache-2.0) + libhelix MP3 解码器
-firmware/              编译好的 bin 五件套（与烧录脚本同目录，自包含）
+firmware/              编译好的 bin 四件套（与烧录脚本同目录，自包含）
 ```
 
 ---

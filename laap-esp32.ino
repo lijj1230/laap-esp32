@@ -25,6 +25,7 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <time.h>
+#include <esp_ota_ops.h>   // 运行槽位诊断（OTA 后确认新固件在跑）
 #include "laap_config.h"
 #include "laap_display.h"
 #include "laap_cognition.h"
@@ -428,7 +429,7 @@ void llmHarvest() {
     g_lastExpr = r.expr.length() ? r.expr : "curious";
     display.drawFace(g_lastExpr.c_str());
     memory.logEvent("aris", "【自发】我刚才在想「" + g_monoTopic + "」：" + r.say);
-    if (g_monoKnow.length()) memory.logEvent("world", g_monoTopic + " → " + g_monoKnow.substring(0, 80));
+    if (g_monoKnow.length()) memory.logEvent("world", g_monoTopic + " → " + utf8Cut(g_monoKnow, 80));  // 字节截断会切半汉字（曾污染 episodes.jsonl）
     Serial.printf("[Aris·独白] %s\n", r.say.c_str());
     display.drawNeeds(mind.needs().energy, mind.needs().curiosity, mind.needs().social,
                       mind.needs().security, mind.needs().expression);
@@ -730,23 +731,39 @@ String associativeRecall(const String& currentUserText, const String& preRecalle
 // ============================================================
 static int g_lastReflectDay = -1;
 
-void nightlyReflect() {
+// force=true：串口 /reflect 手动触发（测试用），跳过 0-5 点时间窗与"每天一次"节流，
+// 且不写 g_lastReflectDay——手动跑过一次不会把当晚真正的夜间反思吃掉。
+void nightlyReflect(bool force) {
   time_t now = time(nullptr);
-  if (now < 1700000000) return;
+  if (now < 1700000000) {
+    if (!force) return;
+    Serial.println("[LAAP·反思] 时钟未同步，强制继续（时间戳按 0 记）");
+  }
   struct tm t; localtime_r(&now, &t);
   int day = t.tm_yday;
-  if (g_lastReflectDay == day) return;           // 今天已反思
-  // 反思窗口：0-5 点之间第一次心跳；白天启动则跳过等明天
-  if (t.tm_hour >= 6) { g_lastReflectDay = day; return; }
+  if (!force) {
+    if (g_lastReflectDay == day) return;         // 今天已反思
+    // 反思窗口：0-5 点之间第一次心跳；白天启动则跳过等明天
+    if (t.tm_hour >= 6) { g_lastReflectDay = day; return; }
+  }
   String recent = memory.recentContext(900);
-  if (recent.length() < 80) { g_lastReflectDay = day; return; }
-  g_lastReflectDay = day;
+  if (recent.length() < 80) {
+    if (!force) g_lastReflectDay = day;
+    Serial.printf("[LAAP·反思] 跳过：近期记忆只有 %u 字节（<80，没素材）\n", (unsigned)recent.length());
+    return;
+  }
+  if (!force) g_lastReflectDay = day;
+  Serial.printf("[LAAP·反思] 开始复盘（素材 %u 字节）…\n", (unsigned)recent.length());
 
   String sys = String("你是") + cfg.s.agentName + "。深夜，你在复盘自己的一天。"
                "基于今天的经历，写两句真诚的自我反思：一句今天学到/感受到的，"
                "一句对主人的新认识。共不超过60字，只输出反思本身。";
   LlmMsg m[2] = { {"system", sys}, {"user", String("今天的经历：\n" + recent)} };
-  llmSubmit(m, 2, 160, 0.8f, "", LK_REFLECT);     // 忙就放弃（明天再说）
+  // 反思要"想清楚再写"，思考型模型（v4 系）在小预算下会把额度全花在推理上、正文返回空
+  // （实测 160/320/640 全空）。起步就给足，再靠 llm 内部的翻倍重试兜底。
+  int cap = cfg.s.llmMaxTokens > 1000 ? cfg.s.llmMaxTokens : 1000;
+  if (!llmSubmit(m, 2, cap, 0.8f, "", LK_REFLECT))   // 忙就放弃（明天再说）
+    Serial.println("[LAAP·反思] LLM 正忙，本次放弃");
 }
 
 // ============================================================
@@ -757,7 +774,7 @@ void psiTick() {
   g_lastTickMs = millis();
   mind.tick(dtMin);
   mind.incCycle();
-  nightlyReflect();   // F7: 深夜复盘（内部自带每天一次节流）
+  nightlyReflect(false);   // F7: 深夜复盘（内部自带每天一次节流）
 
   // IMU 世界感知
   float motion = 0;
@@ -822,7 +839,7 @@ void serialCli() {
     if (!line.length()) continue;
     laapActivity();     // 串口打字也是交互
     if (line == "/help") {
-      Serial.println("命令: /status /look(视觉识图) /search 词 /weather 城市 /touch(摇晃) /touchpad(触摸) /screen N /redraw /i2cscan /portal /mem /tick /lcd /pa /imu /asrtest /reset");
+      Serial.println("命令: /status /look(视觉识图) /search 词 /weather 城市 /touch(摇晃) /touchpad(触摸) /screen N /redraw /i2cscan /portal /mem /reflect(立刻反思) /tick /lcd /pa /imu /asrtest /reset");
       Serial.println("      直接打字回车 = 跟它说话（走完整对话链路）");
     } else if (line == "/touch") {
       // 触觉实测：5 秒采样，摇晃/扣翻板子看峰值与判定
@@ -1030,6 +1047,8 @@ void serialCli() {
       psiTick();
     } else if (line.startsWith("/say ")) {
       voice.speak(line.substring(5), "calm");
+    } else if (line == "/reflect") {
+      nightlyReflect(true);          // 立刻做一次夜间反思（不等 0-5 点窗口）
     } else if (line.startsWith("/vol")) {
       int v = line.substring(4).toInt();
       if (v >= 0 && v <= 100) {
@@ -1063,6 +1082,17 @@ void setup() {
   Serial.println("\n[LAAP] Living Agent Application Protocol - 端侧生命体启动中…");
   // 构建时间戳：判断"板子里跑的到底是哪一版"的唯一可靠依据（烧录后必看这一行）
   Serial.printf("[LAAP] 固件构建 %s %s\n", __DATE__, __TIME__);
+  {   // 运行槽位：OTA 后靠这行确认"新固件真的生效了"（还是老固件在跑）
+    const esp_partition_t* rp = esp_ota_get_running_partition();
+    Serial.printf("[LAAP] 运行分区 %s (0x%06x) | OTA 可升级: %s\n",
+                  rp ? rp->label : "?", rp ? (unsigned)rp->address : 0,
+                  esp_ota_get_next_update_partition(nullptr) ? "是" : "否（分区表没有 ota_1）");
+  }
+  // 堆与栈底数：视觉/语音都是"内存敏感"功能，排障时第一眼要看这个
+  Serial.printf("[LAAP] 内部堆 %u KB / PSRAM %u KB / 环任务栈 %u 字节\n",
+                (unsigned)(ESP.getFreeHeap() / 1024),
+                (unsigned)(ESP.getFreePsram() / 1024),
+                (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
 
   memory.begin();
   cfg.begin();

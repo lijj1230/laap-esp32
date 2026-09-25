@@ -28,6 +28,14 @@ public:
   uint32_t eventCount() const { return _count; }
   String episodicTail(int n);                            // 最近 n 条（Web 查看）
   void clearAll();
+  // 记忆搬家（备份/恢复/换分区）：分段纯文本，含情景+语义+性格进化。
+  // 导入先落临时文件再逐行解析，整份不进内存（300 行也只要几 KB 缓冲）
+  String exportDump();
+  bool   importBegin();                                  // 打开 /mem/import.txt 写
+  bool   importWrite(const uint8_t* d, size_t n);        // 追加（Web 上传分片调用）
+  void   importEnd();
+  bool   applyImport(String& msg);                       // 解析并落盘（覆盖现有记忆）
+  void   reloadWork();                                   // 从盘上重建工作记忆环（导入后用）
 
 private:
   void appendEpisodic(const char* role, const String& text);

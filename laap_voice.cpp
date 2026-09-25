@@ -20,6 +20,16 @@ void LaapVoice::begin() {
 void LaapVoice::speak(const String& text, const char* expr) {
   if (!_ready || (VoiceMode)cfg.s.voiceMode == VoiceMode::Off) return;
   if (!text.length()) return;
+  // 栈水位护栏：TTS 要过一次 TLS 握手，峰值吃 6-8KB（默认 8KB 环任务栈实测踩金丝雀重启）。
+  // 栈不够时宁可不说话也不能重启——文字已经上屏，用户照样看得到回复。
+  UBaseType_t hw = uxTaskGetStackHighWaterMark(NULL);
+  if (hw < 2600) {
+    Serial.printf("[VOICE] 栈余量仅 %u 字节，跳过播报（防栈溢出重启；文字已显示）\n",
+                  (unsigned)(hw * sizeof(StackType_t)));
+    display.drawFace(expr ? expr : "calm", false);
+    _cooldownMs = millis() + 600;
+    return;
+  }
   _busy = true;
   display.drawFace(expr ? expr : "calm", true); // 说话=思考眉
 

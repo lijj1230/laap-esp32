@@ -180,6 +180,20 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
   // 空正文按失败处理：思考型模型（v4 系列默认开思考）会把 max_tokens 全花在思考上、
   // content 返回空串。旧代码当成功 → 网页拿到空白气泡、TTS 无话可说（实测 2026-09-26）
   if (content.length() == 0) {
+    String fin0, rc;
+    extractStringField(payload, "finish_reason", fin0);
+    // 取证：思考型模型的推理过程在 reasoning_content 里，长度说明"思考吃掉了多少预算"
+    if (extractStringField(payload, "reasoning_content", rc))
+      Serial.printf("[LLM] reasoning_content %u 字节（预算 %d）\n", (unsigned)rc.length(), maxTokens);
+    else
+      Serial.printf("[LLM] payload 头(无 reasoning 字段): %.400s\n", payload.c_str());
+    // 只有"被截断"才值得加钱重试：上限翻倍再要一次（真·空回复重试也没用）
+    if (depth > 0 && fin0 == "length" && maxTokens < 1600) {
+      int bigger = maxTokens * 2; if (bigger > 1600) bigger = 1600;
+      Serial.printf("[LLM] content 空 + finish=length → 上限 %d→%d 重试一次\n", maxTokens, bigger);
+      LlmReply r2 = chatMsgsContinue(msgs, count, bigger, temperature, depth - 1);
+      if (r2.ok) return r2;
+    }
     lastError = "响应 content 为空（思考模型吃满 max_tokens？把单次回复上限调大试试）";
     return r;
   }
@@ -238,6 +252,28 @@ String utf8Cut(const String& s, int len) {
   int cut = len;
   while (cut > 0 && (s[cut] & 0xC0) == 0x80) cut--;   // 落在续字节上→退到首字节
   return s.substring(0, cut);
+}
+
+// UTF-8 兜底清洗：丢掉非法字节（孤立续字节、被截断的多字节序列）
+String sanitizeUtf8(const String& s) {
+  String out; out.reserve(s.length());
+  unsigned int i = 0;
+  while (i < s.length()) {
+    uint8_t c = (uint8_t)s[i];
+    int need;
+    if      (c < 0x80)           need = 0;
+    else if ((c & 0xE0) == 0xC0) need = 1;
+    else if ((c & 0xF0) == 0xE0) need = 2;
+    else if ((c & 0xF8) == 0xF0) need = 3;
+    else { i++; continue; }                       // 孤立续字节 / 非法首字节
+    bool ok = (i + (unsigned)need < s.length());
+    for (int k = 1; ok && k <= need; k++)
+      if (((uint8_t)s[i + k] & 0xC0) != 0x80) ok = false;
+    if (!ok) { i++; continue; }                   // 截断序列：丢首字节，续字节下一轮同样被丢
+    for (int k = 0; k <= need; k++) out += s[i + k];
+    i += need + 1;
+  }
+  return out;
 }
 
 // ================= 语义向量：硅基流动 bge-m3（记忆智能召回用） =================

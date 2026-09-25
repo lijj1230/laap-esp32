@@ -333,5 +333,6 @@ String LaapVision::look(const String& question) {
 }
 
 void LaapVision::logSight(const String& desc) {
-  if (desc.length()) memory.logEvent("world", "看见: " + desc.substring(0, 100));
+  // utf8Cut：按字节 substring 会切半汉字，污染记忆文件（/api/memory 的 JSON 就是这么坏的）
+  if (desc.length()) memory.logEvent("world", "看见: " + utf8Cut(desc, 100));
 }

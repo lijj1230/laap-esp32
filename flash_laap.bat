@@ -46,6 +46,8 @@ python -m esptool --chip esp32s3 --port "%PORT%" --baud 921600 --before default-
 if errorlevel 1 (
   echo.
   echo [失败] 分区烧录出错，改用整片镜像方式再试...
+  echo [注意] 整片烧录会覆盖整颗 16MB，包含记忆区（LittleFS）——人格与记忆会清空。
+  echo         刷完可在网页"记忆"页用"导入记忆"恢复此前的备份。
   python -m esptool --chip esp32s3 --port "%PORT%" --baud 921600 write-flash 0x0 firmware\laap-lite-merged-16MB.bin
   if errorlevel 1 (
     echo [失败] 烧录未完成，请把上面窗口里的报错文字截图/复制发回来

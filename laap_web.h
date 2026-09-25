@@ -30,6 +30,9 @@ private:
   void handleTest();
   void handleMemoryPage();
   void handleMemoryApi();
+  void handleMemExport();    // 记忆导出（纯文本下载：备份/换机/分区迁移）
+  void handleMemImport();    // 记忆导入（分段文本上传，逐行解析，不进大缓冲）
+  bool memImportOk = false;
   void handleClear();
   void handleReset();
   void handleReboot();

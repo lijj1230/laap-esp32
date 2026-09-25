@@ -52,6 +52,9 @@ public:
   // ---- 进化 ----
   void evolveAfterChat(int userBytes);   // UTF-8 字节数
   void saveEvolution();
+  // 记忆导入后把盘上的性格/代数读回内存：否则运行中的实例会在下次 saveEvolution
+  // 用自己的旧值覆盖刚导入的进化数据（"导入成功"却没生效）
+  void reloadEvolution() { loadEvolution(); }
   uint32_t generation() const { return _gen; }
   uint32_t cycles() const { return _cycles; }
   uint32_t chats() const { return _chats; }

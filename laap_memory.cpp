@@ -36,12 +36,16 @@ bool MemorySystem::begin() {
     LittleFS.remove(EMB_PATH);
     _embCount = 0;
   }
+  reloadWork();   // 从盘上末段重建工作记忆环：否则重启后 recentContext 为空，
+                  // 夜间反思会因为"没素材"跳过、聊天也丢了最近几轮上下文
   return true;
 }
 
-void MemorySystem::appendEpisodic(const char* role, const String& text) {
+void MemorySystem::appendEpisodic(const char* role, const String& rawText) {
   File f = LittleFS.open(EP_PATH, "a");
   if (!f) return;
+  // 落盘前清洗：切半的汉字会让整个 episodes.jsonl 行非法，/api/memory 直接吐不出合法 JSON
+  const String text = sanitizeUtf8(rawText);
   time_t now = time(nullptr);
   // 时钟未同步时 t=0（区别于"开机后秒数"——那会被 decay 当成 5 万天前而最先淘汰）
   uint32_t t = (now > 1700000000) ? (uint32_t)now : 0;
@@ -116,7 +120,7 @@ void MemorySystem::rewriteEpisodicByScore() {
 
 void MemorySystem::logEvent(const char* role, const String& text) {
   // 工作记忆（环）：截断单条长度；String operator= 容量足够时复用已有缓冲，不反复碎片化
-  String tmp = String(role) + ":" + text;
+  String tmp = String(role) + ":" + sanitizeUtf8(text);
   if (tmp.length() > 160) tmp = utf8Cut(tmp, 160);
   if (_work[_workHead].length() == 0) _work[_workHead].reserve(176); // 首次预留，之后容量常驻
   _work[_workHead] = tmp;
@@ -231,7 +235,7 @@ void MemorySystem::embedTick() {
     return;
   }
   int xe = line.length() - 3;                              // "}\n 尾
-  String text = line.substring(xp + 5, xe > xp + 5 ? xe : xp + 5);
+  String text = sanitizeUtf8(line.substring(xp + 5, xe > xp + 5 ? xe : xp + 5));
 
   float* vec = (float*)malloc(EMB_DIM * 4);
   if (!vec) return;
@@ -326,6 +330,7 @@ String MemorySystem::recallSmart(const String& query, int maxChars) {
       x.replace("\\n", " "); x.replace("\\\"", "\"");
       int xe = x.lastIndexOf('"');
       if (xe > 0) x = x.substring(0, xe);
+      x = sanitizeUtf8(x);
     }
     if (x.length()) out = out.length() ? out + "\n" + x : x;
     hits[best] = hits.back(); hits.pop_back();
@@ -365,6 +370,7 @@ String MemorySystem::semantic() const {
   if (!f) return "";
   String s = f.readString();
   f.close();
+  s = sanitizeUtf8(s);                 // 历史遗留的半汉字：读了就清，别让它进 JSON/请求体
   if (s.length() > 400) s = utf8Cut(s, 400);
   return s;
 }
@@ -383,7 +389,7 @@ String MemorySystem::episodicTail(int n) {
   std::vector<String> lines;
   while (f.available()) {
     String l = f.readStringUntil('\n');
-    if (l.length()) lines.push_back(l);
+    if (l.length()) lines.push_back(sanitizeUtf8(l));   // 老行里的半汉字就地清掉，保证 JSON 合法
   }
   f.close();
   out = "[";
@@ -403,4 +409,140 @@ void MemorySystem::clearAll() {
   LittleFS.remove(EMB_PATH);              // 向量缓存一并清，否则旧向量错配新记忆
   _count = 0; _workLen = 0; _workHead = 0;
   _embCount = 0; _embFail = 0;
+}
+
+// ============================================================
+//  记忆搬家：导出 / 导入
+//  存在的理由：分区表改版（加 OTA 槽）要把 spiffs 挪位置，littlefs 的块分散在整片
+//  分区里，原始镜像换了尺寸未必还能挂上——文本导出是唯一"无损且可验证"的搬迁方式。
+//  顺带也是给主人的备份/恢复能力（换板子、刷机前留一手）。
+//  格式（纯文本，逐行）：
+//    ###LAAP-MEMORY v1
+//    ###SEMANTIC
+//    <自我认知，可能多行>
+//    ###EPISODES
+//    {"t":...,"r":"...","w":1.0,"x":"..."}
+//    ###EVOLUTION
+//    {"gen":...}
+//    ###END
+//  episodes 行都是 JSON，不可能以 ### 开头，所以段头不会误判
+// ============================================================
+static const char* IMP_PATH = "/mem/import.txt";
+
+String MemorySystem::exportDump() {
+  String out; out.reserve(4096);
+  out += "###LAAP-MEMORY v1\n";
+  out += "###SEMANTIC\n";
+  { File f = LittleFS.open("/mem/semantic.txt", "r");
+    if (f) { while (f.available()) { String l = f.readStringUntil('\n'); out += sanitizeUtf8(l); out += '\n'; } f.close(); } }
+  out += "###EPISODES\n";
+  { File f = LittleFS.open(EP_PATH, "r");
+    if (f) { while (f.available()) { String l = f.readStringUntil('\n'); l.trim();
+              if (l.length()) { out += sanitizeUtf8(l); out += '\n'; } } f.close(); } }
+  out += "###EVOLUTION\n";
+  { File f = LittleFS.open("/evolution.json", "r");
+    if (f) { String s = f.readString(); s.trim(); if (s.length()) { out += s; out += '\n'; } f.close(); } }
+  out += "###END\n";
+  return out;
+}
+
+bool MemorySystem::importBegin() {
+  LittleFS.remove(IMP_PATH);   // 清掉上次的残留：导入必须是"这份文件"说了算
+  return true;
+}
+
+bool MemorySystem::importWrite(const uint8_t* d, size_t n) {
+  File f = LittleFS.open(IMP_PATH, "a");
+  if (!f) return false;
+  size_t w = f.write(d, n);
+  f.close();
+  return w == n;
+}
+
+void MemorySystem::importEnd() { /* 每次 write 都已落盘并关闭，无需收尾 */ }
+
+bool MemorySystem::applyImport(String& msg) {
+  File in = LittleFS.open(IMP_PATH, "r");
+  if (!in) { msg = "没收到上传内容"; return false; }
+  File epsTmp = LittleFS.open("/mem/episodes.imp", "w");
+  if (!epsTmp) { in.close(); msg = "文件系统写入失败"; return false; }
+  int section = 0, nSem = 0, nEps = 0, nEvo = 0;
+  String semBuf, evoBuf;
+  while (in.available()) {
+    String l = in.readStringUntil('\n');
+    l.trim();
+    if (l.startsWith("###")) {
+      if      (l.startsWith("###SEMANTIC"))  section = 1;
+      else if (l.startsWith("###EPISODES"))  section = 2;
+      else if (l.startsWith("###EVOLUTION")) section = 3;
+      else section = 0;                      // ###LAAP-MEMORY / ###END
+      continue;
+    }
+    if (!l.length()) continue;
+    if (section == 1) { semBuf += l; nSem++; }
+    else if (section == 2) { epsTmp.println(l); nEps++; }
+    else if (section == 3) { evoBuf += l; nEvo++; }
+  }
+  in.close();
+  epsTmp.close();
+  // 认不出格式就别动记忆（宁可不导入，也不能把主人的人格清成白纸）
+  if (!nEps && !nSem && !nEvo) {
+    LittleFS.remove("/mem/episodes.imp"); LittleFS.remove(IMP_PATH);
+    msg = "内容不像记忆备份（没有 ###SEMANTIC/###EPISODES 段头）";
+    return false;
+  }
+  // 分段可缺：只有情景段才替换情景记忆（否则"只恢复性格"的导入会把记忆清空）
+  if (nEps) {
+    LittleFS.remove(EP_PATH);
+    LittleFS.rename("/mem/episodes.imp", EP_PATH);
+  } else {
+    LittleFS.remove("/mem/episodes.imp");
+  }
+  // 语义/性格：有就覆盖，没有就保留原样
+  if (nSem) { File f = LittleFS.open("/mem/semantic.txt", "w"); if (f) { f.print(semBuf); f.close(); } }
+  if (nEvo) { File f = LittleFS.open("/evolution.json", "w"); if (f) { f.print(evoBuf); f.close(); } }
+  LittleFS.remove(EMB_PATH);   // 向量与行序绑死：换了记忆必须整份作废重建
+  LittleFS.remove(IMP_PATH);
+  _embCount = 0; _embFail = 0;
+  _count = 0;
+  File f = LittleFS.open(EP_PATH, "r");
+  if (f) { while (f.available()) { if (f.read() == '\n') _count++; } f.close(); }
+  reloadWork();
+  msg = String("已导入 ");
+  if (nEps) msg += String(nEps) + " 条情景记忆";
+  if (nSem) msg += (nEps ? "、" : "") + String("自我认知");
+  if (nEvo) msg += ((nEps || nSem) ? "、" : "") + String("性格进化");
+  if (!nEps) msg += "（备份里没有情景段，原有记忆保持不变）";
+  Serial.printf("[MEM] %s（_count=%lu）\n", msg.c_str(), (unsigned long)_count);
+  return true;
+}
+
+// 从盘上末段重建工作记忆环：导入后立刻就能"想起"，不用等到下次聊天
+void MemorySystem::reloadWork() {
+  _workLen = 0; _workHead = 0;
+  File f = LittleFS.open(EP_PATH, "r");
+  if (!f) return;
+  std::vector<String> tail;
+  while (f.available()) {
+    String l = f.readStringUntil('\n');
+    if (!l.length()) continue;
+    int rp = l.indexOf("\"r\":\"");
+    int xp = l.indexOf("\"x\":\"");
+    if (rp < 0 || xp < 0) continue;
+    String role = l.substring(rp + 5, l.indexOf('"', rp + 5));
+    String x = l.substring(xp + 5);
+    x.replace("\\n", " "); x.replace("\\\"", "\"");
+    int xe = x.lastIndexOf('"');
+    if (xe > 0) x = x.substring(0, xe);
+    x = sanitizeUtf8(x);
+    tail.push_back(role + ":" + x);
+    if (tail.size() > WORK_MAX) tail.erase(tail.begin());
+  }
+  f.close();
+  for (auto& t : tail) {
+    if (t.length() > 160) t = utf8Cut(t, 160);
+    _work[_workHead] = t;
+    _workHead = (_workHead + 1) % WORK_MAX;
+    if (_workLen < WORK_MAX) _workLen++;
+  }
 }

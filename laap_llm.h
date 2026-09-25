@@ -47,5 +47,8 @@ private:
 
 // UTF-8 安全截断（laap_llm.cpp 实现，全局可用）：len 字节上限处回退到字符边界
 String utf8Cut(const String& s, int len);
+// UTF-8 兜底清洗：丢掉非法字节（历史遗留的"切半汉字"）。写盘与出 JSON 前过一遍，
+// 否则半个汉字会让整个 JSON 或 LLM 请求体非法（/api/memory 曾因此吐不出合法 JSON）
+String sanitizeUtf8(const String& s);
 
 extern LlmClient llm;

@@ -1,5 +1,7 @@
 #include "laap_web.h"
 #include <Update.h>
+#include <esp_ota_ops.h>   // esp_ota_get_running_partition / get_next_update_partition
+#include <LittleFS.h>      // fs_used_kb / fs_total_kb（核对记忆占用）
 #include "laap_config.h"
 #include "laap_cognition.h"
 #include "laap_display.h"
@@ -141,18 +143,43 @@ void LaapWeb::registerRoutes() {
   server.on("/api/test", HTTP_POST, [this]() { handleTest(); });
   server.on("/api/save", HTTP_POST, [this]() { handleSave(); });
   server.on("/api/memory", HTTP_GET, [this]() { handleMemoryApi(); });
+  server.on("/api/memexport", HTTP_GET, [this]() { handleMemExport(); });
+  server.on("/api/memimport", HTTP_POST,
+    [this]() { handleMemImport(); },
+    [this]() {
+      HTTPUpload& up = server.upload();
+      if (up.status == UPLOAD_FILE_START) {
+        Serial.printf("[MEM] 导入开始: %s\n", up.filename.c_str());
+        memImportOk = memory.importBegin();
+      } else if (up.status == UPLOAD_FILE_WRITE) {
+        if (memImportOk && !memory.importWrite(up.buf, up.currentSize)) {
+          memImportOk = false;
+          Serial.println("[MEM] 导入写入失败");
+        }
+      } else if (up.status == UPLOAD_FILE_END) {
+        memory.importEnd();
+        Serial.printf("[MEM] 导入上传完成 %u 字节\n", (unsigned)up.totalSize);
+      }
+    });
   server.on("/api/clear", HTTP_POST, [this]() { handleClear(); });
   server.on("/api/reset", HTTP_POST, [this]() { handleReset(); });
   server.on("/api/reboot", HTTP_POST, [this]() { handleReboot(); });
   // F1: OTA 固件上传（POST .bin 原始体，写满即重启）
+  // 回包必须在"最终回调"里发：在 upload 回调里 send 会与 WebServer 自己的收尾回包撞车
+  // （双响应），重启时机也不可控。upload 回调只负责写 flash + 置标志。
   server.on("/api/ota", HTTP_POST,
     [this]() {
       if (otaPending) {
         server.send(200, "application/json",
           "{\"ok\":true,\"msg\":\"固件已写入，重启中，约 20 秒后回来\"}");
+        laapUptimePersist();   // 重启前落盘累计时长
+        delay(600);
+        ESP.restart();
       } else {
+        String msg = otaErr.length() ? otaErr : String("未收到固件数据");
+        Serial.printf("[OTA] 失败: %s\n", msg.c_str());
         server.send(500, "application/json",
-          String("{\"ok\":false,\"msg\":\"写入失败: ") + otaErr + "\"}");
+          String("{\"ok\":false,\"msg\":\"写入失败: ") + msg + "\"}");
       }
     },
     [this]() {
@@ -161,22 +188,23 @@ void LaapWeb::registerRoutes() {
         Serial.printf("[OTA] 开始: %s\n", up.filename.c_str());
         otaPending = false; otaErr = "";
         display.drawFace("curious", true);          // 升级中表情
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { otaErr = Update.errorString(); return; }
+        // 没有可写槽是"升不动"的头号原因：先讲清楚，别让人对着 500 猜
+        const esp_partition_t* tgt = esp_ota_get_next_update_partition(nullptr);
+        if (!tgt) { otaErr = "分区表没有可写 OTA 槽（需 ota_0/ota_1 双分区）"; return; }
+        Serial.printf("[OTA] 目标槽 %s @0x%06x，容量 %u KB\n",
+                      tgt->label, (unsigned)tgt->address, (unsigned)(tgt->size / 1024));
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) { otaErr = Update.errorString(); return; }
       } else if (up.status == UPLOAD_FILE_WRITE) {
-        if (Update.write(up.buf, up.currentSize) != up.currentSize) {
-          otaErr = Update.errorString(); return;
+        if (!otaErr.length() && Update.write(up.buf, up.currentSize) != up.currentSize) {
+          otaErr = Update.errorString(); Update.abort();
         }
       } else if (up.status == UPLOAD_FILE_END) {
+        if (otaErr.length()) return;
         if (Update.end(true)) {
           otaPending = true;
-          Serial.printf("[OTA] 完成: %u 字节，重启\n", (unsigned)up.totalSize);
-            // 先回包再重启：给响应留出发送时间，否则浏览器把连接重置当失败
-            server.send(200, "application/json", "{\"ok\":true,\"msg\":\"写入完成，重启中…\"}");
-            delay(500);
-            ESP.restart();
+          Serial.printf("[OTA] 完成: %u 字节 → 已写入目标槽，等待重启\n", (unsigned)up.totalSize);
         } else {
-          otaErr = Update.errorString();
-          Serial.printf("[OTA] 失败: %s\n", otaErr.c_str());
+          otaErr = Update.errorString(); Update.abort();
         }
       }
     });
@@ -363,7 +391,10 @@ void LaapWeb::handleSettingsPage() {
     "async function otaup(e){e.preventDefault();const f=document.getElementById('otabin').files[0];"
     "if(!f){alert('先选 .bin 文件');return}"
     "otaout.textContent='上传中 '+f.name+' ('+Math.round(f.size/1024)+'KB)，请勿断电…';"
-    "try{const b=await fetch('/api/ota',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f});"
+    // 必须用 multipart：ESP32 WebServer 只把 multipart 的请求体流给 upload 回调，
+    // 直接 POST 原始二进制（octet-stream）时回调一次都不触发 → "未收到固件数据"
+    "const fd=new FormData();fd.append('file',f,f.name);"
+    "try{const b=await fetch('/api/ota',{method:'POST',body:fd});"
     "const r=await b.json();otaout.textContent=(r.ok?'✅ ':'❌ ')+r.msg;}catch(err){otaout.textContent='❌ 上传失败: '+err;}}"
     "async function testllm(e){e.preventDefault();testout.textContent='测试中…';"
     "const b=await fetch('/api/test',{method:'POST'});const r=await b.json();"
@@ -543,10 +574,17 @@ void LaapWeb::handleStatus() {
     "\"vision_ready\":" + (vision.available() ? "true" : "false") +
     ",\"voice_ready\":" + (voice.ready() ? "true" : "false") +
     ",\"vad_paused\":" + (voice.vadPaused() ? "true" : "false") +
+    // 分区/文件系统：OTA 之后靠 part 确认新固件真的在跑；fs 用来核对记忆占用
+    ",\"part\":\"" + String(esp_ota_get_running_partition() ? esp_ota_get_running_partition()->label : "?") + "\"" +
+    ",\"ota_slot\":\"" + String(esp_ota_get_next_update_partition(nullptr) ? esp_ota_get_next_update_partition(nullptr)->label : "无（不可 OTA）") + "\"" +
+    ",\"fs_used_kb\":" + String(LittleFS.usedBytes() / 1024) +
+    ",\"fs_total_kb\":" + String(LittleFS.totalBytes() / 1024) +
     ",\"screen_off\":" + cfg.s.screenOffSec +
     ",\"uptime_s\":" + String(millis() / 1000) +
     ",\"uptime_total_min\":" + String(laapUptimeMin()) +
     ",\"heap_kb\":" + String(ESP.getFreeHeap() / 1024) +
+    // 环任务栈历史最低余量（字节）：TTS 的 TLS 握手最吃栈，低于 2-3KB 就该警惕
+    ",\"stack_min\":" + String((unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t))) +
     ",\"wifi_rssi\":" + (WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) : String("0")) +
     ",\"chip_temp\":" + String(temperatureRead(), 1) +
     ",\"needs\":" + needs +
@@ -593,7 +631,12 @@ void LaapWeb::handleMemoryPage() {
     "<div id='sem' style='margin-top:6px'>…</div></div>"
     "<div class='card'><div class='k' style='color:#8b95a8;font-size:12px'>最近情景记忆</div>"
     "<div id='eps' style='margin-top:6px;font-size:13px;line-height:1.8'></div>"
+    "<div style='margin-top:10px;display:flex;gap:8px;flex-wrap:wrap'>"
+    "<a class='ghost' href='/api/memexport' style='text-decoration:none;padding:6px 12px'>导出记忆（备份）</a>"
+    "<button class='ghost' onclick='memimp(event)'>导入记忆（恢复）</button>"
     "<button class='ghost' onclick='clearmem(event)'>清空全部记忆</button></div>"
+    "<input type='file' id='memfile' accept='.txt' style='margin-top:8px;width:100%'>"
+    "<div class='hint'>导出的 txt 含情景记忆+自我认知+性格进化；导入会覆盖当前记忆（先备份再导入更稳）</div></div>"
     "<script>"
     "async function load(){const s=await (await fetch('/api/memory')).json();"
     "sem.textContent=s.semantic||'（还没有形成自我认知）';"
@@ -601,8 +644,14 @@ void LaapWeb::handleMemoryPage() {
     "const c=e.r=='user'?'#9ae6b4':(e.r=='aris'?'#6fd3ff':'#8b95a8');"
     "h+='<div style=\"color:'+c+'\">['+e.r+'] '+e.x.replace(/</g,'&lt;')+'</div>';}"
     "eps.innerHTML=h||'（空）';}"
-    "async function clearmem(e){e.preventDefault();if(!confirm('清空全部记忆?'))return;"
+    "async function clearmem(e){e.preventDefault();if(!confirm('清空全部记忆?（建议先导出备份）'))return;"
     "await fetch('/api/clear',{method:'POST'});load();}"
+    "async function memimp(e){e.preventDefault();const f=document.getElementById('memfile').files[0];"
+    "if(!f){alert('先选择要导入的记忆 txt 文件');return;}"
+    "if(!confirm('导入会覆盖当前记忆，继续?'))return;"
+    "const fd=new FormData();fd.append('file',f, f.name);"
+    "try{const r=await (await fetch('/api/memimport',{method:'POST',body:fd})).json();"
+    "alert((r.ok?'✅ ':'❌ ')+r.msg);load();}catch(err){alert('导入失败: '+err);}}"
     "load();</script>");
   server.send(200, "text/html; charset=utf-8", head + body + FPSTR(PAGE_FOOT));
 }
@@ -618,6 +667,34 @@ void LaapWeb::handleMemoryApi() {
   }
   String j = String("{\"semantic\":\"") + esc + "\",\"events\":" + memory.episodicTail(60) + "}";
   server.send(200, "application/json", j);
+}
+
+void LaapWeb::handleMemExport() {
+  String dump = memory.exportDump();
+  // 完整性校验：内部堆紧张时 String 增长可能中途失败，宁可报错也不能给出一份
+  // "看起来正常、其实少了一半" 的备份（恢复时才发现少了记忆是最坏的情况）
+  if (!dump.endsWith("###END\n") || !dump.startsWith("###LAAP-MEMORY")) {
+    Serial.printf("[MEM] 导出失败：内容不完整（%u 字节）\n", (unsigned)dump.length());
+    server.send(500, "application/json",
+                "{\"ok\":false,\"msg\":\"导出失败：内存紧张导致内容不完整，稍后重试\"}");
+    return;
+  }
+  Serial.printf("[MEM] 导出记忆 %u 字节（%lu 条事件）\n",
+                (unsigned)dump.length(), (unsigned long)memory.eventCount());
+  server.sendHeader("Content-Disposition", "attachment; filename=laap-memory.txt");
+  server.send(200, "text/plain; charset=utf-8", dump);
+}
+
+void LaapWeb::handleMemImport() {
+  if (!memImportOk) {
+    server.send(500, "application/json", "{\"ok\":false,\"msg\":\"上传失败（内容没落盘）\"}");
+    return;
+  }
+  String msg;
+  bool ok = memory.applyImport(msg);
+  if (ok) mind.reloadEvolution();   // 让盘上的性格进化立刻生效（否则被运行中的旧值覆盖）
+  server.send(ok ? 200 : 500, "application/json",
+              String("{\"ok\":") + (ok ? "true" : "false") + ",\"msg\":\"" + msg + "\"}");
 }
 
 void LaapWeb::handleClear() {
