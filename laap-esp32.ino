@@ -664,6 +664,8 @@ void serialCli() {
                      "  RSSI: " + String(WiFi.RSSI()) + " dBm  温度: " + String(temperatureRead(), 1) + "C");
     } else if (line == "/portal") {
       webui.beginAP();
+    } else if (line == "/lcd") {
+      Serial.println("[LCD] " + display.lcdDiag());
     } else if (line == "/mem") {
       Serial.println(memory.recentContext(800));
     } else if (line == "/tick") {
@@ -706,6 +708,9 @@ void setup() {
   cfg.begin();
   cfg.load();
 
+  // vision.begin() 暂时禁用（黑屏排查）：esp32-camera probe 在 I2C 未就绪时反复撞 port0，
+  // 其引脚配置污染 GPIO 矩阵的嫌疑最大。视觉后端本就未配置，禁用零损失。
+  // vision.begin();
   display.begin();
   display.drawBootScreen();
 
@@ -734,7 +739,6 @@ void setup() {
   display.setBrightness(cfg.s.brightness);  // 应用持久化亮度（背光 PWM）
   mind.trust = laapTrust();        // 小凌⑥: 启动时取回持久化信任值
   laapSearch.begin();  // 联网搜索（主源可配，WiFi 就绪后可用）
-  vision.begin();      // F9: GC0308 摄像头（无视觉后端时抓帧仍可用，描述静默跳过）
 
   display.drawFace(mind.moodKey());
   display.drawNeeds(mind.needs().energy, mind.needs().curiosity, mind.needs().social,

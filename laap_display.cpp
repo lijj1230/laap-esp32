@@ -1,4 +1,10 @@
 #include "laap_display.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_panel_ops.h"
+#include "driver/spi_master.h"
+
+static esp_lcd_panel_handle_t s_panel = nullptr;
 
 LaapDisplay display;
 
@@ -11,18 +17,15 @@ void LaapDisplay::pca9557Write(uint8_t reg, uint8_t val) {
 }
 
 // ================= ST7789 底层 =================
+esp_lcd_panel_io_handle_t g_laapPanelIO = nullptr;   // begin() 里赋值（lcd 绘图命令走同一 panel_io）
+
 void LaapDisplay::lcdCmd(uint8_t c) {
-  digitalWrite(SZP_LCD_DC, LOW);
-  SPI.beginTransaction(SPISettings(SZP_LCD_SPI_HZ, MSBFIRST, SPI_MODE0));
-  SPI.transfer(c);
-  SPI.endTransaction();
+  uint8_t v = c;
+  if (g_laapPanelIO) esp_lcd_panel_io_tx_param(g_laapPanelIO, 0x00, &v, 1);   // 0x00=命令
 }
 
 void LaapDisplay::lcdData(const uint8_t* d, int n) {
-  digitalWrite(SZP_LCD_DC, HIGH);
-  SPI.beginTransaction(SPISettings(SZP_LCD_SPI_HZ, MSBFIRST, SPI_MODE0));
-  SPI.transferBytes(d, nullptr, n);
-  SPI.endTransaction();
+  if (g_laapPanelIO) esp_lcd_panel_io_tx_param(g_laapPanelIO, 0x40, d, n);    // 0x40=数据（DC 置 1 的伪命令位）
 }
 
 void LaapDisplay::setWindow(int x0, int y0, int x1, int y1) {
@@ -42,19 +45,21 @@ void LaapDisplay::fillRect(int x, int y, int w, int h, uint16_t c) {
   if (w <= 0 || h <= 0 || x >= SZP_LCD_W || y >= SZP_LCD_H) return;
   if (x + w > SZP_LCD_W) w = SZP_LCD_W - x;
   if (y + h > SZP_LCD_H) h = SZP_LCD_H - y;
-  setWindow(x, y, x + w - 1, y + h - 1);
-  digitalWrite(SZP_LCD_DC, HIGH);
-  SPI.beginTransaction(SPISettings(SZP_LCD_SPI_HZ, MSBFIRST, SPI_MODE0));
-  size_t total = (size_t)w * h;
-  const int CHUNK = 1024;
-  static uint8_t line[CHUNK * 2];
-  for (int i = 0; i < CHUNK; i++) { line[i*2] = c >> 8; line[i*2+1] = c & 0xFF; }
-  while (total > 0) {
-    int n = total > CHUNK ? CHUNK : total;
-    SPI.transferBytes(line, nullptr, n * 2);
-    total -= n;
+  if (!s_panel) return;
+  // 按真实窗口尺寸填充缓冲（越界读会让 DMA 送出堆垃圾）
+  static uint16_t buf[320 * 8];
+  int xx0 = x, xx1 = x + w - 1;
+  int winW = w;
+  int rowsPerPass = 320 * 8 / (winW > 0 ? winW : 1);
+  if (rowsPerPass < 1) rowsPerPass = 1;
+  if (rowsPerPass > h) rowsPerPass = h;
+  for (int i = 0; i < winW * rowsPerPass; i++) buf[i] = c;
+  int yy = y;
+  while (yy < y + h) {
+    int rows = (y + h - yy < rowsPerPass) ? (y + h - yy) : rowsPerPass;
+    esp_lcd_panel_draw_bitmap(s_panel, xx0, yy, xx1 + 1, yy + rows, buf);
+    yy += rows;
   }
-  SPI.endTransaction();
 }
 
 void LaapDisplay::fillCircle(int cx, int cy, int r, uint16_t c) {
@@ -86,33 +91,81 @@ void LaapDisplay::vendorInit() {
 }
 
 void LaapDisplay::begin() {
-  // I2C 先行：把 PCA9557 的 LCD_CS(bit0) 拉低永久选中
+  // I2C 先行：小智 Pca9557 构造同款（先写输出寄存器值，再开低3位输出）
   Wire.begin(SZP_I2C_SDA, SZP_I2C_SCL, 400000);
-  pca9557Write(0x03, 0xF8); // 低3位输出（xiaozhi BSP 同款）：bit0=LCD_CS bit1=PA_EN bit2=摄像头PWDN
-  pca9557Write(0x01, 0x03); // LCD_CS=0 选中, PA_EN=1 功放使能（原 0x00 把功放关了）
+  pca9557Write(0x01, 0x03);   // 输出值：bit0(LCD_CS)=高=未选中, bit1(PA_EN)=1, bit2(摄像头PWDN)=0
+  pca9557Write(0x03, 0xF8);   // 低3位转输出
 
   pinMode(SZP_LCD_DC, OUTPUT);
   pinMode(SZP_LCD_BL, OUTPUT);
-  digitalWrite(SZP_LCD_BL, LOW);       // 实战派背光反相（低=最亮，xiaozhi BSP: BACKLIGHT_OUTPUT_INVERT true）
-  SPI.begin(SZP_LCD_CLK, -1, SZP_LCD_MOSI, -1);
+  digitalWrite(SZP_LCD_BL, LOW);   // 反相：低=亮
 
-  // ST7789 上电时序鲁棒化：某些上电瞬间（3V3 爬升慢/USB 供电抖动）芯片停在半睡眠，
-  // 表现为背光亮但整屏黑。软件复位 + 充分延时 + 二次 DISPON 兜底。
-  lcdCmd(0x01); // SWRESET
-  delay(200);                          // 数据手册要求 120ms，留裕量
-  lcdCmd(0x11); // SLPOUT
-  delay(150);                          // 数据手册要求 120ms，留裕量
-  vendorInit();                        // 冷态屏必需：电源/伽马/门驱动完整序列
-  lcdCmd(0x3A); uint8_t m = 0x55; lcdData(&m, 1); // 16bit
-  lcdCmd(0x36); m = 0x60; lcdData(&m, 1);         // MADCTL: MV|MX 横屏(官方同款)
-  lcdCmd(0x21); // INVON 反色(官方同款)
-  lcdCmd(0x13); // NORON
-  delay(20);
-  lcdCmd(0x29); // DISPON
-  delay(20);
-  lcdCmd(0x29); // DISPON 二次兜底（个别上电第一次 DISPON 被吞）
+  // esp_lcd 面板栈（xiaozhi szpi-esp32s3 完整同款：SPI3_HOST/MODE2/80MHz/ST7789 组件驱动）
+  gpio_config_t io_dc = {};
+  io_dc.pin_bit_mask = 1ULL << SZP_LCD_DC;
+  io_dc.mode = GPIO_MODE_OUTPUT;
+  gpio_config(&io_dc);
+
+  esp_lcd_panel_io_handle_t panel_io = nullptr;
+  esp_lcd_panel_handle_t panel = nullptr;
+  // SPI3 总线显式初始化（xiaozhi InitializeSpi 同款；漏了这步 panel_io 会挂不上）
+  spi_bus_config_t buscfg = {};
+  buscfg.mosi_io_num = SZP_LCD_MOSI;
+  buscfg.miso_io_num = -1;
+  buscfg.sclk_io_num = SZP_LCD_CLK;
+  buscfg.quadwp_io_num = -1;
+  buscfg.quadhd_io_num = -1;
+  buscfg.max_transfer_sz = SZP_LCD_W * SZP_LCD_H * sizeof(uint16_t);
+  ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO));
+
+  esp_lcd_panel_io_spi_config_t io_config = {};
+  io_config.cs_gpio_num = -1;          // NC：CS 由 PCA9557 常选
+  io_config.dc_gpio_num = SZP_LCD_DC;
+  io_config.spi_mode = 2;
+  io_config.pclk_hz = 80 * 1000 * 1000;
+  io_config.trans_queue_depth = 10;
+  io_config.lcd_cmd_bits = 8;
+  io_config.lcd_param_bits = 8;
+  io_config.on_color_trans_done = nullptr;
+  io_config.user_ctx = nullptr;
+  ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((spi_host_device_t)SPI3_HOST, &io_config, &panel_io));
+  g_laapPanelIO = panel_io;
+
+  esp_lcd_panel_dev_config_t panel_config = {};
+  panel_config.reset_gpio_num = -1;
+  panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
+  panel_config.bits_per_pixel = 16;
+  panel_config.flags.reset_active_high = 0;
+  ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(panel_io, &panel_config, &panel));
+  s_panel = panel;
+
+  esp_lcd_panel_reset(panel);
+  // 关键一步（xiaozhi SetOutputState(0,0) 同款）：bit0(LCD_CS) 拉低选中面板，bit1(PA_EN) 保持 1。
+  // 缺了这步 CS 一直为高，面板被片选隔离，所有 SPI 命令无效（无内容黑屏的根因）
+  pca9557Write(0x01, 0x02);
+  ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
+  esp_lcd_panel_invert_color(panel, true);   // INVON（xiaozhi 同款）
+  esp_lcd_panel_swap_xy(panel, true);        // DISPLAY_SWAP_XY true
+  esp_lcd_panel_mirror(panel, true, false);  // DISPLAY_MIRROR_X/Y
+  esp_lcd_panel_disp_on_off(panel, true);
+
+  { // 自检：回读 PCA9557 输出寄存器，确认 bit0(CS)=0 已选中、bit1(PA_EN)=1
+    Wire.beginTransmission(SZP_PCA9557_ADDR); Wire.write(0x01); Wire.endTransmission();
+    uint8_t rb = (Wire.requestFrom((int)SZP_PCA9557_ADDR, 1) == 1) ? Wire.read() : 0xFF;
+    Serial.printf("[display] PCA9557 out=0x%02X (CS=%s PA_EN=%d)\n",
+                  rb, (rb & 0x01) ? "HIGH未选中!" : "low已选中", (rb >> 1) & 1);
+  }
+
+  // 背光：analogWrite（3.x 内置 LEDC 后端），setBrightness 内部已做反相占空
   setBrightness(90);
   fillRect(0, 0, SZP_LCD_W, SZP_LCD_H, CLR_BG);
+}
+// 显示子系统自诊断：报告栈状态
+String LaapDisplay::lcdDiag() {
+  return "panel=" + String(s_panel ? "ok" : "null") +
+         ", panelIO=" + String(g_laapPanelIO ? "ok" : "null") +
+         ", brightness=" + String(brightness) +
+         ", backlightPin=LOW(active)";
 }
 
 void LaapDisplay::setBrightness(uint8_t pct) {

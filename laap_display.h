@@ -37,6 +37,7 @@ public:
   void begin();
   void setBrightness(uint8_t pct);
   uint8_t getBrightness() const { return brightness; }
+  String lcdDiag();            // 显示子系统自诊断（串口 /lcd 调用）
   void clear(uint16_t c) { fillRect(0, 0, SZP_LCD_W, SZP_LCD_H, c); }
   // ---- UI ----
   void drawFace(const char* expr, bool thinking = false);
