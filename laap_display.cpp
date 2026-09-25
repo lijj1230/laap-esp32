@@ -260,6 +260,8 @@ void LaapDisplay::repaint() {
   if (!_screenOn) return;
   drawFace(curExpr, false);
   drawTopStrip();
+  // 底栏必须一起补：扣翻装死是整屏 clear，翻回来只画脸+顶栏会让 IP 栏一直是黑的
+  if (ipDrawn) drawIpLine(ipCache, ipWifiOk);
 }
 
 void LaapDisplay::drawListenState(bool listening) {
@@ -303,6 +305,7 @@ static const struct { char ch; uint8_t g[5]; } GLYPH3x5[] = {
   {'d', {0x01,0x01,0x07,0x05,0x07}},
   {'m', {0x00,0x07,0x05,0x05,0x05}},
   {'h', {0x04,0x04,0x07,0x05,0x05}},
+  {'g', {0x07,0x05,0x07,0x01,0x06}},   // IMU 读数单位
 };
 
 // scale=1 时 3x5 像素；scale=2/3 时每点放大成方块（顶栏用 2~3 倍，原 3x5 太小看不清）
@@ -335,8 +338,8 @@ void LaapDisplay::drawTopStrip() {
   fillRect(0, 0, SZP_LCD_W, UI_TOP_H, CLR_BG);
   fillRect(0, UI_TOP_H - 1, SZP_LCD_W, 1, CLR_DIM);   // 分隔线
 
-  const uint16_t tc = RGB565(180, 195, 215);
-  const uint16_t dc = RGB565(120, 134, 158);
+  const uint16_t tc = CLR_TIME;   // 暖米灰（原近白蓝，深底上偏刺眼）
+  const uint16_t dc = CLR_META;   // 冷灰蓝
 
   // ---- 行1 (y=1): 时间 3x 放大（9x15 像素，远处也看得清） ----
   time_t nowT = time(nullptr);
@@ -362,16 +365,23 @@ void LaapDisplay::drawTopStrip() {
   // 聆听点（右上角，仅真正在听时出现——原来常亮会让人以为一直在收声）
   if (listenDot > 0) fillCircle(SZP_LCD_W - 8, 9, 4, CLR_EXP);
 
-  // ---- 行2 (y=20): 设备信息 47C -45dB 90KB 12h30m（2x） ----
+  // ---- 行2 (y=20, 2x): 左 体温/信号/堆 ｜ 中 运行时长 ｜ 右 IMU 加速度模值 ----
   char buf[48];
-  snprintf(buf, sizeof(buf), "%dC %ddB %uKB %uh%02um",
-           (int)devTemp, devRssi, (unsigned)devHeapKb,
-           (unsigned)(devUpMin / 60), (unsigned)(devUpMin % 60));
+  auto tw = [](const char* s, uint8_t sc) {          // 文本像素宽（'.' 窄一档）
+    int w = 0; for (; *s; s++) w += ((*s == '.') ? 3 : 4) * sc; return w;
+  };
+  snprintf(buf, sizeof(buf), "%dC %ddB %uKB", (int)devTemp, devRssi, (unsigned)devHeapKb);
   drawText3x5(6, 20, buf, dc, 2);
+  snprintf(buf, sizeof(buf), "%uh%02um", (unsigned)(devUpMin / 60), (unsigned)(devUpMin % 60));
+  drawText3x5(124, 20, buf, dc, 2);
+  if (devAccel > 0) {                                 // IMU 读数：静止 1.00g，晃动 1.5~3g
+    snprintf(buf, sizeof(buf), "%.2fg", devAccel);
+    drawText3x5(296 - tw(buf, 2), 20, buf, CLR_META, 2);   // 右对齐（数值跳动不左右抖）
+  }
 }
 
-void LaapDisplay::drawStatusLine(float tempC, int rssi, uint32_t heapKb, uint32_t upMin) {
-  devTemp = tempC; devRssi = rssi; devHeapKb = heapKb; devUpMin = upMin;
+void LaapDisplay::drawStatusLine(float tempC, int rssi, uint32_t heapKb, uint32_t upMin, float accelG) {
+  devTemp = tempC; devRssi = rssi; devHeapKb = heapKb; devUpMin = upMin; devAccel = accelG;
   drawTopStrip();
 }
 
@@ -422,6 +432,7 @@ void LaapDisplay::drawIp7seg(int x, int y, const String& s) {
 }
 
 void LaapDisplay::drawIpLine(const String& ip, bool wifiOk) {
+  ipCache = ip; ipWifiOk = wifiOk; ipDrawn = true;   // 先缓存：息屏/装死期间也能在恢复时补画
   if (!_screenOn) return;
   // 底栏：分隔线 + 天线/感叹号 + IP（7段数码），UI_BAR_H=36 内布局
   fillRect(0, UI_BAR_Y - 2, SZP_LCD_W, UI_BAR_H + 2, CLR_BG);

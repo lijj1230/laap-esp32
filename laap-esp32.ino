@@ -735,7 +735,7 @@ void serialCli() {
     if (!line.length()) continue;
     laapActivity();     // 串口打字也是交互
     if (line == "/help") {
-      Serial.println("命令: /status /touch(触觉实测) /screen N(息屏秒) /portal(进配置热点) /mem(看记忆) /tick(手动心跳) /lcd /pa /imu /asrtest /reset(格式化)");
+      Serial.println("命令: /status /touch(触觉实测) /screen N(息屏秒) /redraw(重画整屏) /portal(进配置热点) /mem(看记忆) /tick(手动心跳) /lcd /pa /imu /asrtest /reset(格式化)");
       Serial.println("      直接打字回车 = 跟它说话（走完整对话链路）");
     } else if (line == "/touch") {
       // 触觉实测：5 秒采样，摇晃/扣翻板子看峰值与判定
@@ -771,13 +771,26 @@ void serialCli() {
     } else if (line == "/status") {
       Serial.println("[世界模型] " + mind.worldJson());
       Serial.println("[语义记忆] " + memory.semantic());
-      Serial.println("[设备] " + deviceFeelLine() +
-                     "  时间: " + (time(nullptr) > 1700000000 ? String(time(nullptr)) : String("未同步")) +
-                     "  RSSI: " + String(WiFi.RSSI()) + " dBm  温度: " + String(temperatureRead(), 1) + "C");
+      {
+        float ax, ay, az, acc = -1;
+        if (g_imuOk) {
+          imuReadAccel(ax, ay, az);
+          float m = sqrtf(ax * ax + ay * ay + az * az);
+          if (m > 0.05f && m < 8.0f) acc = m;
+        }
+        Serial.printf("[设备] %s  时间: %s  RSSI: %d dBm  温度: %.1fC  IMU: %s\n",
+                      deviceFeelLine().c_str(),
+                      time(nullptr) > 1700000000 ? String(time(nullptr)).c_str() : "未同步",
+                      WiFi.RSSI(), temperatureRead(),
+                      acc > 0 ? (String(acc, 2) + " g").c_str() : "无");
+      }
     } else if (line == "/portal") {
       webui.beginAP();
     } else if (line == "/lcd") {
       Serial.println("[LCD] " + display.lcdDiag());
+    } else if (line == "/redraw") {
+      display.repaint();   // 重画 表情+顶栏+底栏IP（屏幕状态异常时的复位手势）
+      Serial.println("[LCD] 已重画整屏（表情 + 顶栏 + 底栏 IP）");
     } else if (line == "/pa") {
       // 音频物理层诊断: PCA9557 输出寄存器回读（bit1=PA_EN）+ ES8311 音量
       Wire.beginTransmission(0x19); Wire.write(0x01); Wire.endTransmission(false);
@@ -1002,14 +1015,21 @@ void loop() {
   serialCli();
   memory.embedTick();   // 语义向量懒补（15s 限速，断网自动退关键词）
   display.blinkTick();
-  { // 顶栏（时间/需求数字/设备信息）每秒刷新
+  { // 顶栏（时间/需求数字/设备信息/IMU）每秒刷新
     static uint32_t s_lastStatus = 0;
     if (millis() - s_lastStatus > 1000) {
       s_lastStatus = millis();
+      float ax, ay, az, acc = -1;
+      if (g_imuOk) {
+        imuReadAccel(ax, ay, az);
+        float m = sqrtf(ax * ax + ay * ay + az * az);
+        if (m > 0.05f && m < 8.0f) acc = m;     // 无效读数(默认 z=-9)不显示
+      }
       display.drawStatusLine(temperatureRead(),
                              (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0,
                              ESP.getFreeHeap() / 1024,
-                             laapUptimeMin());   // 累计运行（跨重启，不再每次开机归零）
+                             laapUptimeMin(),       // 累计运行（跨重启，不再每次开机归零）
+                             acc);
     }
   }
   voice.loopTick();   // VAD 自动聆听模式

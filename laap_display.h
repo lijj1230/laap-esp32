@@ -32,6 +32,9 @@
 #define CLR_SOC   RGB565(198, 134, 170)   // 社交-藕粉
 #define CLR_SEC   RGB565(128, 158, 200)   // 安全-灰蓝
 #define CLR_EXP   RGB565(136, 186, 140)   // 表达-豆绿
+// 顶栏文字（低饱和莫兰迪灰，深底不刺眼；时间最亮、状态次之、说明文字最弱）
+#define CLR_TIME  RGB565(198, 192, 176)   // 时间-暖米灰
+#define CLR_META  RGB565(132, 138, 152)   // 状态指标-冷灰蓝
 
 class LaapDisplay {
 public:
@@ -43,7 +46,7 @@ public:
   // ---- UI ----
   void drawFace(const char* expr, bool thinking = false);
   void drawNeeds(float energy, float curiosity, float social, float security, float expression);
-  void drawStatusLine(float tempC, int rssi, uint32_t heapKb, uint32_t upMin);   // 顶栏刷新（时间/需求/设备信息）
+  void drawStatusLine(float tempC, int rssi, uint32_t heapKb, uint32_t upMin, float accelG);   // 顶栏刷新（时间/需求/设备/IMU）
   void drawIpLine(const String& ip, bool wifiOk);
   void drawBootScreen();
   void blinkTick();                       // loop 里调用，眨眼动画
@@ -77,6 +80,8 @@ private:
   uint8_t needPct[5] = {0,0,0,0,0};
   int8_t listenDot = -1;              // -1=不显示 0=灰 1=绿
   float devTemp = 0; int devRssi = 0; uint32_t devHeapKb = 0, devUpMin = 0;
+  float devAccel = -1;                // IMU 加速度模值(g)，<0=不显示（IMU 缺席/无效）
+  String ipCache; bool ipWifiOk = false; bool ipDrawn = false;   // 底栏缓存：息屏/装死后重画用
 };
 
 extern LaapDisplay display;
