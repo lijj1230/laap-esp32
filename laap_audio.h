@@ -65,7 +65,7 @@ private:
   float _slowRms = 30, _fastRms = 30;          // 环境基线 / 瞬时
   bool _vadSpeech = false;
   uint32_t _speechStartMs = 0, _silenceMs = 0;
-  bool _interrupted = false, _bargeEn = true;
+  bool _interrupted = false, _bargeEn = false;   // 默认关：播放期间不收麦（防回环/自触发）
   uint32_t _paOffMs = 0;                       // PA 空闲关断时刻（0=无需关）
 };
 

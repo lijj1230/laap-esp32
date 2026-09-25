@@ -35,8 +35,6 @@
 #include "laap_audio.h"
 #include "laap_voice.h"
 #include "laap_speech.h"
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
 #include "laap_search.h"
 #include "laap_vision.h"
 #include "laap_tools.h"
@@ -701,31 +699,6 @@ void connectWifi() {
 // ============================================================
 //  串口 CLI
 // ============================================================
-// /pa2 用: PCA9557 PA 位 + ES8311 关键寄存器一次性回读
-static void pa2Dump(const char* tag) {
-  Wire.beginTransmission(0x19); Wire.write(0x01); Wire.endTransmission(false);
-  uint8_t pa = (Wire.requestFrom((int)0x19, 1) == 1) ? Wire.read() : 0xFF;
-  Serial.printf("[PA2·%s] PCA=0x%02X(PA=%d) ES8311:", tag, pa, (pa >> 1) & 1);
-  static const uint8_t regs[] = {0x00, 0x01, 0x02, 0x03, 0x0D, 0x0E, 0x12, 0x13, 0x14, 0x16, 0x17, 0x18, 0x32, 0x37};
-  for (uint8_t r : regs) {
-    Wire.beginTransmission(0x18); Wire.write(r); Wire.endTransmission(false);
-    uint8_t v = (Wire.requestFrom((int)0x18, 1) == 1) ? Wire.read() : 0xFF;
-    Serial.printf(" %02X=%02X", r, v);
-  }
-  Serial.println();
-}
-// playPcm 播放轮询回调: 播放中 dump 寄存器 + 每 500ms 报麦克风 RMS（喇叭真响→RMS 飙升）
-static bool pa2Probe(void* ctx) {
-  static bool s_done = false;
-  static uint32_t s_lastRms = 0;
-  if (!s_done) { s_done = true; pa2Dump("playing"); s_lastRms = millis(); }
-  if (millis() - s_lastRms > 500) {
-    s_lastRms = millis();
-    Serial.printf("[PA2·playing] micRMS=%.0f（>200=喇叭在响，≈46=物理静音）\n", audio.micRms());
-  }
-  return false;   // 永不打断
-}
-
 void serialCli() {
   while (Serial.available()) {
     String line = Serial.readStringUntil('\n');
@@ -758,16 +731,6 @@ void serialCli() {
       rb = (Wire.requestFrom((int)0x19, 1) == 1) ? Wire.read() : 0xFF;
       Serial.printf("[AUD] 播放中 PA_EN=%d（若 0 → paSet 未生效=硬件/扩展芯片问题）\n", (rb >> 1) & 1);
       audio.paSet(false);
-    } else if (line == "/pa2") {
-      // 播放中探针: 3s 长音（小缓冲循环播，不占静态 RAM）
-      Serial.println("[PA2] 3 秒 440Hz 长音…请听喇叭！");
-      audio.bargeInEnable(false);
-      pa2Dump("idle");
-      static int16_t tone1[1600];            // 100ms@16k 循环 30 次 = 3s（96KB 静态会吃穿堆）
-      for (int i = 0; i < 1600; i++) tone1[i] = (int16_t)(12000 * sinf(2 * PI * 440 * i / 16000.0));
-      for (int r = 0; r < 30; r++) audio.playPcm(tone1, 1600, 16000, pa2Probe, nullptr);
-      pa2Dump("after");
-      Serial.println("[PA2] 完成");
     } else if (line == "/imu") {
       // IMU 诊断: 扫 0x6A/0x6B + 回读 WHO_AM_I
       for (uint8_t a : {(uint8_t)0x6A, (uint8_t)0x6B}) {
@@ -782,34 +745,6 @@ void serialCli() {
         Serial.println();
       }
       Serial.printf("[IMU] g_imuOk=%d\n", g_imuOk);
-    } else if (line == "/asrkey") {
-      // ASR Key 账户探针: 同一 Key 打 SiliconFlow chat 接口（区分端点故障 vs 账户问题）
-      if (!String(cfg.s.asrKey).length()) { Serial.println("[ASRKEY] asrKey 未配置"); }
-      else {
-        WiFiClientSecure sec; sec.setInsecure(); sec.setTimeout(15);
-        HTTPClient http;
-        String base(cfg.s.asrBase);
-        while (base.endsWith("/")) base.remove(base.length() - 1);
-        http.begin(sec, base + "/chat/completions");
-        http.addHeader("Content-Type", "application/json");
-        http.addHeader("Authorization", String("Bearer ") + cfg.s.asrKey);
-        http.setTimeout(15000);
-        int code = http.POST("{\"model\":\"Qwen/Qwen2.5-7B-Instruct\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":4}");
-        String body = http.getString();
-        Serial.printf("[ASRKEY] 同Key打chat → %d\n%.150s\n", code, body.c_str());
-        http.end();
-      }
-    } else if (line == "/llmfromasr") {
-      // LLM 切到 SiliconFlow（用 ASR 的 Key/base——/asrkey 已验证其有效且有余额）
-      if (!String(cfg.s.asrKey).length()) { Serial.println("[LLM] asrKey 未配置，无法迁移"); }
-      else {
-        strlcpy(cfg.s.llmBase, "https://api.siliconflow.cn/v1", sizeof(cfg.s.llmBase));
-        strlcpy(cfg.s.llmModel, "Qwen/Qwen2.5-7B-Instruct", sizeof(cfg.s.llmModel));
-        strlcpy(cfg.s.llmKey, cfg.s.asrKey, sizeof(cfg.s.llmKey));
-        cfg.save();
-        Serial.println("[LLM] 已切到 SiliconFlow(Qwen2.5-7B)，Key 复用 ASR 的（已验证有效）");
-        Serial.println("[LLM] 串口发句话测试，或网页改模型（deepseek-ai/DeepSeek-V3.1 等）");
-      }
     } else if (line == "/asrtest") {
       // ASR 端到端诊断: 录 5s（请对着板子说话）→ RMS 判定麦克风 → SiliconFlow 转写
       if (!audio.micOk) { Serial.println("[ASR] 无麦克风"); continue; }
@@ -853,7 +788,6 @@ void serialCli() {
       psiTick();
     } else if (line.startsWith("/say ")) {
       voice.speak(line.substring(5), "calm");
-      Serial.println("[VOICE] /say 完成");
     } else if (line.startsWith("/vol")) {
       int v = line.substring(4).toInt();
       if (v >= 0 && v <= 100) {

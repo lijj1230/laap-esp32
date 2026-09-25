@@ -361,7 +361,10 @@ esp_err_t es8311_voice_volume_set(es8311_handle_t dev, int volume, int *volume_s
     if (volume == 0) {
         reg32 = 0;
     } else {
-        reg32 = ((volume) * 256 / 100) - 1;
+        /* ES8311 DAC 音量寄存器: 0x00=-95.5dB, 0xBF=0dB, 0xFF=+32dB。
+           原生 0-100→0-0xFF 映射会让 100% 落在 +32dB —— 数字满幅信号被硬削波（实测"破音"根因）。
+           重映射 0-100 → 0x00-0xBF：0dB 封顶，留足动态余量。 */
+        reg32 = (volume * 0xBF) / 100;
     }
 
     // provide user with real volume set
@@ -379,7 +382,7 @@ esp_err_t es8311_voice_volume_get(es8311_handle_t dev, int *volume)
     if (reg32 == 0) {
         *volume = 0;
     } else {
-        *volume = ((reg32 * 100) / 256) + 1;
+        *volume = (reg32 * 100) / 0xBF;   // 与 set 的重映射（0xBF=0dB 封顶）互逆
     }
     return ESP_OK;
 }

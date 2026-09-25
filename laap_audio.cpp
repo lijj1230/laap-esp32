@@ -198,13 +198,16 @@ bool LaapAudio::playPcm(const int16_t* data, size_t samples, uint32_t rate,
     }
     if (m > 0) i2s.write((uint8_t*)out, m * 4);
 
-    // 打断监测：播放时也持续泵麦克风
-    pump();
-    if (millis() - leakT0 < 300) { leakRms += _fastRms; leakN++; }
-    else if (_bargeEn && !interruptCb) {
-      float leak = (leakN ? leakRms / leakN : 400) * 1.9f + 250;
-      highCnt = (_fastRms > leak) ? highCnt + 1 : 0;
-      if (highCnt >= 3) { _interrupted = true; }
+    // 打断监测：仅在 barge-in 开启时才吸麦克风（默认关——播放时不动麦克风，
+    // 避免 I2S 全双工 RX/TX 竞争与"自己听见自己"的回环干扰）
+    if (_bargeEn) {
+      pump();
+      if (millis() - leakT0 < 300) { leakRms += _fastRms; leakN++; }
+      else if (!interruptCb) {
+        float leak = (leakN ? leakRms / leakN : 400) * 1.9f + 250;
+        highCnt = (_fastRms > leak) ? highCnt + 1 : 0;
+        if (highCnt >= 3) { _interrupted = true; }
+      }
     }
     if (interruptCb && interruptCb(ctx)) _interrupted = true;
     if (_interrupted) break;
@@ -212,6 +215,14 @@ bool LaapAudio::playPcm(const int16_t* data, size_t samples, uint32_t rate,
   // PA 不再逐块关断：流式播放每 24ms 一块，逐块开关会让功放永远停在启动瞬态（无声根因）。
   // 改为保持开启，静默 400ms 后由 paTick() 关闭。
   _paOffMs = millis() + 400;
+  // 播放期间未吸麦克风（barge-in 关闭时）→ 排空 RX 积压，避免陈旧回声在恢复聆听时误触发 VAD
+  if (!_bargeEn) {
+    static int16_t junk[256];
+    int guard = 0;
+    while (i2s.available() > 0 && guard++ < 64) {
+      if (i2s.readBytes((char*)junk, min((size_t)i2s.available(), sizeof(junk))) <= 0) break;
+    }
+  }
   return !_interrupted;
 }
 
