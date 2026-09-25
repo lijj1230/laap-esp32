@@ -715,6 +715,21 @@ void serialCli() {
       webui.beginAP();
     } else if (line == "/lcd") {
       Serial.println("[LCD] " + display.lcdDiag());
+    } else if (line == "/pa") {
+      // 音频物理层诊断: PCA9557 输出寄存器回读（bit1=PA_EN）+ ES8311 音量
+      Wire.beginTransmission(0x19); Wire.write(0x01); Wire.endTransmission(false);
+      uint8_t rb = (Wire.requestFrom((int)0x19, 1) == 1) ? Wire.read() : 0xFF;
+      Serial.printf("[AUD] PCA9557 out=0x%02X (CS=%d PA_EN=%d PWDN=%d) vol=%d%%\n",
+                    rb, rb & 1, (rb >> 1) & 1, (rb >> 2) & 1, audio.volume());
+      Serial.println("[AUD] 播 1s 测试音…（此时 PA 应为 1）");
+      audio.paSet(true);
+      int16_t tone[1600];                    // 440Hz 100ms@16k，播 10 次=1s
+      for (int i = 0; i < 1600; i++) tone[i] = (int16_t)(8000 * sinf(2 * PI * 440 * i / 16000));
+      for (int r = 0; r < 10; r++) audio.playPcm(tone, 1600, 16000);
+      Wire.beginTransmission(0x19); Wire.write(0x01); Wire.endTransmission(false);
+      rb = (Wire.requestFrom((int)0x19, 1) == 1) ? Wire.read() : 0xFF;
+      Serial.printf("[AUD] 播放中 PA_EN=%d（若 0 → paSet 未生效=硬件/扩展芯片问题）\n", (rb >> 1) & 1);
+      audio.paSet(false);
     } else if (line == "/mem") {
       String mem = memory.recentContext(800);
       if (mem.length()) Serial.print(mem);
@@ -723,6 +738,7 @@ void serialCli() {
       psiTick();
     } else if (line.startsWith("/say ")) {
       voice.speak(line.substring(5), "calm");
+      Serial.println("[VOICE] /say 完成");
     } else if (line.startsWith("/vol")) {
       int v = line.substring(4).toInt();
       if (v >= 0 && v <= 100) {
@@ -759,11 +775,9 @@ void setup() {
   cfg.begin();
   cfg.load();
 
-  // vision.begin() 暂时禁用（黑屏排查）：esp32-camera probe 在 I2C 未就绪时反复撞 port0，
-  // 其引脚配置污染 GPIO 矩阵的嫌疑最大。视觉后端本就未配置，禁用零损失。
-  // vision.begin();
-  display.begin();
+  display.begin();  // Wire(I2C) 在 display.begin 里初始化——必须先于 vision
   display.drawBootScreen();
+  vision.begin();   // GC0308（PWDN 经 PCA9557 bit2 已上电；SCCB 复用主 I2C，须在 Wire 初始化后）
 
   mind.begin();
   g_imuOk = imuInit();
@@ -786,6 +800,8 @@ void setup() {
   else if (String(cfg.s.wifiSsid).length() == 0) { webui.beginAP(); display.drawIpLine("", false); }
 
   voice.begin();   // 音频管线 + 编解码器 + VAD 校准
+  // 音量 0 防护：NVS 被写成 0（网页异常提交过一次）会导致永久静音，开机钳回 30
+  if (cfg.s.volume == 0) { cfg.s.volume = 30; cfg.save(); }
   audio.setVolume(cfg.s.volume);  // 应用持久化音量（ES8311）
   display.setBrightness(cfg.s.brightness);  // 应用持久化亮度（背光 PWM）
   mind.trust = laapTrust();        // 小凌⑥: 启动时取回持久化信任值

@@ -26,11 +26,12 @@
 #define CLR_PUPIL RGB565(8, 10, 18)
 #define CLR_DIM   RGB565(60, 70, 90)
 #define CLR_TXT   RGB565(200, 210, 225)
-#define CLR_ENE   RGB565(255, 176, 32)   // 能量-橙
-#define CLR_CUR   RGB565(64, 200, 255)   // 好奇-青
-#define CLR_SOC   RGB565(255, 96, 200)   // 社交-粉
-#define CLR_SEC   RGB565(96, 128, 255)   // 安全-蓝
-#define CLR_EXP   RGB565(96, 230, 128)   // 表达-绿
+// 需求条莫兰迪柔和色（低饱和，深底不刺眼）
+#define CLR_ENE   RGB565(224, 158, 106)   // 能量-暖杏
+#define CLR_CUR   RGB565(118, 178, 205)   // 好奇-雾蓝
+#define CLR_SOC   RGB565(198, 134, 170)   // 社交-藕粉
+#define CLR_SEC   RGB565(128, 158, 200)   // 安全-灰蓝
+#define CLR_EXP   RGB565(136, 186, 140)   // 表达-豆绿
 
 class LaapDisplay {
 public:

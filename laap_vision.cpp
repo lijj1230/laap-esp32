@@ -40,9 +40,12 @@ static bool pca9557Pwdn(bool level) {
   return Wire.endTransmission() == 0;
 }
 
+// 摄像头 SCCB 复用主 I2C（SDA=1 SCL=2）。曾试过自建 port1 legacy 总线 +
+// sccb_i2c_port=1（xiaozhi 同款），但 Arduino 构建的 esp32-camera 预编译库与之
+// 不兼容直接 abort——回退到 port0 复用（识别可能失败但不崩，视觉后端本就未配置）。
 bool LaapVision::begin() {
   _ok = false;
-  pca9557Pwdn(true);                    // 退出掉电
+  pca9557Pwdn(false);                   // 上电：PWDN 拉低退出掉电（xiaozhi SetOutputState(2,0) 同款极性）
   delay(10);
   camera_config_t c = {};
   c.ledc_channel = LEDC_CHANNEL_1;      // LEDC_CH0 归屏幕背光
@@ -51,7 +54,7 @@ bool LaapVision::begin() {
   c.pin_d4 = V_PIN_D4;  c.pin_d5 = V_PIN_D5;  c.pin_d6 = V_PIN_D6;  c.pin_d7 = V_PIN_D7;
   c.pin_xclk = V_PIN_XCLK; c.pin_pclk = V_PIN_PCLK;
   c.pin_vsync = V_PIN_VSYNC; c.pin_href = V_PIN_HREF;
-  c.pin_sccb_sda = -1;                  // 用已初始化的 I2C
+  c.pin_sccb_sda = -1;                  // SCCB 复用已初始化的 I2C（识别失败不崩，见上注）
   c.pin_sccb_scl = 2;
   c.sccb_i2c_port = 0;
   c.pin_pwdn = -1; c.pin_reset = -1;    // PWDN 手动经 PCA9557

@@ -254,9 +254,8 @@ void LaapDisplay::thinkingPulse() {
   fillRect(x, 118, 6, 4, CLR_DIM);
 }
 
-// ================= 需求条（状态区：带标签横排，全宽可读） =================
+// ================= 需求条（状态区：圆点图标 + 柔和圆头条） =================
 void LaapDisplay::drawNeeds(float energy, float curiosity, float social, float security, float expression) {
-  // 5 行单列全宽：标签色块(22px) + 细条;  行高 10px 间隔紧凑
   struct { float v; uint16_t c; } bars[5] = {
     {energy,    CLR_ENE},
     {curiosity, CLR_CUR},
@@ -264,18 +263,26 @@ void LaapDisplay::drawNeeds(float energy, float curiosity, float social, float s
     {security,  CLR_SEC},
     {expression,CLR_EXP},
   };
-  const int bx = 12;                 // 左边距
-  const int bw = SZP_LCD_W - bx * 2; // 全宽
-  const int bh = 7, gap = 11;
+  const int bx = 14;                 // 左边距
+  const int bw = SZP_LCD_W - bx - 24;
+  const int bh = 6, gap = 10;
   fillRect(0, UI_NEEDS_Y - 4, SZP_LCD_W, UI_NEEDS_H + 8, CLR_BG);
   for (int i = 0; i < 5; i++) {
     int y = UI_NEEDS_Y + i * gap;
-    // 左侧标识色块（图标位）：当前需求颜色
-    fillRect(bx, y, 4, bh, bars[i].c);
-    // 底槽 + 值条
-    fillRect(bx + 10, y, bw - 10, bh, CLR_DIM);
-    int fw = (int)((bw - 10) * (bars[i].v > 1 ? 1 : bars[i].v));
-    if (fw > 0) fillRect(bx + 10, y, fw, bh, bars[i].c);
+    int cy = y + bh / 2;
+    // 左侧圆点图标（当前需求色）
+    fillCircle(bx + 3, cy, 3, bars[i].c);
+    // 底槽（暗色圆头感：两端各缩1px的细槽）
+    fillRect(bx + 12, y, bw - 12, bh, RGB565(38, 44, 60));
+    // 值条（同高同位，色条覆盖底槽）
+    int fw = (int)((bw - 12) * (bars[i].v > 1 ? 1 : bars[i].v));
+    if (fw > bh) {                      // 圆头：条两端盖同直径圆点
+      fillRect(bx + 12, y, fw, bh, bars[i].c);
+      fillCircle(bx + 12, cy, bh / 2, bars[i].c);
+      fillCircle(bx + 12 + fw, cy, bh / 2, bars[i].c);
+    } else if (fw > 0) {
+      fillRect(bx + 12, y, fw, bh, bars[i].c);
+    }
   }
 }
 

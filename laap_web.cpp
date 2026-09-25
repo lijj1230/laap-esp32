@@ -429,11 +429,16 @@ void LaapWeb::handleSave() {
 void LaapWeb::handleStatus() {
   String key = String(cfg.s.llmKey);
   String masked = key.length() ? (key.substring(0, 3) + "***" + key.substring(key.length() - 4 > 3 ? key.length() - 4 : 3)) : "";
-  // worldJson 的 "needs":{...} 是最后一个键：从 { 截到串尾即完整对象（原 +7 从冒号起产生 "needs"::）
+  // worldJson 形如 {"time":...,"needs":{...},"mood":"...","goal":"..."}
+  // needs 不是末键：从它的 { 截到配对的 }（内部无嵌套，第一个 } 即终点），避免把 mood/goal 重复拼进来多出一个 }
   String wj = mind.worldJson();
   int ns = wj.indexOf("\"needs\":");
-  String needs = (ns >= 0) ? wj.substring(ns + 8) : String("{}");
-  needs.trim();
+  String needs = String("{}");
+  if (ns >= 0) {
+    int ob = wj.indexOf('{', ns);
+    int cb = wj.indexOf('}', ob);
+    if (ob >= 0 && cb > ob) needs = wj.substring(ob, cb + 1);
+  }
   String j = String("{\"agent\":\"") + jsonEsc(cfg.s.agentName) +
     "\",\"owner\":\"" + jsonEsc(cfg.s.ownerName) +
     "\",\"mood\":\"" + mind.moodKey() + "\",\"mood_cn\":\"" + mind.moodCn() +
@@ -460,9 +465,9 @@ void LaapWeb::handleStatus() {
     ",\"brightness\":" + cfg.s.brightness +
     ",\"llm_continue\":" + cfg.s.llmContinue +
     ",\"llm_max_tokens\":" + cfg.s.llmMaxTokens +
-    ",\"search_keys\":\"" + jsonEsc(cfg.s.searchKeys) +
-    ",\"search_api\":\"" + jsonEsc(cfg.s.searchApi) +
-    ",\"voice_mode\":" + cfg.s.voiceMode +
+    ",\"search_keys\":\"" + jsonEsc(cfg.s.searchKeys) + "\"," +
+    "\"search_api\":\"" + jsonEsc(cfg.s.searchApi) + "\"," +
+    "\"voice_mode\":" + cfg.s.voiceMode +
     ",\"tts_channel\":" + cfg.s.ttsChannel +
     ",\"tts_voice\":\"" + jsonEsc(cfg.s.ttsVoice) +
     "\",\"tts_rate\":\"" + jsonEsc(cfg.s.ttsRate) +
@@ -479,9 +484,9 @@ void LaapWeb::handleStatus() {
     "\",\"vision_base\":\"" + jsonEsc(cfg.s.visionBase) +
     "\",\"vision_llm_base\":\"" + jsonEsc(cfg.s.visionLlmBase) +
     "\",\"vision_key_masked\":\"" + (String(cfg.s.visionKey).length() ? "已配置" : "") +
-    "\",\"vision_model\":\"" + jsonEsc(cfg.s.visionModel) +
-    "\",\"vision_ready\":" + (vision.available() ? "true" : "false") +
-    "\",\"voice_ready\":" + (voice.ready() ? "true" : "false") +
+    "\",\"vision_model\":\"" + jsonEsc(cfg.s.visionModel) + "\"," +
+    "\"vision_ready\":" + (vision.available() ? "true" : "false") +
+    ",\"voice_ready\":" + (voice.ready() ? "true" : "false") +
     ",\"vad_paused\":" + (voice.vadPaused() ? "true" : "false") +
     ",\"uptime_s\":" + String(millis() / 1000) +
     ",\"heap_kb\":" + String(ESP.getFreeHeap() / 1024) +
