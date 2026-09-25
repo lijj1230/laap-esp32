@@ -38,6 +38,7 @@
 #include "laap_search.h"
 #include "laap_vision.h"
 #include "laap_tools.h"
+#include "laap_touch.h"
 
 // ---------- 全局（定义在各模块 .cpp，头文件已 extern） ----------
 
@@ -46,6 +47,7 @@ static String g_lastExpr = "calm";
 static uint32_t g_lastTickMs = 0;
 static uint32_t g_lastConsumeMs = 0;   // 上次记忆压缩
 static bool g_imuOk = false;
+static bool g_touchOk = false;         // 板载电容触摸（FT6236/6336 @0x38）
 
 // 聊天成品回复（网页聊天异步取件：受理回执 + seq，页面轮询 /api/chat/reply）
 static uint32_t g_chatSeq = 0;
@@ -735,7 +737,7 @@ void serialCli() {
     if (!line.length()) continue;
     laapActivity();     // 串口打字也是交互
     if (line == "/help") {
-      Serial.println("命令: /status /touch(触觉实测) /screen N(息屏秒) /redraw(重画整屏) /portal(进配置热点) /mem(看记忆) /tick(手动心跳) /lcd /pa /imu /asrtest /reset(格式化)");
+      Serial.println("命令: /status /touch(摇晃实测) /touchpad(触摸屏实测) /screen N(息屏秒) /redraw(重画整屏) /i2cscan /portal(配置热点) /mem(看记忆) /tick(手动心跳) /lcd /pa /imu /asrtest /reset(格式化)");
       Serial.println("      直接打字回车 = 跟它说话（走完整对话链路）");
     } else if (line == "/touch") {
       // 触觉实测：5 秒采样，摇晃/扣翻板子看峰值与判定
@@ -788,6 +790,41 @@ void serialCli() {
       webui.beginAP();
     } else if (line == "/lcd") {
       Serial.println("[LCD] " + display.lcdDiag());
+    } else if (line == "/touchpad") {
+      // 触摸屏实测：8 秒采样，点屏幕看有没有触点
+      if (!g_touchOk) Serial.println("[触摸] 未检测到触摸芯片（0x38 无应答）——先跑 /i2cscan 确认");
+      else {
+        Serial.printf("[触摸] 芯片 0x38：模式=0x%02X 阈值=0x%02X\n", touchReg(0x00), touchReg(0x80));
+        Serial.println("[触摸] 8 秒采样中：现在用手指点/按屏幕…");
+        uint32_t t0 = millis(); int lastx = -1, lasty = -1, hits = 0;
+        while (millis() - t0 < 8000) {
+          uint8_t raw[5]; touchReadRaw(raw);
+          int n = raw[0] & 0x0F;
+          if (n) {
+            int x = ((raw[1] & 0x0F) << 8) | raw[2], y = ((raw[3] & 0x0F) << 8) | raw[4];
+            hits++;
+            if (abs(x - lastx) > 3 || abs(y - lasty) > 3 || hits == 1) {
+              Serial.printf("  触点 %d: x=%d y=%d（事件=%d）\n", n, x, y, (raw[1] >> 6) & 3);
+              lastx = x; lasty = y;
+            }
+          }
+          delay(20);
+        }
+        Serial.printf("[触摸] 8 秒采到 %d 次触点 → %s\n", hits,
+                      hits ? "触摸屏工作正常（以后点屏幕它就会回应）"
+                           : "没采到触点（手没点到屏上？还是这块屏不是触摸屏）");
+      }
+    } else if (line == "/i2cscan") {
+      // I2C 总线扫描（找外设真身：PCA9557/ES8311/ES7210/QMI8658/摄像头 以及可能的触摸芯片）
+      Serial.print("[I2C] 扫描 0x08-0x77:");
+      int found = 0;
+      for (uint8_t a = 0x08; a < 0x78; a++) {
+        Wire.beginTransmission(a);
+        if (Wire.endTransmission() == 0) { Serial.printf(" 0x%02X", a); found++; }
+      }
+      Serial.printf("  共 %d 个\n", found);
+      Serial.println("[I2C] 已知: 0x19=PCA9557(IO扩展) 0x18=ES8311(喇叭) 0x40=ES7210(麦克风) 0x6A=QMI8658(IMU) 0x21=GC0308(摄像头)");
+      Serial.println("[I2C] 触摸常见: 0x38/0x39=FT6236/FT6336  0x15=CST816  0x5D=GT911  0x48/0x49=NS2009");
     } else if (line == "/redraw") {
       display.repaint();   // 重画 表情+顶栏+底栏IP（屏幕状态异常时的复位手势）
       Serial.println("[LCD] 已重画整屏（表情 + 顶栏 + 底栏 IP）");
@@ -907,6 +944,8 @@ void setup() {
   mind.begin();
   g_imuOk = imuInit();
   if (!g_imuOk) Serial.println("[LAAP] IMU 未找到（不影响运行）");
+  g_touchOk = touchInit();     // 触摸芯片复用 display.begin() 初始化的 Wire
+  if (!g_touchOk) Serial.println("[LAAP] 触摸屏未响应（0x38 无应答，不影响运行）");
 
   bool firstBreath = (memory.eventCount() == 0);
   if (firstBreath) {
@@ -959,15 +998,33 @@ static uint32_t g_shakeWindowMs = 0;
 static bool g_facedown = false;           // 当前是否扣伏
 static uint32_t g_facedownMs = 0;
 
+// 身体层即时反馈（摸/摇/翻）：表情 + 一句本地短语 + 记事件，全部本地完成。
+// 原来这些事件走 arisExpress→后台 LLM：LLM 忙时 llmSubmit 失败=毫无反应；且 tickle/makeup
+// 不在 drawFace 的表情表里（会渲染成 calm），用户看到的就是"摸了摇了都没反馈"。
+void laapLocalReact(const char* kind) {
+  const char* face = "curious";
+  String line = "嗯？";
+  if (!strcmp(kind, "tickle"))        { face = "excited"; line = "哎呀，别摇啦～"; }
+  else if (!strcmp(kind, "facedown")) { face = "anxious"; line = "闷……看不见你了。"; }
+  else if (!strcmp(kind, "makeup"))   { face = "happy";   line = "哦，亮了，好受点了。"; }
+  else if (!strcmp(kind, "touch"))    { face = "curious"; line = "嗯？你戳我。"; }
+  Serial.printf("[触觉] 反馈[%s]: %s\n", kind, line.c_str());
+  memory.logEvent("event", line);
+  g_lastSay = line;
+  g_lastExpr = face;
+  display.drawFace(face);
+  voice.speak(line, face);
+}
+
 void touchGestures() {
   if (!g_imuOk) return;
   float x, y, z;
   imuReadAccel(x, y, z);
   if (z < -8) return;                     // IMU 无效
 
-  // ---- 摇晃检测：|加速度方向漂移|，1.5s 窗口计 3 次强晃 = 事件 ----
+  // ---- 摇晃检测：1.5s 窗口累计 3 次强晃 = 事件（阈值 0.55→0.35：原来轻摇完全测不到） ----
   float mag = sqrtf(x * x + y * y + z * z);
-  bool strongShake = fabsf(mag - 1.0f) > 0.55f;
+  bool strongShake = fabsf(mag - 1.0f) > 0.35f;
   if (strongShake) {
     if (g_shakeWindowMs == 0) g_shakeWindowMs = millis();
     g_shakeCount++;
@@ -977,7 +1034,7 @@ void touchGestures() {
         Serial.println("[触觉] 摇晃 → 撒娇反应");
         laapActivity();
         mind.onUserInteraction();
-        arisExpress(true, "tickle");      // 主人在逗它
+        laapLocalReact("tickle");         // 身体即时反馈（不等 LLM：LLM 忙/挂时也一定有反应）
       }
     }
   } else if (g_shakeWindowMs && millis() - g_shakeWindowMs > 1500) {
@@ -989,15 +1046,14 @@ void touchGestures() {
   if (down && !g_facedown) {
     g_facedown = true; g_facedownMs = millis();
     Serial.println("[触觉] 被扣在桌上 → 生气");
-    memory.logEvent("event", "被扣在桌上，有点生气。");
     mind.onError();                        // 安全需求受挫
+    laapLocalReact("facedown");            // 有声音反馈（画面随即被装死黑屏盖掉）
   } else if (!down && g_facedown) {
     g_facedown = false;
     laapActivity();                        // 被翻回来=有人在动它
     if (millis() - g_facedownMs > 2000) {  // 扣了 2 秒以上才算真生气过
       Serial.println("[触觉] 翻回来了 → 和好");
-      memory.logEvent("event", "被翻回来了，气消了一半。");
-      arisExpress(true, "makeup");
+      laapLocalReact("makeup");
     }
   }
   // 扣伏期间闭眼装死：只在状态切换时画一帧（原来每帧 clear = 10ms 一次全屏 SPI 空转）
@@ -1036,6 +1092,24 @@ void loop() {
   audio.paTick();     // 功放空闲关断（流式播放间隔中保持开启）
   llmHarvest();       // F4: 收割后台 LLM 结果
   touchGestures();    // F5: 摇晃/翻面触觉（每帧，内部自带节流）
+
+  // F5b: 电容触摸屏——点一下=戳它。按下沿触发；息屏时第一次触摸只唤醒（防误触乱说话）
+  { static bool s_wasTouch = false; static uint32_t s_lastTouchReact = 0;
+    int tx = 0, ty = 0;
+    bool nowTouch = g_touchOk && touchRead(tx, ty);
+    if (nowTouch && !s_wasTouch) {
+      bool wasAsleep = !display.screenOn();
+      laapActivity();
+      if (!wasAsleep && millis() - s_lastTouchReact > 1500) {
+        s_lastTouchReact = millis();
+        Serial.printf("[触觉] 触摸屏 (%d,%d)\n", tx, ty);
+        mind.onUserInteraction();
+        laapLocalReact("touch");
+      } else if (wasAsleep) {
+        Serial.println("[触觉] 触摸唤醒屏幕");
+      }
+    }
+    s_wasTouch = nowTouch; }
 
   // 有人对着麦克风说话 = 活动（VAD 电平沿触发，避免每帧刷屏）
   { static bool s_wasSpeech = false;

@@ -32,9 +32,9 @@
 #define CLR_SOC   RGB565(198, 134, 170)   // 社交-藕粉
 #define CLR_SEC   RGB565(128, 158, 200)   // 安全-灰蓝
 #define CLR_EXP   RGB565(136, 186, 140)   // 表达-豆绿
-// 顶栏文字（低饱和莫兰迪灰，深底不刺眼；时间最亮、状态次之、说明文字最弱）
-#define CLR_TIME  RGB565(198, 192, 176)   // 时间-暖米灰
-#define CLR_META  RGB565(132, 138, 152)   // 状态指标-冷灰蓝
+// 顶栏文字（低饱和莫兰迪灰：柔和但必须看得清——第一版 132,138,152 实测"太淡"）
+#define CLR_TIME  RGB565(214, 208, 192)   // 时间-暖米灰（主信息）
+#define CLR_META  RGB565(164, 170, 184)   // 状态指标-冷灰蓝（次信息）
 
 class LaapDisplay {
 public:

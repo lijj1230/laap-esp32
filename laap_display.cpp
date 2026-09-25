@@ -371,9 +371,9 @@ void LaapDisplay::drawTopStrip() {
     int w = 0; for (; *s; s++) w += ((*s == '.') ? 3 : 4) * sc; return w;
   };
   snprintf(buf, sizeof(buf), "%dC %ddB %uKB", (int)devTemp, devRssi, (unsigned)devHeapKb);
-  drawText3x5(6, 20, buf, dc, 2);
+  int x2 = drawText3x5(6, 20, buf, dc, 2) + 10;   // 按实际宽度接排：左段位数会变（信号 -100、堆 5 位）
   snprintf(buf, sizeof(buf), "%uh%02um", (unsigned)(devUpMin / 60), (unsigned)(devUpMin % 60));
-  drawText3x5(124, 20, buf, dc, 2);
+  drawText3x5(x2, 20, buf, dc, 2);
   if (devAccel > 0) {                                 // IMU 读数：静止 1.00g，晃动 1.5~3g
     snprintf(buf, sizeof(buf), "%.2fg", devAccel);
     drawText3x5(296 - tw(buf, 2), 20, buf, CLR_META, 2);   // 右对齐（数值跳动不左右抖）
