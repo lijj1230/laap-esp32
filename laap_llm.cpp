@@ -175,10 +175,13 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
   {   // 原文取证：判断"答非所问/截断/空回复"的第一现场
     String fin;
     extractStringField(payload, "finish_reason", fin);
-    if (content.length() == 0)
-      Serial.printf("[LLM] 警告: content 为空（finish=%s，思考吃满 max_tokens？）\n", fin.c_str());
-    else
-      Serial.printf("[LLM] 原文(finish=%s): %.160s\n", fin.c_str(), content.c_str());
+    Serial.printf("[LLM] 原文(finish=%s): %.160s\n", fin.c_str(), content.c_str());
+  }
+  // 空正文按失败处理：思考型模型（v4 系列默认开思考）会把 max_tokens 全花在思考上、
+  // content 返回空串。旧代码当成功 → 网页拿到空白气泡、TTS 无话可说（实测 2026-09-26）
+  if (content.length() == 0) {
+    lastError = "响应 content 为空（思考模型吃满 max_tokens？把单次回复上限调大试试）";
+    return r;
   }
   // 期望两行: 表情词\n要说的话（宽松解析）
   content.trim();
@@ -219,8 +222,14 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
 
 bool LlmClient::ping(String& reply) {
   LlmReply r = chat("你是测试助手。只回复两个字：正常", "ping", 16, 0.1f);
-  reply = r.ok ? r.say : lastError;
-  return r.ok;
+  if (r.ok) { reply = r.say; return true; }
+  // 空正文（思考模型吃满 max_tokens）说明"网络与鉴权都通、只是这次没吐字"——连通性算通过
+  if (lastError.indexOf("content 为空") >= 0) {
+    reply = "连接与鉴权正常，但模型这次没吐正文（多半是思考型模型把 max_tokens 花在思考上，建议把「单次回复上限」调大）";
+    return true;
+  }
+  reply = lastError;
+  return false;
 }
 
 // UTF-8 安全截断：len 字节上限处回退到字符边界（不切碎中文）

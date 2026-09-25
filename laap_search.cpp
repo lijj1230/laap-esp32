@@ -375,12 +375,24 @@ String LaapSearch::search(const String& query, int maxHit, int maxLen) {
     else { snprintf(buf, sizeof(buf), "%%%02X", (unsigned char)c); q += buf; }
   }
 
+  // DDG 在国内长期不可达：连败 2 次后 10 分钟内直接跳过（省掉每次 ~6 秒白等），到期自动放行重试
+  static uint8_t s_ddgFail = 0;
+  static uint32_t s_ddgSkipMs = 0;
+  bool ddgSkip = (s_ddgFail >= 2) && (millis() - s_ddgSkipMs < 600000UL);
+
   String r = searchCustom(q, maxHit, maxLen);
   if (r.length()) return r;
   String err1 = lastError;
-  r = searchDdg(q, maxHit, maxLen);
-  if (r.length()) return r;
-  String err2 = lastError;
+  String err2;
+  if (ddgSkip) {
+    err2 = "DDG跳过(连败退避)";
+  } else {
+    r = searchDdg(q, maxHit, maxLen);
+    if (r.length()) return r;
+    err2 = lastError;
+    s_ddgFail++; s_ddgSkipMs = millis();
+    if (s_ddgFail >= 2) Serial.println("[SEARCH] DDG 连败，10 分钟内跳过它");
+  }
   r = searchBing(q, maxHit, maxLen);
   if (r.length()) return r;
   lastError = err1 + " | " + err2 + " | " + lastError;

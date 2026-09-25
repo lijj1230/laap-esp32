@@ -122,7 +122,7 @@ async function sendChat(){
    for(let i=0;i<30;i++){
     await new Promise(s=>setTimeout(s,1500));
     const q=await (await fetch('/api/chat/reply')).json();
-    if(q.seq>r.seq){got=true;tip.className='aris';tip.textContent='Aris: '+q.reply;break;}
+    if(q.seq>r.seq){got=true;tip.className='aris';tip.textContent='Aris: '+(q.reply||'（它想了半天，没说出来）');break;}
    }
    if(!got)tip.textContent='（还在想，稍后看上面"它最近说"）';
   }else{tip.className='aris';tip.textContent='Aris: '+r.reply;}

@@ -2,6 +2,9 @@
 #include "laap_audio.h"
 #include "laap_display.h"
 #include "laap_config.h"
+#include "laap_llm.h"      // utf8Cut
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
 
 // ================= 匹配器 =================
 static bool containsAny(const String& text, const char* const* words, int n) {
@@ -89,7 +92,147 @@ void laapToolsInit() {
   Serial.printf("[TOOLS] %d 个语音工具就绪（音量/亮度）\n", kToolN);
 }
 
+// ================= 天气快问（联网，不经过大模型） =================
+// 根因备注：让大模型从搜索结果里"自己得出天气"时，它常因自身人设（无联网能力的生命体）
+// 回答"我查不到/我没有联网能力"。端侧直接取一行纯文本天气更稳更快（2026-09-26）。
+static String httpGetText(const String& host, const String& path, int timeoutMs) {
+  WiFiClientSecure cli;
+  cli.setInsecure();                    // 端侧自签策略，见 README
+  cli.setTimeout(timeoutMs);
+  if (!cli.connect(host.c_str(), 443)) return "";
+  cli.print(String("GET ") + path + " HTTP/1.1\r\nHost: " + host +
+            "\r\nUser-Agent: curl/8.0\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+  String resp; resp.reserve(2048);
+  uint32_t deadline = millis() + timeoutMs;
+  while (cli.connected() && millis() < deadline) {
+    while (cli.available()) { resp += (char)cli.read(); if (resp.length() > 6000) break; }
+    if (resp.length() > 6000) break;
+    delay(2);
+  }
+  cli.stop();
+  int sp = resp.indexOf(' ');
+  int status = (sp > 0) ? resp.substring(sp + 1, sp + 4).toInt() : 0;
+  if (status != 200) { Serial.printf("[WEA] HTTP %d\n", status); return ""; }
+  int bs = resp.indexOf("\r\n\r\n");
+  return (bs > 0) ? resp.substring(bs + 4) : String("");
+}
+
+// wttr.in 可能用 chunked；把分块壳剥掉（首行是纯十六进制长度才算）
+static String dechunk(const String& in) {
+  int nl = in.indexOf("\r\n");
+  if (nl <= 0) return in;
+  String first = in.substring(0, nl);
+  for (unsigned int i = 0; i < first.length(); i++)
+    if (!isHexadecimalDigit(first[i])) return in;
+  String out; int pos = 0;
+  while (pos < (int)in.length()) {
+    int e = in.indexOf("\r\n", pos);
+    if (e < 0) break;
+    long n = strtol(in.substring(pos, e).c_str(), nullptr, 16);
+    if (n <= 0) break;
+    int s = e + 2;
+    out += in.substring(s, s + n);
+    pos = s + n + 2;
+  }
+  return out.length() ? out : in;
+}
+
+// 从"北京今天天气怎么样"里抠城市名（剥掉问句壳与天气词），空=按出口 IP 定位
+static String weatherCityOf(const String& text) {
+  static const char* junk[] = {"今天","明天","后天","现在","目前","最近","怎么样","怎样","如何","咋样",
+                               "查一下","查查","帮我","帮忙","看看","一下","天气","气温","预报","下雨",
+                               "下雪","冷不冷","热不热","的","呢","吗","呀","啊","？","?"," "};
+  String s = text;
+  for (auto j : junk) s.replace(j, "");
+  s.trim();
+  if (s.length() > 12) s = utf8Cut(s, 12);
+  return s;
+}
+
+// wttr.in 的天气描述是英文（lang=zh 对 %C 不生效）→ 端侧转中文。
+// 用"强度前缀 + 天气类型"组合而非穷举表：wttr 的措辞有上百种组合，穷举必漏
+// （实测漏过 "Smoky haze"、"Moderate rain at times"）。
+static String cnWeather(const String& en) {
+  String s = en; s.toLowerCase();
+  if (s.indexOf("thunder") >= 0) return "雷阵雨";
+  if (s.indexOf("blizzard") >= 0) return "暴雪";
+  String inten;                                   // 强度前缀
+  if (s.indexOf("torrential") >= 0)      inten = "暴";
+  else if (s.indexOf("heavy") >= 0)      inten = "大";
+  else if (s.indexOf("moderate") >= 0)   inten = "中";
+  else if (s.indexOf("light") >= 0 || s.indexOf("patchy") >= 0) inten = "小";
+  static const struct { const char* k; const char* v; } kTypes[] = {
+    {"smoky haze", "烟霾"}, {"haze", "霾"}, {"mist", "薄雾"}, {"fog", "雾"},
+    {"freezing drizzle", "冻毛毛雨"}, {"freezing rain", "冻雨"},
+    {"sleet", "雨夹雪"}, {"drizzle", "毛毛雨"}, {"rain", "雨"}, {"snow", "雪"},
+    {"dust", "浮尘"}, {"sand", "沙尘"}, {"smoke", "烟"},
+    {"overcast", "阴"}, {"cloudy", "多云"}, {"sunny", "晴"}, {"clear", "晴"},
+    {"windy", "风大"}, {"breezy", "微风"},
+  };
+  for (auto& t : kTypes)
+    if (s.indexOf(t.k) >= 0) return inten + t.v;
+  return en;   // 没命中保留英文，总比没有强
+}
+
+static String weatherReport(const String& city) {
+  // 5 分钟缓存：连着问不重复打网络
+  static String cCity; static String cText; static uint32_t cMs = 0;
+  if (cText.length() && cCity == city && millis() - cMs < 300000UL) return cText;
+  String path = "/" + city + "?format=%C+%t&lang=zh";
+  String enc; char buf[8];
+  for (unsigned int i = 0; i < path.length(); i++) {
+    char c = path[i];
+    if (isalnum((unsigned char)c) || strchr("-_.~/?=&+", c)) enc += c;   // "+" 是 wttr 格式串分隔符，不能转义
+    else { snprintf(buf, sizeof(buf), "%%%02X", (unsigned char)c); enc += buf; }
+  }
+  String body = dechunk(httpGetText("wttr.in", enc, 6000));
+  body.trim();
+  int nl = body.indexOf('\n');
+  if (nl > 0) body = body.substring(0, nl);
+  body.trim();
+  if (!body.length()) return "";
+  // 形如 "Moderate rain at times\t+24°C"（注意 wttr 用制表符分隔，不能只按空格切）
+  String temp, cond = body;
+  int deg = body.indexOf("°");   // 必须用字符串：'°' 是多字节字面量，会被截成 0xB0 而误匹配续字节
+  if (deg > 0) {
+    // 温度 token 起点：往前退到"分隔符"为止。wttr 的分隔符可能是空格/制表符/不间断空格，
+    // 所以除列出的空白外，遇到任何非 ASCII 字节也立刻停（绝不吃进中文/emoji）
+    int st = deg;
+    while (st > 0) {
+      unsigned char c = (unsigned char)body[st - 1];
+      if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == 0xA0 || c >= 0x80) break;
+      st--;
+    }
+    int en2 = deg;                                 // 终点：往后到空白或结尾
+    while (en2 < (int)body.length()) {
+      unsigned char c = (unsigned char)body[en2];
+      if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == 0xA0) break;
+      en2++;
+    }
+    temp = body.substring(st, en2);
+    cond = body.substring(0, st);
+  }
+  cond.trim(); temp.trim();
+  Serial.printf("[WEA] raw=%s | cond=%s | temp=%s\n", body.c_str(), cond.c_str(), temp.c_str());
+  if (temp.length()) { temp.replace("+", ""); temp.replace("°C", "度"); }   // TTS 友好："24度"
+  String out = cnWeather(cond);
+  if (temp.length()) out += " " + temp;
+  cCity = city; cText = out; cMs = millis();
+  return out;
+}
+
 String laapToolsDispatch(const String& text) {
+  // 天气优先（联网快问）：设备上"查天气"最稳的一条路
+  static const char* wkeys[] = {"天气", "气温", "下雨", "下雪", "冷不冷", "热不热", "weather"};
+  if (containsAny(text, wkeys, 7)) {
+    String city = weatherCityOf(text);
+    Serial.printf("[TOOLS] weather: 城市「%s」\n", city.length() ? city.c_str() : "(按出口IP定位)");
+    String cond = weatherReport(city);
+    if (!cond.length()) return "网络这会儿不太顺，天气没查着，过会儿再问我一次吧。";
+    String say = city.length() ? (city + "现在" + cond) : ("你那边现在" + cond);
+    Serial.printf("[TOOLS] weather → %s\n", say.c_str());
+    return say;
+  }
   for (int i = 0; i < kToolN; i++) {
     ToolMatch m;
     if (!toolMatchSentence(kTools[i], text, m)) continue;

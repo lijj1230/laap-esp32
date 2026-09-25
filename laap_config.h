@@ -20,7 +20,7 @@ struct LaapSettings {
   uint8_t brightness = 90;                          // 屏幕亮度(0-100, 背光PWM)
   uint16_t screenOffSec = 60;                       // 静默息屏秒数(0=不息屏)
   uint8_t llmContinue = 1;                          // 输出截断自动续写轮数(0=关, 最多3)
-  uint16_t llmMaxTokens = 220;                      // 单次回复 maxTokens(80-1000, 聊天/表达/独白共用)
+  uint16_t llmMaxTokens = 500;                      // 单次回复 maxTokens(80-1000, 聊天/表达/独白共用；思考型模型会先花 token 思考，过小会空回复)
   // 小凌⑥: 信任标量（NVS 键 trust，0..255 ↔ 0..1）——读写走 laapTrust()/laapTrustSet()
   // 注入提示词前由主程序把 laapTrust() 拷进 mind.trust；cfg.save() 时从 mind.trust 取回
   char searchKeys[193] = "什么,怎么,如何,为什么,为啥,多少,几,哪,新闻,今天,最新,查,搜索,search,who,what,how,why,when,news"; // 聊天搜索触发词(逗号分隔,空=关)

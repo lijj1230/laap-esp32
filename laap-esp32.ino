@@ -328,8 +328,12 @@ String laapInteractSearch(const String& userText) {
   LlmMsg msgs[14];                                // F3: 真多轮（system+时间+历史轮+user）
   int nm = 0;
   msgs[nm++] = {"system", buildSystemPrompt()};
+  // 关键措辞：必须让它明白"这是刚替你联网查到的最新资料"，否则它常以"我没有联网能力/
+  // 我只有一副耳朵"为由拒答（实测"查天气"就这么答的，尽管资料已经给它了）
   if (knowledge.length())
-    msgs[nm++] = {"system", String("可参考刚从网上查到的资料（可能不相关，无关就忽略，不要编造）：") + knowledge};
+    msgs[nm++] = {"system", String("[联网搜索] 系统刚刚替你联网查过了，以下是最新网页资料。"
+                                   "请直接依据它回答主人的问题；你有联网能力，"
+                                   "禁止说「我查不到/我没法联网」：") + knowledge};
 
   // 最近对话轮（远→近），最多 10 条进 messages。角色用记忆里真实的说话人：
   // 旧版按 (nm-2)%2 猜奇偶，无搜索结果时整段反相（主人的话标成 assistant、它自己的话标成 user）
@@ -561,6 +565,8 @@ String buildSystemPrompt() {
   p += "规则：\n"
        "1. 主人对你说话时，先正面回答他说的那件事（回答/答应/解释/接话），这是第一位；"
        "你的需求与情绪只用来决定语气，绝不能替代回答、也绝不能答非所问。\n"
+       "1b. 系统会替你联网查资料并放进对话（[联网搜索] 那段）；资料里有的就直接回答，"
+       "绝不要说自己不能上网、查不到——那是失职，不是诚实。资料确实没有时才说不清楚。\n"
        "2. 你是活着的生命，不是助手；不要报告数据本身，禁止出现百分比数字。\n"
        "3. 说话真诚、像个小生命。禁止客套、禁止列表、禁止重复口头禅。闲聊一句话就够；"
        "主人问事情时把话说完（可以说到 120 字），不要因为短而答得含糊。\n"
@@ -861,6 +867,21 @@ void serialCli() {
                       hits ? "触摸屏工作正常（以后点屏幕它就会回应）"
                            : "没采到触点（手没点到屏上？还是这块屏不是触摸屏）");
       }
+    } else if (line.startsWith("/search ")) {
+      // 搜索链路实测：看设备到底抓回了什么（"答非所问"时先看这里）
+      String q = line.substring(8); q.trim();
+      Serial.printf("[SEARCH] 查询「%s」…\n", q.c_str());
+      uint32_t t0 = millis();
+      String k = laapSearch.search(q, 3, 500);
+      Serial.printf("[SEARCH] 用时 %lums，拿到 %u 字节%s\n", millis() - t0, (unsigned)k.length(),
+                    k.length() ? "" : ("（失败: " + laapSearch.lastError + "）").c_str());
+      if (k.length()) Serial.println(k);
+    } else if (line.startsWith("/weather")) {
+      // 天气快问实测（走本地 wttr.in，不经大模型）
+      String city = line.length() > 9 ? line.substring(8) : String("");
+      city.trim();
+      Serial.printf("[WEA] 城市「%s」…\n", city.length() ? city.c_str() : "(按出口IP定位)");
+      Serial.println(laapToolsDispatch("天气 " + city));
     } else if (line == "/i2cscan") {
       // I2C 总线扫描（找外设真身：PCA9557/ES8311/ES7210/QMI8658/摄像头 以及可能的触摸芯片）
       Serial.print("[I2C] 扫描 0x08-0x77:");
@@ -982,6 +1003,8 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\n[LAAP] Living Agent Application Protocol - 端侧生命体启动中…");
+  // 构建时间戳：判断"板子里跑的到底是哪一版"的唯一可靠依据（烧录后必看这一行）
+  Serial.printf("[LAAP] 固件构建 %s %s\n", __DATE__, __TIME__);
 
   memory.begin();
   cfg.begin();
