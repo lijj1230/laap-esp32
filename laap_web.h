@@ -43,6 +43,9 @@ private:
   void handleFeedback();      // 网页 👍/👎 反馈
   void handleSnapshots();     // "自我"文件快照列表
   void handleSnapRestore();   // 快照恢复（恢复后重启）
+  void handleRulesApi();      // 行为规则文本（记忆页展示）
+  void handleSkillsApi();     // 口令技能列表（记忆页展示）
+  void handleRulesReflect();  // 立刻归纳一轮规则
   void handleNotFound();
 
   WebServer server{80};
@@ -65,3 +68,4 @@ bool laapChatPending();       // 上一次 laapInteractSearch 是否丢给了后
 bool laapReplySpoken();       // 上一次是否已自己念过（本地直答：工具指令 / 看东西）
 String laapLastUserText();    // 最近一轮主人原话（反馈落盘用）
 String laapIdleInfo();        // 独白计时诊断（"还差多久冒泡"）
+void rulesReflect(bool force);// 立刻归纳一轮行为规则（记忆页"立刻归纳"按钮用）

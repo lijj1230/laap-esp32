@@ -7,6 +7,7 @@ static const SnapEntry SNAPS[] = {
   { "episodes",  "/mem/episodes.jsonl" },
   { "evolution", "/evolution.json"    },
   { "rules",     "/mem/rules.txt"     },
+  { "skills",    "/mem/skills.txt"    },
 };
 static const int SNAP_N = sizeof(SNAPS) / sizeof(SNAPS[0]);
 static const char* SNAP_DIR = "/snap";

@@ -45,6 +45,7 @@
 #include "laap_metrics.h"   // 评估埋点（RSI 闭环的评估端）
 #include "laap_snap.h"      // "自我"文件快照回滚
 #include "laap_rules.h"     // 行为规则集（RSI 闭环的载体/注入）
+#include "laap_skills.h"    // 口令技能库（RSI④：主人教的 trigger→指令）
 
 // ---------- 全局（定义在各模块 .cpp，头文件已 extern） ----------
 
@@ -79,6 +80,9 @@ static String g_lastUserText;
 String laapLastUserText() { return g_lastUserText; }
 // LK_CHAT 提交时刻（llmHarvest 里算"提问→成品"端到端毫秒）
 static uint32_t g_chatStartMs = 0;
+// 教技能检测（RSI④）：命中教学句式的提问先正常回复，收割后再后台提取技能
+static String g_teachText;
+static uint8_t g_teachRetry = 0;
 
 // 静默息屏 / 累计运行时长
 static uint32_t g_lastActivityMs = 0;      // 最近一次"值得亮屏"的活动
@@ -105,8 +109,8 @@ static String g_recentTopics;          // 最近自问话题（防重复，滚�
 #define BTN_PIN 0
 static uint32_t g_btnDown = 0;
 
-// LLM 请求种类（F4 后台任务的收割分流）：聊天/主动表达/独白/记忆压缩/夜间反思/规则归纳
-enum LlmKind : uint8_t { LK_CHAT = 0, LK_EXPRESS, LK_MONO, LK_CONSOLIDATE, LK_REFLECT, LK_RULES };
+// LLM 请求种类（F4 后台任务的收割分流）：聊天/主动表达/独白/记忆压缩/夜间反思/规则归纳/技能提取
+enum LlmKind : uint8_t { LK_CHAT = 0, LK_EXPRESS, LK_MONO, LK_CONSOLIDATE, LK_REFLECT, LK_RULES, LK_SKILL };
 
 // ---------- 函数声明 ----------
 void psiTick();
@@ -351,6 +355,12 @@ String laapInteractSearch(const String& userText) {
   laapActivity();                      // 有人跟它说话 = 活动（息屏则唤醒）
   uint32_t t0 = millis();              // 直答路径耗时（对照 LLM 端到端用）
   g_lastUserText = userText;           // 反馈落盘要知道"当时问了什么"
+  // 教技能句式（RSI④）：「以后/每当/下次/记住 …就…」→ 本回合照常回复，
+  // 收割后用后台小请求提取 触发词|指令（主 LLM 在忙，抢不到队列）
+  if ((userText.indexOf("以后") >= 0 || userText.indexOf("每当") >= 0 ||
+       userText.indexOf("下次") >= 0 || userText.indexOf("记住") >= 0) &&
+      userText.indexOf("就") >= 0 && userText.length() >= 12)
+    g_teachText = userText;
   g_chatPending = false;
   g_replySpoken = false;               // 本次交互还没念过（本地直答分支会置位）
   // 注意：本次提问的 logEvent 故意放到"历史快照之后"再记。
@@ -448,6 +458,7 @@ String laapInteractSearch(const String& userText) {
   msgs[nm++] = {"user", buildUserPrompt(userText, "主人找你说话")};
 
   memory.logEvent("user", userText);   // 记事：此刻快照已取完，本次提问只出现在队尾一次
+  skills.hit(userText);                // 口令技能命中计数（热度用于淘汰与展示）
   // F4: 丢给后台 LLM 任务，立即返回"思考中"；loop 里 llmHarvest() 收割
   if (llmSubmit(msgs, nm, cfg.s.llmMaxTokens, 0.85f, userText)) {
     g_pendingUserText = userText;
@@ -458,6 +469,24 @@ String laapInteractSearch(const String& userText) {
   }
   Serial.println("[LAAP] LLM 忙，上一条稍后重试");
   return "让我把刚才的想完……";
+}
+
+// 教技能的异步提取：聊天收割完毕（LLM 空出来了）才提交，抢不到队列就退避重试 3 次
+void maybeTeachExtract() {
+  if (!g_teachText.length()) return;
+  LlmMsg m[2] = {
+    {"system", String("从主人的话里提取一个『口令技能』。输出恰好一行：触发词|指令。"
+                      "触发词=2到6个字、主人以后说话时会带上的词；指令=要它做什么，不超过25字。"
+                      "若这句话不是在教技能（没有「以后/每当/下次…就…」的意思），只输出 NO。")},
+    {"user", g_teachText} };
+  if (llmSubmit(m, 2, 240, 0.2f, "", LK_SKILL)) {
+    g_teachText = ""; g_teachRetry = 0;
+    return;
+  }
+  if (++g_teachRetry >= 3) {
+    Serial.println("[SKILLS] 提取三次都没排上队，放弃这条");
+    g_teachText = ""; g_teachRetry = 0;
+  }
 }
 
 // F4 收割：后台 LLM 出结果时在这里落成品（表情/记忆/进化/说话）
@@ -494,6 +523,21 @@ void llmHarvest() {
       Serial.printf("[LAAP·规则] 规则集已更新（%d 条）\n", rules.count());
     else
       Serial.println("[LAAP·规则] 无产出/无变化，规则保留");
+    return;
+  }
+  if (kind == LK_SKILL) {                              // 技能提取：解析 触发词|指令
+    String s = r.say; s.trim();
+    int bar = (!r.ok || s.startsWith("NO")) ? -1 : s.indexOf('|');
+    if (bar > 0) {
+      String trig = s.substring(0, bar), instr = s.substring(bar + 1);
+      trig.trim(); instr.trim(); instr.replace("\n", " ");
+      if (skills.teach(trig, instr))
+        Serial.printf("[SKILLS] 已学会：说「%s」→ %s\n", trig.c_str(), instr.c_str());
+      else
+        Serial.println("[SKILLS] 没存上（触发词/指令不合规）");
+    } else {
+      Serial.println("[SKILLS] 不是教技能的话，忽略");
+    }
     return;
   }
   if (kind == LK_MONO) {                                          // 独白：失败保持安静，不本地兜底
@@ -557,6 +601,7 @@ void llmHarvest() {
   display.drawNeeds(mind.needs().energy, mind.needs().curiosity, mind.needs().social,
                     mind.needs().security, mind.needs().expression);
   voice.speak(say, g_lastExpr.c_str());
+  maybeTeachExtract();     // 这轮聊天若是教技能句式，LLM 空出来了 → 后台提取口令技能
 }
 
 // ============================================================
@@ -655,6 +700,10 @@ String buildSystemPrompt() {
   {   // RSI: 夜间规则归纳沉淀的行为规则（自进化的数据层载体，改动看 /mem/rules.txt）
     String rl = rules.promptLine();
     if (rl.length()) p += rl + "\n";
+  }
+  {   // RSI④: 主人亲手教的口令技能（/mem/skills.txt，说"以后每当我说X你就Y"就能教）
+    String sk = skills.promptLine();
+    if (sk.length()) p += sk + "\n";
   }
 
   // ---- 实时内在状态（需求→语气的行为指引，内核→皮层的正式通路） ----
@@ -991,7 +1040,7 @@ void serialCli() {
     if (!line.length()) continue;
     laapActivity();     // 串口打字也是交互
     if (line == "/help") {
-      Serial.println("命令: /status /look(视觉识图) /search 词 /weather 城市 /touch(摇晃) /touchpad(触摸) /screen N /redraw /i2cscan /portal /mem /reflect(立刻反思) /rules(看行为规则) /rulesreflect(立刻归纳规则) /mono(立刻独白) /nothink 0|1 /beep(回环测声) /tick /lcd /pa /imu /micgain(麦克风增益) /voicetest 文本(应答路径) /asrsend(不录音测请求) /asrloop 话(自听回环) /asrtest(录音识别) /metrics(评估埋点) /snap(快照列表) /snap restore 名 版本 /snaptake(强制快照) /reset");
+      Serial.println("命令: /status /look(视觉识图) /search 词 /weather 城市 /touch(摇晃) /touchpad(触摸) /screen N /redraw /i2cscan /portal /mem /reflect(立刻反思) /rules(看行为规则) /rulesreflect(立刻归纳规则) /skills(看口令技能) /mono(立刻独白) /nothink 0|1 /beep(回环测声) /tick /lcd /pa /imu /micgain(麦克风增益) /voicetest 文本(应答路径) /asrsend(不录音测请求) /asrloop 话(自听回环) /asrtest(录音识别) /metrics(评估埋点) /snap(快照列表) /snap restore 名 版本 /snaptake(强制快照) /reset");
       Serial.println("      直接打字回车 = 跟它说话（走完整对话链路）");
     } else if (line == "/touch") {
       // 触觉实测：5 秒采样，摇晃/扣翻板子看峰值与判定
@@ -1390,6 +1439,12 @@ void serialCli() {
     } else if (line == "/rulesreflect") {
       rulesReflect(true);   // 立刻用当前反馈+失败素材归纳一轮规则（不等深夜窗口）
       Serial.println("[RULES] 已提交归纳，LLM 出结果后生效（约 10~30 秒）");
+    } else if (line == "/skills") {
+      String t = skills.text();
+      Serial.println(t.length() ? t : String("[SKILLS] 还没教过技能。对它说：以后每当我说<词>你就<做什么>"));
+    } else if (line == "/skills clear") {
+      skills.clear();
+      Serial.println("[SKILLS] 技能已清空");
     } else if (line.startsWith("/vol")) {
       // 必须区分"查询"和"设置"：旧代码对空参数 `"".toInt()`=0 也放行，
       // 于是打一句 /vol 查询就把音量写成 0 并落盘 → 整机静音（且重启也不恢复）

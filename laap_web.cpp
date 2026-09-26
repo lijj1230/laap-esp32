@@ -12,6 +12,8 @@
 #include "laap_audio.h"
 #include "laap_metrics.h"
 #include "laap_snap.h"
+#include "laap_rules.h"
+#include "laap_skills.h"
 #include <WiFi.h>
 #include <ESPmDNS.h>
 
@@ -231,6 +233,9 @@ void LaapWeb::registerRoutes() {
   server.on("/api/feedback", HTTP_POST, [this]() { handleFeedback(); });
   server.on("/api/snapshots", HTTP_GET, [this]() { handleSnapshots(); });
   server.on("/api/snapshot/restore", HTTP_POST, [this]() { handleSnapRestore(); });
+  server.on("/api/rules", HTTP_GET, [this]() { handleRulesApi(); });
+  server.on("/api/skills", HTTP_GET, [this]() { handleSkillsApi(); });
+  server.on("/api/rulesreflect", HTTP_POST, [this]() { handleRulesReflect(); });
   server.onNotFound([this]() { handleNotFound(); });
   otaPending = false;
 }
@@ -676,13 +681,29 @@ void LaapWeb::handleMemoryPage() {
     "<div class='card'><b>⏪ 快照回滚</b>"
     "<div class='hint'>「自我」三件套（自我认知 / 情景记忆 / 性格进化）的自动快照，各留 3 版：自动档 12 小时一拍，清空记忆 / 导入记忆前会强制拍一份。恢复 = 把选中的版本拷回原位（现状先存成 .pre），然后设备自动重启。这是它「自我进化跑偏」时的后悔药。</div>"
     "<div id='snaps' style='margin-top:6px;font-size:13px;line-height:2.2'></div></div>"
+    "<div class='card'><b>🧠 学会的行为规则</b>"
+    "<div class='hint'>每晚用你的 👍/👎 和当天的失败记录自动归纳（也可点按钮立刻归纳）。点踩越多，它改得越准。</div>"
+    "<div id='rules' style='margin-top:6px;font-size:13px;white-space:pre-wrap;line-height:1.9'>…</div>"
+    "<button class='ghost' onclick='rulesref(event)' style='margin-top:8px'>立刻归纳一轮</button></div>"
+    "<div class='card'><b>🎯 口令技能</b>"
+    "<div class='hint'>对它说「以后每当我说<词>，你就<做什么>」就能教一个技能；以后它听到触发词就照做。</div>"
+    "<div id='skills' style='margin-top:6px;font-size:13px;white-space:pre-wrap;line-height:1.9'>…</div></div>"
     "<script>"
     "async function load(){const s=await (await fetch('/api/memory')).json();"
     "sem.textContent=s.semantic||'（还没有形成自我认知）';"
     "let h='';for(const e of s.events.slice(-40).reverse()){"
     "const c=e.r=='user'?'#9ae6b4':(e.r=='aris'?'#6fd3ff':'#8b95a8');"
     "h+='<div style=\"color:'+c+'\">['+e.r+'] '+e.x.replace(/</g,'&lt;')+'</div>';}"
-    "eps.innerHTML=h||'（空）';loadSnaps();}"
+    "eps.innerHTML=h||'（空）';loadSnaps();loadLearned();}"
+    "async function loadLearned(){try{"
+    "const r=await (await fetch('/api/rules')).json();"
+    "document.getElementById('rules').textContent=r.rules||'（还没有。点踩几次 + 点「立刻归纳」就有了）';"
+    "const s=await (await fetch('/api/skills')).json();"
+    "document.getElementById('skills').textContent=s.skills||'（还没教过。对它说：以后每当我说…你就…）';}catch(e){}}"
+    "async function rulesref(e){e.preventDefault();"
+    "if(!confirm('现在用当前反馈/失败素材归纳一轮规则?'))return;"
+    "try{const r=await (await fetch('/api/rulesreflect',{method:'POST'})).json();"
+    "alert(r.msg);}catch(err){alert('提交失败: '+err);}}"
     "async function loadSnaps(){try{const a=await (await fetch('/api/snapshots')).json();let h='';"
     "for(const s of a){h+='<div><b>'+s.name+'</b> <span style=\"color:#8b95a8;font-size:12px\">'+s.path+'</span> ';"
     "if(!s.v.length)h+='（还没有快照，写入一次后就会出现）';"
@@ -825,4 +846,22 @@ void LaapWeb::handleSnapRestore() {
   laapUptimePersist();
   delay(600);
   ESP.restart();
+}
+
+// ---- 学到的东西（规则 / 技能）----（记忆页展示 + 归纳按钮）
+void LaapWeb::handleRulesApi() {
+  server.send(200, "application/json",
+              String("{\"rules\":\"") + jsonEsc(rules.text()) + "\"}");
+}
+
+void LaapWeb::handleSkillsApi() {
+  server.send(200, "application/json",
+              String("{\"skills\":\"") + jsonEsc(skills.text()) + "\"}");
+}
+
+void LaapWeb::handleRulesReflect() {
+  // 与串口 /rulesreflect 同一条路：异步提交，10~30 秒后刷新页面看结果
+  rulesReflect(true);
+  server.send(200, "application/json",
+              "{\"ok\":true,\"msg\":\"已提交归纳，约 10~30 秒后生效，稍后刷新查看\"}");
 }
