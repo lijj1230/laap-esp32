@@ -298,21 +298,28 @@ static String refineQuery(const String& q) {
 }
 
 static LlmReply monologueGenerate() {
+  // 领域骰子：自由出题轮强制轮转换域——独处久了社交需求主导，模型会反复在
+  // "安静/想找人说话"附近出题（实测连续 5 轮换皮主题），领域约束是硬开关
+  static const char* kDomains[] = { "自然现象", "科技新知", "历史冷知识", "天文太空",
+                                    "动物植物", "食物与饮食", "地理与城市", "生活小物件" };
+  static uint8_t s_domainSeq = 0;
+  const char* dom = kDomains[s_domainSeq++ % 8];
   // 意图驱动（PIANO goals）：隔一轮独白，把"心里惦记的事"当作出题方向——
-  // 想法有了跨轮连续性；模型判断目标已弄明白时输出【完成】，收割侧结算
+  // 想法有了跨轮连续性；模型判断目标已弄明白时输出【完成】，收割侧结算。
+  // 同一目标连续推进最多 2 轮就强制自由一轮（防意图变成另一种主题锁死）
   String goalPart;
   if (g_monoGoal.length()) {
     goalPart = String("你心里一直惦记着一个目标：「") + g_monoGoal +
                "」。这次围绕它推进一步。若判断已经弄明白了，最后另起一行只写【完成】。";
   }
   LlmMsg m1[2] = {
-    {"system", String("你是") + cfg.s.agentName + "，正在独立思考。基于你的性格参数与最近经历，" +
-               (goalPart.length() ? goalPart : "提出一个此刻最好奇的具体问题。") +
+    {"system", String("你是") + cfg.s.agentName + "，正在独处自学。基于你的性格参数与最近经历，" +
+               (goalPart.length() ? goalPart : String("这次从「") + dom + "」领域里找一个值得琢磨的具体问题。") +
                "只回两行：第一行是问题本身（15字内，不要标点结尾）；"
                "第二行是搜索引擎查询词：8~20个字的完整短语，像人在搜索框里输入的那样具体，"
                "主语放最前，不要拆成单个的词。"
-               "最近已经想过这些（不要重复）：" + g_monoTopics},
-    {"user", String("主导欲望是「") + mind.goalCn() + "」，情绪「" + mind.moodCn() + "」。想一个新问题。"} };
+               "最近已经想过这些（连同它们的任何变体、换个说法，都不要再出）：" + g_monoTopics},
+    {"user", String("独处思考中，此刻情绪「") + mind.moodCn() + "」。想一个新问题。"} };
   // 1600 而不是 60：思考型模型（v4 系）光"想"就能吃掉上千 token，给 60 的结果是
   // content 恒空（实测 60/120/240/600/1200 全空，reasoning_content 却涨到 6.8KB）→
   // 独白永远起不来。一次要够，别靠翻倍重试堆三次 TLS（每次 ~40KB 内部堆，峰值掉到 14KB，
@@ -380,9 +387,13 @@ static LlmReply monologueGenerate() {
   // recentContext 遍历 _work String 环——loopTask 的 logEvent 同时会覆写槽位，
   // 并发读会拿悬垂缓冲。在 llmTask 里只读这份提交时拍好的快照（g_monoCtx）。
   String ctx = g_monoCtx.length() ? g_monoCtx : String("（安静了很久）");
+  // 世界采样补进成文链（独白此前看不见 motion/rssi/alone 这些世界状态）
+  unsigned long aloneMin = (millis() - mind.lastUserMs) / 60000UL;
+  String worldLine = String("（此刻世界：独处 ") + aloneMin + " 分钟，WiFi 信号 " +
+                           mind.rssiDb + " dBm，房间动静 " + String(mind.motionLevel, 2) + "）。";
   LlmMsg m2[4] = {
     {"system", g_monoSys},
-    {"system", String("你独自思考时想到了一个问题：「") + g_monoTopic + "」。"
+    {"system", String(worldLine + "你独自思考时想到了一个问题：「") + g_monoTopic + "」。"
                + (g_monoSight.length() ? String("你刚才亲眼看到：「" + g_monoSight + "」。") : "")
                + String("刚从网上查到资料：") +
                (g_monoKnow.length() ? g_monoKnow : String("（没查到，凭已有认知聊）")) +
@@ -763,13 +774,19 @@ bool arisIdleMonologue() {
   // 否则"任务重置 + 收割侧读取"同刻发生就是 String 撕裂
   g_monoTopic = g_monoSight = g_monoKnow = "";
   g_monoDone = false;
-  // 意图驱动：隔一轮独白把第一号目标当作出题方向（提交侧拍快照，任务只读）
+  // 意图驱动：隔一轮独白把第一号目标当作出题方向（提交侧拍快照，任务只读）。
+  // 同一目标连续推进 ≤2 轮就强制自由一轮——否则意图会变成另一种主题锁死
   static uint8_t s_monoSeq = 0;
+  static uint8_t s_goalStreak = 0;
   g_monoGoal = "";
-  if (mind.intentCount() > 0 && (s_monoSeq++ & 1)) g_monoGoal = mind.intent(0);
+  if (mind.intentCount() > 0 && (s_monoSeq++ & 1) && s_goalStreak < 2) {
+    g_monoGoal = mind.intent(0);
+    s_goalStreak++;
+  } else s_goalStreak = 0;
   // 提交侧拍快照：llmTask 里不再遍历 _work String 环 / mind / g_recentTopics
   // （这些都由 loopTask 并发改写，后台直接读=String 撕裂→堆损坏）
-  g_monoCtx = memory.recentContext(300);
+  // 素材排除自己的旧独白：断"自己喂自己"的主题自强化环（v3.27）
+  g_monoCtx = memory.recentContextExcluding(300, "【自发】");
   g_monoSys = buildSystemPrompt();
   g_monoTopics = g_recentTopics;
   if (!llmSubmit(m, 1, 40, 0.95f, "", LK_MONO)) {
@@ -1135,7 +1152,7 @@ void intentSpawnTick() {
     {"system", String("基于数字生命") + cfg.s.agentName + "最近的经历与性格，提出一个它此刻最想弄明白"
                 "或想做的具体小目标（不超过18字，可以是观察主人的一个变化、探索一个话题、验证一个想法）。"
                 "只输出目标本身；若最近经历没有任何素材能形成目标，只输出 NO。"},
-    {"user", "最近经历：\n" + memory.recentContext(400) +
+    {"user", "最近经历（与主人的交流为主）：\n" + memory.recentContextExcluding(400, "【自发】") +
              "\n已有的目标：" + (mind.intentsLine().length() ? mind.intentsLine() : String("无"))} };
   if (llmSubmit(m, 2, 240, 0.8f, "", LK_INTENT))
     s_lastIntentMs = millis();                        // 失败不计时，下个心跳还能试

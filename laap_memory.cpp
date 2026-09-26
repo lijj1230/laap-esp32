@@ -141,6 +141,19 @@ String MemorySystem::recentContext(int maxChars) {
   return out;
 }
 
+// recentContext 的变体：跳过含 exclude 关键字的条目。
+// 用途：独白出题/意图生成的素材要断掉"自己喂自己"的自强化环——自己的旧独白
+// 会把下一轮主题锁在同一个词上（实测连续 5 轮"安静/想说话"换皮主题）
+String MemorySystem::recentContextExcluding(int maxChars, const char* exclude) {
+  String out; out.reserve(256);
+  for (int i = 0; i < _workLen && (int)out.length() < maxChars; i++) {
+    int idx = (_workHead - 1 - i + WORK_MAX * 2) % WORK_MAX;
+    if (exclude && _work[idx].indexOf(exclude) >= 0) continue;
+    out = _work[idx] + "\n" + out;
+  }
+  return out;
+}
+
 // F3: 工作记忆原始条目（近→远），只取 user|aris，供真多轮 messages 用。
 // roles 并行输出说话人（0=主人 1=它自己）：调用方必须用它标 role，
 // 别再按序号奇偶猜——历史里可能连着两条 user（上一轮它没答上），猜错就整段角色反相。

@@ -13,6 +13,8 @@ public:
   bool begin();
   void logEvent(const char* role, const String& text);   // user|aris|event → 双写
   String recentContext(int maxChars = 600);              // 工作记忆（近→远）
+  // 同上，但跳过含 exclude 关键字的条目（独白出题/意图生成断"自己喂自己"环）
+  String recentContextExcluding(int maxChars, const char* exclude);
   // F3: 工作记忆原始条目（近→远顺序, 最多 max 条, 只含 user|aris 角色）
   // 近 max 轮对话（远→近），roles 并行输出说话人：0=主人 1=它自己（调用方据此标 role，别再靠奇偶猜）
   int recentTurns(String* out, uint8_t* roles, int max) const;

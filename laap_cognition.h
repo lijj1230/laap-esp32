@@ -76,7 +76,6 @@ public:
   void incCycle() { _cycles++; }
 
   // 世界模型字段
-  uint32_t bootId = 1;
   float motionLevel = 0;      // 最近加速度扰动 0..1
   int rssiDb = 0;
     uint32_t lastUserMs = 0;    // 上次与主人交互时间
