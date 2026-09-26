@@ -188,7 +188,13 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
   if (r.httpStatus != 200) {
     String emsg;
     if (extractStringField(payload, "message", emsg)) lastError = "HTTP " + String(r.httpStatus) + ": " + emsg;
-    else lastError = "HTTP " + String(r.httpStatus);
+    else {
+      // 服务商报错形状五花八门（error.message / error.code / 纯文本），
+      // 解析不到 message 就带一段响应体原文——"HTTP 400" 三个字排查不了任何问题
+      lastError = "HTTP " + String(r.httpStatus);
+      String snip = payload; snip.trim();
+      if (snip.length()) lastError += "｜" + snip.substring(0, 160);
+    }
     // 400 且开着"关闭思考"：多半是这家服务商不认 thinking 字段 → 直接告诉用户怎么关
     if (r.httpStatus == 400 && cfg.s.llmNoThink)
       lastError += "（若报未知参数，请在设置页关掉「关闭模型思考」）";

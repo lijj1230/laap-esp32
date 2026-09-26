@@ -1,0 +1,86 @@
+#include "laap_rules.h"
+#include "laap_snap.h"
+#include "laap_llm.h"   // utf8Cut
+#include <LittleFS.h>
+
+LaapRules rules;
+
+static const char* RULES_PATH = "/mem/rules.txt";
+static const int RULES_MAX = 6;
+static const size_t RULE_BYTES = 90;   // ≈30 个汉字（UTF-8 3B/字），超了截断
+
+void LaapRules::ensureLoaded() {
+  if (_loaded) return;
+  _loaded = true;
+  File f = LittleFS.open(RULES_PATH, "r");
+  if (!f) return;
+  _cache = f.readString();
+  f.close();
+  _cache.trim();
+}
+
+String LaapRules::text() {
+  ensureLoaded();
+  return _cache;
+}
+
+int LaapRules::count() {
+  ensureLoaded();
+  if (!_cache.length()) return 0;
+  int n = 1;
+  for (unsigned int i = 0; i < _cache.length(); i++) if (_cache[i] == '\n') n++;
+  return n;
+}
+
+String LaapRules::promptLine() {
+  ensureLoaded();
+  if (!_cache.length()) return "";
+  String s = _cache;
+  s.replace("\n", "\n- ");   // 每行都要带列表符
+  return String("[行为规则（自我进化沉淀，必须遵守）]\n- ") + s;
+}
+
+bool LaapRules::apply(const String& llmOutput) {
+  // 行式解析：去掉常见前缀（- • * 1. ①等），只留像规则的行
+  String picked[RULES_MAX];
+  int n = 0;
+  int start = 0;
+  while (start < (int)llmOutput.length() && n < RULES_MAX) {
+    int nl = llmOutput.indexOf('\n', start);
+    String ln = (nl < 0) ? llmOutput.substring(start) : llmOutput.substring(start, nl);
+    start = (nl < 0) ? llmOutput.length() : nl + 1;
+    ln.trim();
+    if (!ln.length()) continue;
+    // 剥前缀：- / • / * / 1. / 1、 / ①
+    if (ln[0] == '-' || ln[0] == '•' || ln[0] == '*') { ln = ln.substring(1); ln.trim(); }
+    else if (ln[0] >= '0' && ln[0] <= '9') {
+      int d = 0;
+      while (d < (int)ln.length() && (ln[d] == '.' || ln[d] == '、' || ln[d] == ')' ||
+             (ln[d] >= '0' && ln[d] <= '9'))) d++;
+      if (d > 0 && d < (int)ln.length()) { ln = ln.substring(d); ln.trim(); }
+    }
+    else if (ln[0] == (char)0xE2 && ln.length() > 3) { ln = ln.substring(3); ln.trim(); } // ①等 U+2460 起 3B
+    // 过滤：太短（<4B 不成话）、太长截到上限、明显是解释行（含"规则""输出"开头的元话语）
+    if (ln.length() < 8 || ln.length() > 160) continue;
+    if (ln.startsWith("规则") || ln.startsWith("输出") || ln.startsWith("以下") || ln.startsWith("好的")) continue;
+    picked[n++] = utf8Cut(ln, RULE_BYTES);
+  }
+  if (!n) return false;                       // 无产出：保留现有规则
+  String merged;
+  for (int i = 0; i < n; i++) { if (i) merged += '\n'; merged += picked[i]; }
+  ensureLoaded();
+  if (merged == _cache) return false;         // 无变化：不写盘（省磨损）
+  laapSnapMake("rules", false);               // 覆盖前拍快照（自动档 12h 节流）
+  File f = LittleFS.open(RULES_PATH, "w");
+  if (!f) { Serial.println("[RULES] 规则落盘失败"); return false; }
+  f.print(merged);
+  f.close();
+  _cache = merged;
+  return true;
+}
+
+void LaapRules::clear() {
+  LittleFS.remove(RULES_PATH);
+  _cache = "";
+  _loaded = true;
+}

@@ -44,6 +44,7 @@
 #include "laap_touch.h"
 #include "laap_metrics.h"   // 评估埋点（RSI 闭环的评估端）
 #include "laap_snap.h"      // "自我"文件快照回滚
+#include "laap_rules.h"     // 行为规则集（RSI 闭环的载体/注入）
 
 // ---------- 全局（定义在各模块 .cpp，头文件已 extern） ----------
 
@@ -104,8 +105,8 @@ static String g_recentTopics;          // 最近自问话题（防重复，滚�
 #define BTN_PIN 0
 static uint32_t g_btnDown = 0;
 
-// LLM 请求种类（F4 后台任务的收割分流）：聊天/主动表达/独白/记忆压缩/夜间反思
-enum LlmKind : uint8_t { LK_CHAT = 0, LK_EXPRESS, LK_MONO, LK_CONSOLIDATE, LK_REFLECT };
+// LLM 请求种类（F4 后台任务的收割分流）：聊天/主动表达/独白/记忆压缩/夜间反思/规则归纳
+enum LlmKind : uint8_t { LK_CHAT = 0, LK_EXPRESS, LK_MONO, LK_CONSOLIDATE, LK_REFLECT, LK_RULES };
 
 // ---------- 函数声明 ----------
 void psiTick();
@@ -399,6 +400,7 @@ String laapInteractSearch(const String& userText) {
       }
       Serial.printf("[LAAP] 视觉失败（%s），交给搜索/大模型兜底\n", vision.lastError.c_str());
       metrics.vision(false);
+      metrics.failNote(String("视觉: ") + vision.lastError);
     } else if (wantLook) {
       Serial.println("[LAAP] 视觉未就绪（/api/status 的 vision_ready）");
     }
@@ -410,6 +412,7 @@ String laapInteractSearch(const String& userText) {
     String q = searchQueryOf(userText);
     knowledge = laapSearch.search(q, 3, 500);
     metrics.search(knowledge.length() > 0);   // 搜索命中率：内容空洞时答案差的前置原因
+    if (!knowledge.length()) metrics.failNote(String("搜索: ") + laapSearch.lastError);
     Serial.printf("[LAAP] 搜索「%s」: %s\n", q.c_str(),
                   knowledge.length() ? "有收获" : laapSearch.lastError.c_str());
   }
@@ -464,6 +467,7 @@ void llmHarvest() {
   LlmReply r = g_llmResult;
   uint8_t kind = g_resultKind;
   metrics.llm(r.ok);   // 后台 LLM 成败（含独白/反思/压缩：服务商健康度的总信号）
+  if (!r.ok) metrics.failNote(String("LLM: ") + llm.lastError);   // 规则归纳的失败素材
   g_llmFailStreak = r.ok ? 0 : (uint8_t)(g_llmFailStreak + 1);   // 退避计数（独白据此让路）
   if (kind == LK_CONSOLIDATE) {                        // 记忆压缩：只更新自我认知，不说话
     if (r.ok && r.say.length() > 10) {
@@ -479,6 +483,17 @@ void llmHarvest() {
       memory.setSemantic((sem.length() ? sem + " " : "") + r.say);
       Serial.printf("[LAAP·反思] %s\n", r.say.c_str());
     }
+    return;
+  }
+  if (kind == LK_RULES) {                              // 规则归纳：更新 /mem/rules.txt，不说话
+    if (!r.ok) {
+      Serial.printf("[LAAP·规则] 归纳失败: %s（现有规则保留）\n", llm.lastError.c_str());
+      return;
+    }
+    if (rules.apply(r.say))
+      Serial.printf("[LAAP·规则] 规则集已更新（%d 条）\n", rules.count());
+    else
+      Serial.println("[LAAP·规则] 无产出/无变化，规则保留");
     return;
   }
   if (kind == LK_MONO) {                                          // 独白：失败保持安静，不本地兜底
@@ -637,6 +652,10 @@ String buildSystemPrompt() {
   if (String(cfg.s.persona).length()) p += String("人设补充：") + cfg.s.persona + "\n";
   p += "性格参数：" + mind.traitsLine() + "\n";
   if (sem.length()) p += "长期自我记忆：" + sem + "\n";
+  {   // RSI: 夜间规则归纳沉淀的行为规则（自进化的数据层载体，改动看 /mem/rules.txt）
+    String rl = rules.promptLine();
+    if (rl.length()) p += rl + "\n";
+  }
 
   // ---- 实时内在状态（需求→语气的行为指引，内核→皮层的正式通路） ----
   const Needs& n = mind.needs();
@@ -851,6 +870,54 @@ void nightlyReflect(bool force) {
 }
 
 // ============================================================
+//  RSI 规则归纳：每夜用「主人的反馈 + 今天的失败」整理行为规则集
+//  产出 /mem/rules.txt（一行一条，注入 system prompt）——改进发生在数据层。
+//  与反思同窗口（0-6 点第一次心跳）、各自每天一次；没素材不出门（省调用）。
+//  评估端：metrics.failNote 的失败环 + feedback.jsonl 的 👍/👎（v3.19 已埋好）。
+// ============================================================
+static int g_lastRulesDay = -1;
+
+void rulesReflect(bool force) {
+  time_t now = time(nullptr);
+  if (now < 1700000000) {
+    if (!force) return;
+  }
+  struct tm t; localtime_r(&now, &t);
+  int day = t.tm_yday;
+  if (!force) {
+    if (g_lastRulesDay == day) return;
+    if (t.tm_hour >= 6) { g_lastRulesDay = day; return; }   // 白天不跑，等今晚
+  }
+  // 素材门：没有反馈、没有失败、也没有可整理的旧规则 → 今天没什么可学的
+  String fb = metrics.feedbackDigest(6);
+  String fails = metrics.failDigest();
+  String cur = rules.text();
+  if (!fb.length() && !fails.length() && !cur.length()) {
+    if (!force) g_lastRulesDay = day;
+    Serial.println("[LAAP·规则] 跳过：无反馈/失败素材");
+    return;
+  }
+  if (!force) g_lastRulesDay = day;
+  Serial.printf("[LAAP·规则] 开始归纳（反馈 %u B、失败 %u B、现有规则 %d 条）…\n",
+                (unsigned)fb.length(), (unsigned)fails.length(), rules.count());
+
+  String sys = String("你是数字生命") + cfg.s.agentName + "的行为规则维护器。"
+               "行为规则 = 让它表现更好的一句话指令（每条≤25字，具体、可执行，"
+               "例如「回答前先确认听清了主人的问题」「查不到资料就直说，不许编」）。"
+               "根据素材整理规则集：主人点踩的回答要找出共性问题变成规则；反复出现的失败要给出规避办法；"
+               "仍然适用的旧规则原样保留。只输出规则本身：每行一条、以-开头、最多6行，禁止任何解释。";
+  String usr = String("现有规则：\n") + (cur.length() ? cur : String("（还没有）")) +
+               "\n\n主人的反馈（v=1 是赞，v=-1 是踩，u=主人问的，a=它答的）：\n" +
+               (fb.length() ? fb : String("（今天没有）")) +
+               "\n\n今天的失败记录：\n" + (fails.length() ? fails : String("（今天没有）")) +
+               "\n\n请输出更新后的规则集。";
+  LlmMsg m[2] = { {"system", sys}, {"user", usr} };
+  int cap = cfg.s.llmMaxTokens > 1000 ? cfg.s.llmMaxTokens : 1000;   // 同反思：预算小了思考型模型只想不答
+  if (!llmSubmit(m, 2, cap, 0.4f, "", LK_RULES))                     // 规则要准，温度调低
+    Serial.println("[LAAP·规则] LLM 正忙，下个心跳再试");
+}
+
+// ============================================================
 //  PSI 心跳
 // ============================================================
 void psiTick() {
@@ -859,6 +926,7 @@ void psiTick() {
   mind.tick(dtMin);
   mind.incCycle();
   nightlyReflect(false);   // F7: 深夜复盘（内部自带每天一次节流）
+  rulesReflect(false);     // RSI: 深夜规则归纳（反馈+失败→行为规则集；LLM 忙则下个心跳再试）
 
   // IMU 世界感知
   float motion = 0;
@@ -923,7 +991,7 @@ void serialCli() {
     if (!line.length()) continue;
     laapActivity();     // 串口打字也是交互
     if (line == "/help") {
-      Serial.println("命令: /status /look(视觉识图) /search 词 /weather 城市 /touch(摇晃) /touchpad(触摸) /screen N /redraw /i2cscan /portal /mem /reflect(立刻反思) /mono(立刻独白) /nothink 0|1 /beep(回环测声) /tick /lcd /pa /imu /micgain(麦克风增益) /voicetest 文本(应答路径) /asrsend(不录音测请求) /asrloop 话(自听回环) /asrtest(录音识别) /metrics(评估埋点) /snap(快照列表) /snap restore 名 版本 /snaptake(强制快照) /reset");
+      Serial.println("命令: /status /look(视觉识图) /search 词 /weather 城市 /touch(摇晃) /touchpad(触摸) /screen N /redraw /i2cscan /portal /mem /reflect(立刻反思) /rules(看行为规则) /rulesreflect(立刻归纳规则) /mono(立刻独白) /nothink 0|1 /beep(回环测声) /tick /lcd /pa /imu /micgain(麦克风增益) /voicetest 文本(应答路径) /asrsend(不录音测请求) /asrloop 话(自听回环) /asrtest(录音识别) /metrics(评估埋点) /snap(快照列表) /snap restore 名 版本 /snaptake(强制快照) /reset");
       Serial.println("      直接打字回车 = 跟它说话（走完整对话链路）");
     } else if (line == "/touch") {
       // 触觉实测：5 秒采样，摇晃/扣翻板子看峰值与判定
@@ -1313,6 +1381,15 @@ void serialCli() {
       } else Serial.println("用法: /snap restore <semantic|episodes|evolution> <1-3>");
     } else if (line == "/snaptake") {
       laapSnapAll(true);   // 手动强制拍一份（改配置/折腾前留个还原点）
+    } else if (line == "/rules") {
+      String t = rules.text();
+      Serial.println(t.length() ? t : String("[RULES] 还没有行为规则（/rulesreflect 现在归纳一轮，或等夜里自动跑）"));
+    } else if (line == "/rules clear") {
+      rules.clear();
+      Serial.println("[RULES] 规则已清空");
+    } else if (line == "/rulesreflect") {
+      rulesReflect(true);   // 立刻用当前反馈+失败素材归纳一轮规则（不等深夜窗口）
+      Serial.println("[RULES] 已提交归纳，LLM 出结果后生效（约 10~30 秒）");
     } else if (line.startsWith("/vol")) {
       // 必须区分"查询"和"设置"：旧代码对空参数 `"".toInt()`=0 也放行，
       // 于是打一句 /vol 查询就把音量写成 0 并落盘 → 整机静音（且重启也不恢复）

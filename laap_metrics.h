@@ -44,6 +44,18 @@ struct LaapMetrics {
   bool feedback(int v, const String& user, const String& reply);
   // "asr_try":N,... 形式（不带花括号），/api/metrics 与 /api/status 共用
   String json() const;
+
+  // ---- 失败记录环（规则自进化的"素材端"）----
+  // 记最近 6 条有文本的失败（ASR/视觉/搜索/LLM 的报错原文），RAM 环不落盘：
+  // 它是给夜间规则归纳当样本用的，重启丢失可接受（feedback.jsonl 才是持久证据）。
+  void failNote(const String& s);     // 与上一条相同自动去重（连败刷屏只算一条）
+  String failDigest() const;          // "1. ...\n2. ..."；空=无失败
+  // 反馈文件末尾 maxLines 行原文（含 👍/👎 与问答），给夜间规则归纳当素材
+  String feedbackDigest(int maxLines = 6);
+
+private:
+  String _failRing[6];
+  uint8_t _failIdx = 0, _failCnt = 0;
 };
 
 extern LaapMetrics metrics;

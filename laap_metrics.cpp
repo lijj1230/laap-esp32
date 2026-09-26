@@ -1,8 +1,31 @@
 #include "laap_metrics.h"
+#include "laap_llm.h"   // utf8Cut（按字符边界截，substring 会把汉字拦腰切断→请求体非法 UTF-8）
 #include <LittleFS.h>
 #include <time.h>
 
 LaapMetrics metrics;
+
+// 就地清洗非法 UTF-8（历史文件里的半截汉字/坏字节）：合法序列原样保留，坏字节丢弃。
+// DeepSeek 对请求体做严格 UTF-8 校验，一个坏字节 = HTTP 400 invalid unicode code point。
+static String cleanUtf8(const String& s) {
+  String o; o.reserve(s.length());
+  for (unsigned int i = 0; i < s.length(); ) {
+    unsigned char c = (unsigned char)s[i];
+    int len = 1;
+    if (c >= 0xF0) len = 4;
+    else if (c >= 0xE0) len = 3;
+    else if (c >= 0xC0) len = 2;
+    else if (c >= 0x80) { i++; continue; }            // 孤立续字节：丢
+    if (i + len > s.length()) { i++; continue; }      // 尾部截断：丢
+    bool ok = true;
+    for (int k = 1; k < len; k++)
+      if (((unsigned char)s[i + k] & 0xC0) != 0x80) { ok = false; break; }
+    if (!ok) { i++; continue; }
+    for (int k = 0; k < len; k++) o += s[i + k];
+    i += len;
+  }
+  return o;
+}
 
 // JSON 字符串转义（问答原文里什么都有：引号/换行/表情）
 static void escTo(String& o, const String& s) {
@@ -24,8 +47,8 @@ bool LaapMetrics::feedback(int v, const String& user, const String& reply) {
   time_t now = time(nullptr);
   String line = String("{\"t\":") + (now > 1600000000 ? String((long)now) : String("-1")) +
                 ",\"v\":" + v +
-                ",\"u\":\"";  escTo(line, user.substring(0, 120));
-  line += "\",\"a\":\""; escTo(line, reply.substring(0, 240));
+                ",\"u\":\"";  escTo(line, cleanUtf8(utf8Cut(user, 120)));
+  line += "\",\"a\":\""; escTo(line, cleanUtf8(utf8Cut(reply, 240)));
   line += "\"}\n";
   bool ok = f.print(line) == line.length();
   f.close();
@@ -68,4 +91,53 @@ String LaapMetrics::json() const {
     ",\"rsp_llm_ms\":" + String(rspLlmMs(), 0) +
     ",\"rsp_dir_ms\":" + String(rspDirMs(), 0);
   return j;
+}
+
+// ---- 失败记录环 ----
+void LaapMetrics::failNote(const String& s) {
+  if (!s.length()) return;
+  String note = s;
+  note.trim();
+  if (note.length() > 90) note = note.substring(0, 90);
+  if (_failCnt && _failRing[(_failIdx + 5) % 6] == note) return;   // 连败同错误只记一条
+  _failRing[_failIdx] = note;
+  _failIdx = (_failIdx + 1) % 6;
+  if (_failCnt < 6) _failCnt++;
+}
+
+String LaapMetrics::failDigest() const {
+  if (!_failCnt) return "";
+  String out;
+  for (uint8_t i = 0; i < _failCnt; i++) {
+    const String& s = _failRing[(_failIdx + 6 - _failCnt + i) % 6];
+    if (i) out += "\n";
+    out += String(i + 1) + ". " + s;
+  }
+  return out;
+}
+
+// 反馈文件末尾 N 行：文件可能到 24KB，逐行流式读、只留最近 N 行（不整读进堆）
+String LaapMetrics::feedbackDigest(int maxLines) {
+  File f = LittleFS.open("/mem/feedback.jsonl", "r");
+  if (!f) return "";
+  String ring[8];
+  if (maxLines > 8) maxLines = 8;
+  int idx = 0, cnt = 0;
+  while (f.available()) {
+    String ln = f.readStringUntil('\n');
+    ln.trim();
+    if (!ln.length()) continue;
+    ring[idx] = cleanUtf8(ln);   // 老文件里可能有半截汉字：读取时就地清洗（否则请求体 400）
+    idx = (idx + 1) % maxLines;
+    if (cnt < maxLines) cnt++;
+  }
+  f.close();
+  if (!cnt) return "";
+  String out;
+  for (int i = 0; i < cnt; i++) {
+    const String& ln = ring[(idx + maxLines - cnt + i) % maxLines];
+    if (i) out += "\n";
+    out += ln;
+  }
+  return out;
 }

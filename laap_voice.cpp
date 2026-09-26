@@ -81,7 +81,11 @@ bool LaapVoice::listenAndTranscribe(String& heard) {
   String err;
   heard = asr.transcribe(audio.recordData(), got, err);
   metrics.asr(heard.length() > 0);   // ASR 空识别率：排障与自调优的核心 fitness
-  if (!heard.length()) { lastError = "ASR: " + err; return false; }
+  if (!heard.length()) {
+    metrics.failNote(String("ASR: ") + err);   // 规则归纳的失败素材
+    lastError = "ASR: " + err;
+    return false;
+  }
   Serial.printf("[VOICE] 听到: %s\n", heard.c_str());
   return true;
 }
