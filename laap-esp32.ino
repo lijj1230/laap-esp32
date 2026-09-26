@@ -220,6 +220,83 @@ static String g_monoCtx;    // 提交侧（loopTask）拍的上下文快照，ll
 static String g_monoSys;    // 同上：buildSystemPrompt 也读 mind 全量，提交侧拍好
 static String g_monoTopics; // 同上：g_recentTopics 由收割侧（loopTask）追加，后台读会撕裂 String
 
+// ---------- 搜索词质量（v3.26）：自发独白"搜不准"的三层修 ----------
+// LLM 出的关键词常碎成单字（实测"人 越聊 不想说话"）或过泛；搜索链按"谁有结果用谁"
+// 不看相关性 → 跑题资料被当真注入。修法：①提示词要完整短语 ②碎片词拼接/过短退回
+// 问题原文 ③结果与查询做二字组覆盖率粗检，跑题换问题原文重查一次，仍不中宁可不带。
+
+static int strChars(const String& s) {
+  int n = 0;
+  for (unsigned int k = 0; k < s.length(); k++)
+    if (((unsigned char)s[k] & 0xC0) != 0x80) n++;
+  return n;
+}
+
+// 查询词整理：中文去掉词间空格拼成连续短语（单字碎片会稀释搜索意图）；
+// 查询过短（<3 字）或为空 → 退回问题原文（问题通常比碎片词更可搜）
+static String tidySearchQuery(String kw, const String& topic) {
+  kw.trim();
+  bool cjk = kw.length() && ((unsigned char)kw[0] >= 0x80);
+  if (cjk && kw.indexOf(' ') >= 0) {
+    String j;
+    int s = 0;
+    while (s < (int)kw.length()) {
+      int e = kw.indexOf(' ', s);
+      String w = (e < 0) ? kw.substring(s) : kw.substring(s, e);
+      w.trim();
+      s = (e < 0) ? (int)kw.length() : e + 1;
+      if (w.length()) j += w;
+    }
+    kw = j;
+  }
+  if (strChars(kw) > 20) kw = utf8Cut(kw, 60);
+  kw.trim();
+  if (strChars(kw) < 3) {
+    String tp = topic;
+    tp.trim();
+    if (strChars(tp) >= 3) kw = tp;
+  }
+  return kw;
+}
+
+// 结果相关性粗检：查询（CJK）相邻二字组在结果文本中的覆盖率 0..1。
+// 覆盖率≈0 = 结果与查询几乎无关（跑题）；纯 ASCII 查询不参与判定（返回 1）
+static float queryBigramCoverage(const String& know, const String& q) {
+  if (!((unsigned char)q[0] >= 0x80)) return 1.0f;
+  int off[48];
+  int nOff = 0;
+  for (unsigned int k = 0; k < q.length() && nOff < 47; k++)
+    if (((unsigned char)q[k] & 0xC0) != 0x80) off[nOff++] = k;
+  if (nOff < 2) return 1.0f;
+  int total = 0, hit = 0;
+  for (int i = 0; i + 1 < nOff; i++) {
+    int end = (i + 2 < nOff) ? off[i + 2] : (int)q.length();
+    String big = q.substring(off[i], end);
+    total++;
+    if (know.indexOf(big) >= 0) hit++;
+  }
+  return total ? (float)hit / total : 1.0f;
+}
+
+// 去疑问脚手架：长自然句直接搜会被引擎分词成泛化词条（实测"人为什么越聊越不想说话"
+// 被匹配成"人为（汉语词语）_百度百科"）——剥掉疑问词，留内容短语
+static String refineQuery(const String& q) {
+  String s = q;
+  const char* stops[] = { "为什么", "是怎么回事", "是什么心理", "是什么意思", "是什么", "怎么回事",
+                          "怎么办", "什么", "怎么", "如何", "请问", "吗", "呢" };
+  for (auto w : stops) s.replace(w, " ");
+  String out;
+  bool sp = false;
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == ' ') { if (!sp && out.length()) { out += ' '; sp = true; } continue; }
+    sp = false;
+    out += c;
+  }
+  out.trim();
+  return out;
+}
+
 static LlmReply monologueGenerate() {
   // 意图驱动（PIANO goals）：隔一轮独白，把"心里惦记的事"当作出题方向——
   // 想法有了跨轮连续性；模型判断目标已弄明白时输出【完成】，收割侧结算
@@ -232,7 +309,8 @@ static LlmReply monologueGenerate() {
     {"system", String("你是") + cfg.s.agentName + "，正在独立思考。基于你的性格参数与最近经历，" +
                (goalPart.length() ? goalPart : "提出一个此刻最好奇的具体问题。") +
                "只回两行：第一行是问题本身（15字内，不要标点结尾）；"
-               "第二行是搜索它的关键词（2到4个词，主语在前，空格分隔，不要解释）。"
+               "第二行是搜索引擎查询词：8~20个字的完整短语，像人在搜索框里输入的那样具体，"
+               "主语放最前，不要拆成单个的词。"
                "最近已经想过这些（不要重复）：" + g_monoTopics},
     {"user", String("主导欲望是「") + mind.goalCn() + "」，情绪「" + mind.moodCn() + "」。想一个新问题。"} };
   // 1600 而不是 60：思考型模型（v4 系）光"想"就能吃掉上千 token，给 60 的结果是
@@ -243,18 +321,21 @@ static LlmReply monologueGenerate() {
   LlmReply q = llm.chatMsgs(m1, 2, 1600, 0.95f);
   if (!q.ok || q.say.length() < 4) return LlmReply();  // 离线/失败就保持安静
 
-  // 第一行=问题，第二行=搜索词（防主语劫持：必应按首词排序，主语要放最前）
-  String topic = q.say, query = q.say;
-  topic.trim(); query.trim();
+  // 第一行=问题，第二行=搜索查询词。查询词过碎/过短会自动退回问题原文
+  String topic = q.say, rest = q.say;
+  topic.trim(); rest.trim();
+  String query;
   // 意图结算：模型多出的第三行【完成】= 这个目标已经弄明白了（收割侧 dropIntent）
-  if (topic.indexOf("【完成】") >= 0) { g_monoDone = true; topic.replace("【完成】", ""); query.replace("【完成】", ""); topic.trim(); query.trim(); }
-  int nl = query.indexOf('\n');
+  if (topic.indexOf("【完成】") >= 0) { g_monoDone = true; topic.replace("【完成】", ""); rest.replace("【完成】", ""); topic.trim(); rest.trim(); }
+  int nl = rest.indexOf('\n');
   if (nl > 0) {
-    String kw = query.substring(nl + 1); query = query.substring(0, nl);
-    topic = query;
-    kw.trim(); topic.trim();
-    if (kw.length() >= 2 && kw.length() <= 30) query = kw;
+    topic = rest.substring(0, nl);
+    rest = rest.substring(nl + 1);
+    topic.trim(); rest.trim();
+  } else {
+    rest = "";                       // 没给查询词 → 整理函数会退回问题原文
   }
+  query = tidySearchQuery(rest, topic);
   query.replace(" ", "+");                 // 搜索词进 URL：空格转 +
   g_monoTopic = topic;
 
@@ -262,8 +343,29 @@ static LlmReply monologueGenerate() {
     g_monoSight = vision.look("");
     if (g_monoSight.length()) Serial.printf("[VISION] %s\n", g_monoSight.c_str());
   }
-  g_monoKnow = laapSearch.search(query, 3, 500);
-  Serial.printf("[LAAP·独白] 话题「%s」 搜「%s」:%s（heap %uKB）\n", g_monoTopic.c_str(), query.c_str(),
+  String know = laapSearch.search(query, 3, 500);
+  // 相关性粗检：结果与查询的二字组覆盖率≈0 → 大概率跑题。重查链：去疑问脚手架的
+  // 内容短语 → 问题原文；全都不中就宁可不带资料（跑题资料被当"最新资料"注入是主因）
+  float cov = know.length() ? queryBigramCoverage(know, query) : 0.0f;
+  if (cov < 0.15f) {
+    String refined = refineQuery(topic);
+    String alts[2] = { refined, topic };
+    for (int i = 0; i < 2 && cov < 0.15f; i++) {
+      String a = alts[i];
+      a.trim();
+      if (strChars(a) < 3 || a == query) continue;
+      String k2 = laapSearch.search(a, 3, 500);
+      float c2 = k2.length() ? queryBigramCoverage(k2, query) : 0.0f;
+      Serial.printf("[SEARCH] 首查%s（覆盖 %.0f%%）→ 换「%s」重查（覆盖 %.0f%%）\n",
+                    know.length() ? "疑似跑题" : "无结果", query.c_str(), cov * 100, a.c_str(), c2 * 100);
+      if (k2.length() && c2 > cov) { know = k2; cov = c2; }
+    }
+    if (cov < 0.15f) know = "";
+    if (!know.length()) Serial.println("[SEARCH] 各查询均不中 → 本轮不带资料（宁缺毋滥）");
+  }
+  g_monoKnow = know;
+  Serial.printf("[LAAP·独白] 话题「%s」 搜「%s」:%s（heap %uKB）\n",
+                g_monoTopic.c_str(), g_monoKnow.length() ? query.c_str() : "(未采用)",
                 g_monoKnow.length() ? "OK" : laapSearch.lastError.c_str(),
                 (unsigned)(ESP.getFreeHeap() / 1024));
 
