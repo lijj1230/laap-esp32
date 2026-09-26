@@ -251,8 +251,9 @@ String laapToolsDispatch(const String& text) {
     return String(buf);
   }
   // 天气优先（联网快问）：设备上"查天气"最稳的一条路
+  // 但主人明说"搜索"时不要劫走——那是要联网搜网页，不是问天气
   static const char* wkeys[] = {"天气", "气温", "下雨", "下雪", "冷不冷", "热不热", "weather"};
-  if (containsAny(text, wkeys, 7)) {
+  if (containsAny(text, wkeys, 7) && text.indexOf("搜索") < 0 && !text.startsWith("搜")) {
     String city = weatherCityOf(text);
     Serial.printf("[TOOLS] weather: 城市「%s」\n", city.length() ? city.c_str() : "(按出口IP定位)");
     String cond = weatherReport(city);

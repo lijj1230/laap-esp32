@@ -459,8 +459,10 @@ bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
 // （必应按首词排序："如何钓很多鱼"会被"如何"拽向词典——实测机制）
 static String searchQueryOf(const String& text) {
   String q = text; q.trim();
+  // 长壳在前：循环剥离，"帮我搜一下"必须先于"帮我搜"/"搜"匹配，否则剩个"一下"卡住
   static const char* shells[] = {
-    "请问", "告诉我", "帮我查查", "帮我查", "查一下", "搜索一下", "搜一下",
+    "请问", "告诉我", "帮我搜一下", "帮我查一下", "帮我查查", "帮我查", "帮我搜", "帮我",
+    "查一下", "搜索一下", "搜一下", "搜索", "搜", "查查",
     "什么是", "什么是", "为什么", "怎么样", "如何", "怎样", "为啥", "多少", "哪些" };
   bool changed = true;
   while (changed) {
