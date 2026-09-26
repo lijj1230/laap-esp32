@@ -375,6 +375,7 @@ void LaapWeb::handleSettingsPage() {
     "<label>模型名</label><input id='model'>"
     "<label>它的名字</label><input id='agent'>"
     "<label>你的称呼</label><input id='owner'>"
+    "<label>所在城市（天气用，空=按出口IP定位，定位可能不准）</label><input id='wcity'>"
     "<label>附加人设（可选）</label><textarea id='persona' rows='3'></textarea>"
     "<div class='row'><div style='flex:1'><label>心跳周期（秒）</label><input id='tick' type='number' min='10' max='3600'></div>"
     "<div style='flex:1'><label>主动表达阈值（0-100）</label><input id='thold' type='number' min='10' max='95'></div>"
@@ -443,7 +444,7 @@ void LaapWeb::handleSettingsPage() {
     // 大模型 Key 绝不能把掩码回显填进输入框：老写法 key.value='('+masked+')' 会被原样提交，
     // 保存一次就把真 Key 覆盖成 "(sk-***abcd)" → 之后 401（这正是"之前正常、后来不通"的真凶）
     "ssid.value=s.ssid;base.value=s.llm_base;key.value='';key.placeholder=s.llm_key_masked?'已配置（'+s.llm_key_masked+'），留空=保持不变':'未配置，请填写';"
-    "model.value=s.llm_model;agent.value=s.agent;owner.value=s.owner;persona.value=s.persona;"   // key 见上行：只留 placeholder 提示
+    "model.value=s.llm_model;agent.value=s.agent;owner.value=s.owner;wcity.value=s.city||'';persona.value=s.persona;"   // key 见上行：只留 placeholder 提示
     "tick.value=s.tick;thold.value=s.threshold;idlesil.value=s.idle_silence;idleevery.value=s.idle_every;volume.value=s.volume;brightness.value=s.brightness;screenoff.value=s.screen_off;llmcont.value=s.llm_continue;llmtok.value=s.llm_max_tokens;nothink.checked=!!s.nothink;srchkeys.value=s.search_keys||'';srchapi.value=s.search_api||'';"
     "vmode.value=s.voice_mode;ttsch.value=s.tts_channel;ttsvoice.value=s.tts_voice;ttsrate.value=s.tts_rate;"
     "volcappid.value=s.volc_appid;volctoken.value=s.volc_token_masked?'':'';volctoken.placeholder=s.volc_token_masked?'已配置，留空保持不变':'未配置';"
@@ -458,7 +459,7 @@ void LaapWeb::handleSettingsPage() {
     "async function save(e){e.preventDefault();"
     "const b=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},"
     "body:JSON.stringify({ssid:ssid.value,pass:pass.value,base:base.value,key:key.value,key_set:1,model:model.value,"
-    "agent:agent.value,owner:owner.value,persona:persona.value,tick:tick.value,thold:thold.value,"
+    "agent:agent.value,owner:owner.value,wcity:wcity.value,wcity_set:1,persona:persona.value,tick:tick.value,thold:thold.value,"
     "idlesil:idlesil.value,idleevery:idleevery.value,volume:volume.value,brightness:brightness.value,screenoff:screenoff.value,llmcont:llmcont.value,llmtok:llmtok.value,nothink:nothink.checked?1:0,srchkeys:srchkeys.value,srchkeys_set:1,srchapi:srchapi.value,srchapi_set:1,"
     "vmode:vmode.value,ttsch:ttsch.value,ttsvoice:ttsvoice.value,ttsrate:ttsrate.value,"
     "volcappid:volcappid.value,volctoken:volctoken.value,volctoken_set:1,volcvoice:volcvoice.value,"
@@ -556,6 +557,7 @@ void LaapWeb::handleSave() {
   if (model.length()) strlcpy(cfg.s.llmModel, model.c_str(), sizeof(cfg.s.llmModel));
   if (agent.length()) strlcpy(cfg.s.agentName, agent.c_str(), sizeof(cfg.s.agentName));
   if (owner.length()) strlcpy(cfg.s.ownerName, owner.c_str(), sizeof(cfg.s.ownerName));
+  if (flag("wcity_set")) strlcpy(cfg.s.city, get("wcity").c_str(), sizeof(cfg.s.city));   // 城市：空=按IP定位
   if (persona.length()) strlcpy(cfg.s.persona, persona.c_str(), sizeof(cfg.s.persona));
   // 只在真的带了字段时才改（原来无条件 toInt()：缺少 tick/thold 的部分保存会把它们打成下限 10）
   String tick = get("tick"), thold = get("thold");
@@ -613,6 +615,7 @@ void LaapWeb::handleStatus() {
   }
   String j = String("{\"agent\":\"") + jsonEsc(cfg.s.agentName) +
     "\",\"owner\":\"" + jsonEsc(cfg.s.ownerName) +
+    "\",\"city\":\"" + jsonEsc(cfg.s.city) +
     "\",\"mood\":\"" + mind.moodKey() + "\",\"mood_cn\":\"" + mind.moodCn() +
     "\",\"goal\":\"" + mind.goalCn() +
     "\",\"generation\":" + mind.generation() +

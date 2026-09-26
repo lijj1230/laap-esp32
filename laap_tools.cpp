@@ -142,7 +142,8 @@ static String dechunk(const String& in) {
 static String weatherCityOf(const String& text) {
   static const char* junk[] = {"今天","明天","后天","现在","目前","最近","怎么样","怎样","如何","咋样",
                                "查一下","查查","帮我","帮忙","看看","一下","天气","气温","预报","下雨",
-                               "下雪","冷不冷","热不热","的","呢","吗","呀","啊","？","?"," "};
+                               "下雪","冷不冷","热不热","的","呢","吗","呀","啊","？","?"," ",
+                               "你那边","外面","这里","这边","本地","室内","室外","屋里","家里","市"};
   String s = text;
   for (auto j : junk) s.replace(j, "");
   s.trim();
@@ -175,11 +176,12 @@ static String cnWeather(const String& en) {
   return en;   // 没命中保留英文，总比没有强
 }
 
-static String weatherReport(const String& city) {
+static String weatherReport(const String& city, String& resolvedLoc) {
   // 5 分钟缓存：连着问不重复打网络
-  static String cCity; static String cText; static uint32_t cMs = 0;
-  if (cText.length() && cCity == city && millis() - cMs < 300000UL) return cText;
-  String path = "/" + city + "?format=%C+%t&lang=zh";
+  static String cCity; static String cText; static String cLoc; static uint32_t cMs = 0;
+  if (cText.length() && cCity == city && millis() - cMs < 300000UL) { resolvedLoc = cLoc; return cText; }
+  // %l 让 wttr 顺带报告它定位到的地名：IP 定位经常错城，把定位透出来错不错一眼可见
+  String path = "/" + city + "?format=%l|%C|%t&lang=zh";
   String enc; char buf[8];
   for (unsigned int i = 0; i < path.length(); i++) {
     char c = path[i];
@@ -193,7 +195,28 @@ static String weatherReport(const String& city) {
   body.trim();
   if (!body.length()) return "";
   // 形如 "Moderate rain at times\t+24°C"（注意 wttr 用制表符分隔，不能只按空格切）
-  String temp, cond = body;
+  resolvedLoc = "";
+  String temp, cond;
+  int b1 = body.indexOf('|');
+  if (b1 >= 0) {                                 // 新格式（%l 可能返回空）：[loc]|cond|temp
+    int b2 = body.indexOf('|', b1 + 1);
+    if (b2 > b1) {
+      resolvedLoc = body.substring(0, b1);
+      int cm = resolvedLoc.indexOf(',');         // "Kunshan, Jiangsu, China" 取首段
+      if (cm > 0) resolvedLoc = resolvedLoc.substring(0, cm);
+      resolvedLoc.trim();
+      cond = body.substring(b1 + 1, b2);
+      temp = body.substring(b2 + 1);
+      temp.trim(); cond.trim();
+      if (temp.length()) { temp.replace("+", ""); temp.replace("°C", "度"); }
+      String out = cnWeather(cond);
+      if (temp.length()) out += " " + temp;
+      cCity = city; cText = out; cLoc = resolvedLoc; cMs = millis();
+      return out;
+    }
+  }
+  // 兜底：无 '|' 的旧式响应（°C 解析）
+  cond = body;
   int deg = body.indexOf("°");   // 必须用字符串：'°' 是多字节字面量，会被截成 0xB0 而误匹配续字节
   if (deg > 0) {
     // 温度 token 起点：往前退到"分隔符"为止。wttr 的分隔符可能是空格/制表符/不间断空格，
@@ -218,7 +241,7 @@ static String weatherReport(const String& city) {
   if (temp.length()) { temp.replace("+", ""); temp.replace("°C", "度"); }   // TTS 友好："24度"
   String out = cnWeather(cond);
   if (temp.length()) out += " " + temp;
-  cCity = city; cText = out; cMs = millis();
+  cCity = city; cText = out; cLoc = resolvedLoc; cMs = millis();
   return out;
 }
 
@@ -256,9 +279,18 @@ String laapToolsDispatch(const String& text) {
   if (containsAny(text, wkeys, 7) && text.indexOf("搜索") < 0 && !text.startsWith("搜")) {
     String city = weatherCityOf(text);
     Serial.printf("[TOOLS] weather: 城市「%s」\n", city.length() ? city.c_str() : "(按出口IP定位)");
-    String cond = weatherReport(city);
+    String loc;
+    String cond = weatherReport(city, loc);
     if (!cond.length()) return "网络这会儿不太顺，天气没查着，过会儿再问我一次吧。";
-    String say = city.length() ? (city + "现在" + cond) : ("你那边现在" + cond);
+    String say;
+    if (city.length()) say = city + "现在" + cond;                          // 主人点的城市
+    else if (cfg.s.city[0]) say = String(cfg.s.city) + "现在" + cond;       // 配置的城市
+    else {
+      say = String("你那边现在") + cond;
+      // IP 定位模式下 %l 常是坐标（数字开头），透出来没意义；地名才值得展示
+      if (loc.length() && (loc[0] < '0' || loc[0] > '9'))
+        say += String("（wttr 定位到：") + loc + "，不准就在后台设置里填城市名）";
+    }
     Serial.printf("[TOOLS] weather → %s\n", say.c_str());
     return say;
   }

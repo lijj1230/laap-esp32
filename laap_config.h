@@ -12,6 +12,7 @@ struct LaapSettings {
   char agentName[25] = "Aris";                      // 数字生命名字
   char ownerName[25] = "主人";
   char persona[257]  = "";                          // 附加人设描述
+  char city[33]      = "";                          // 所在城市（天气用；空=按出口IP定位，定位可能不准）
   uint32_t tickSec   = 30;                          // PSI 心跳周期(秒)
   uint8_t threshold  = 55;                          // 主动表达阈值(0-100)
   uint16_t idleSilenceMin = 10;                     // 独白起始静默(分钟)

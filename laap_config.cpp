@@ -44,6 +44,7 @@ void LaapConfig::load() {
   prefs.getString("agent", s.agentName, sizeof(s.agentName));
   prefs.getString("owner", s.ownerName, sizeof(s.ownerName));
   prefs.getString("persona", s.persona, sizeof(s.persona));
+  prefs.getString("wcity", s.city, sizeof(s.city));
   s.tickSec   = prefs.getUInt("tick", 30);
   s.threshold = prefs.getUChar("thold", 55);
   s.idleSilenceMin = prefs.getUShort("idlesil", 10);
@@ -92,6 +93,7 @@ bool LaapConfig::save() {
   prefs.putString("agent", s.agentName);
   prefs.putString("owner", s.ownerName);
   prefs.putString("persona", s.persona);
+  prefs.putString("wcity", s.city);
   prefs.putUInt("tick", s.tickSec);
   prefs.putUChar("thold", s.threshold);
   prefs.putUShort("idlesil", s.idleSilenceMin);
