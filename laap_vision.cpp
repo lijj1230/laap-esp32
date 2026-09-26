@@ -59,7 +59,10 @@ bool LaapVision::begin() {
   c.pin_sccb_scl = 2;
   c.sccb_i2c_port = 0;
   c.pin_pwdn = -1; c.pin_reset = -1;    // PWDN 手动经 PCA9557
-  c.xclk_freq_hz = 24000000;
+  c.xclk_freq_hz = 20000000;
+  // 24MHz 曾导致 cam_hal 持续刷 "FB-SIZE: xxx != 153600"（DMA 欠载交付截断帧，
+  // 高度只剩 50%~90%，S3 DVP+高像素时钟的经典病）；20MHz 是 esp32-camera 例程默认值，
+  // GC0308 内部 PLL 自适应，帧率略降但帧完整
   c.pixel_format = PIXFORMAT_RGB565;    // GC0308 不支持片上 JPEG（实测报错），RGB565 直出
   c.frame_size   = FRAMESIZE_QVGA;      // 320x240，RGB565=150KB/帧，PSRAM 装得下（双缓冲 300KB）
   // fb_count 必须 ≥2：cam_hal 里 en=1 表示"该缓冲可被 DMA 抓取"，抓完一帧置 en=0 就
@@ -67,7 +70,8 @@ bool LaapVision::begin() {
   //   ① 开机后第一次取到的是 init 瞬间抓的那帧（AEC 未收敛，实测均值 28/255 全黑）；
   //   ② 之后每次取到的都是"上次取帧后立刻抓的那帧"= 上一次看的时候的画面，不是现在。
   // 双缓冲让 DMA 一直抓、队列里始终是最新帧（实测帧龄从 ~30s 降到 <100ms）。
-  c.fb_count = 2;
+  // 4 缓冲：DMA 欠载时多了排队余量（2 缓冲实测出现过 FB-OVF）
+  c.fb_count = 4;
   c.grab_mode = CAMERA_GRAB_LATEST;
   c.fb_location = CAMERA_FB_IN_PSRAM;
   esp_err_t err = esp_camera_init(&c);
@@ -204,12 +208,25 @@ static long frameAgeMs(const camera_fb_t* fb) {
   return (long)(age < 0 ? 0 : age);
 }
 
+// 抓一帧"完整"的：DMA 欠载时会交付截断帧（len < 宽×高×2，cam_hal 同时刷 FB-SIZE 报错），
+// 拿去编码 PNG 就是下半截垃圾 → 退回去重抓（GRAB_LATEST 总给最新帧）。重试耗尽返回 null
+static camera_fb_t* grabWholeFrame(int tries) {
+  for (int i = 0; i < tries; i++) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) return nullptr;
+    if (fb->len >= (size_t)fb->width * fb->height * 2) return fb;
+    esp_camera_fb_return(fb);
+    delay(60);                          // 等下一帧进队列
+  }
+  return nullptr;
+}
+
 // 诊断用：抓帧 → PNG → base64（与 look 同一条链路），返回 base64 文本
 String LaapVision::debugPngB64(size_t& outLen) {
   outLen = 0;
   if (!_ok) { lastError = "摄像头未就绪"; return ""; }
-  camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) { lastError = "抓帧失败"; return ""; }
+  camera_fb_t* fb = grabWholeFrame(4);
+  if (!fb) { lastError = "抓帧失败/连续截断"; return ""; }
   long ageMs = frameAgeMs(fb);
   size_t pngLen = 0;
   uint8_t* png = rgb565ToPng(fb->buf, (int)fb->width, (int)fb->height, pngLen);
@@ -255,8 +272,8 @@ String LaapVision::lookLocked(const String& question) {
   // base64 约 205KB、原始帧 150KB：都放 PSRAM。旧代码只看内部堆（90KB 时就报"内存不足"而永远跳过视觉）
   if (ESP.getFreePsram() < 400000) { lastError = "PSRAM 不足，跳过视觉"; return ""; }
 
-  camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) { lastError = "抓帧失败"; return ""; }
+  camera_fb_t* fb = grabWholeFrame(6);
+  if (!fb) { lastError = "抓帧失败/连续截断"; return ""; }
   if (fb->format != PIXFORMAT_RGB565) { esp_camera_fb_return(fb); lastError = "像素格式非 RGB565"; return ""; }
   long ageMs = frameAgeMs(fb);          // 帧龄：这张"照片"是多久以前抓的
 
