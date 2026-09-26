@@ -176,6 +176,81 @@ static String cnWeather(const String& en) {
   return en;   // 没命中保留英文，总比没有强
 }
 
+// ---------- 主源：Open-Meteo（免 Key，15 分钟更新；wttr.in 数据源陈旧是"天气不符"主因） ----------
+// WMO 天气代码 → 中文
+static String wmoCn(int code) {
+  if (code == 0) return "晴";
+  if (code == 1) return "基本晴";
+  if (code == 2) return "局部多云";
+  if (code == 3) return "阴";
+  if (code == 45 || code == 48) return "雾";
+  if (code >= 51 && code <= 55) return "毛毛雨";
+  if (code == 56 || code == 57) return "冻毛毛雨";
+  if (code == 61) return "小雨";
+  if (code == 63) return "中雨";
+  if (code == 65) return "大雨";
+  if (code == 66 || code == 67) return "冻雨";
+  if (code == 71) return "小雪";
+  if (code == 73) return "中雪";
+  if (code == 75) return "大雪";
+  if (code == 77) return "雪粒";
+  if (code == 80) return "阵雨";
+  if (code == 81) return "阵雨";
+  if (code == 82) return "强阵雨";
+  if (code == 85 || code == 86) return "阵雪";
+  if (code == 95) return "雷阵雨";
+  if (code == 96 || code == 99) return "雷阵雨伴冰雹";
+  return "天气代码" + String(code);
+}
+
+// JSON 里取数值字段：跳过同名的 units 键（值带引号），只认后面紧跟数字的
+static bool jsonNum(const String& body, const char* key, float& out) {
+  String pat = String("\"") + key + "\":";
+  int pos = 0;
+  while (true) {
+    int p = body.indexOf(pat, pos);
+    if (p < 0) return false;
+    pos = p + pat.length();
+    char c = body[pos];
+    if (c == '-' || (c >= '0' && c <= '9')) { out = body.substring(pos).toFloat(); return true; }
+  }
+}
+
+static String urlEncQuery(const String& s) {
+  String enc; char buf[8];
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (isalnum((unsigned char)c) || strchr("-_.~", c)) enc += c;
+    else { snprintf(buf, sizeof(buf), "%%%02X", (unsigned char)c); enc += buf; }
+  }
+  return enc;
+}
+
+static String g_omCity; static String g_omText; static uint32_t g_omMs = 0;
+static float g_geoLat = 999, g_geoLon = 999; static String g_geoCity;
+
+static bool weatherOpenMeteo(const String& city, String& out) {
+  // 5 分钟缓存
+  if (g_omCity == city && g_omText.length() && millis() - g_omMs < 300000UL) { out = g_omText; return true; }
+  float lat, lon;
+  if (g_geoCity != city || g_geoLat > 900) {
+    String body = dechunk(httpGetText("geocoding-api.open-meteo.com",
+                    "/v1/search?name=" + urlEncQuery(city) + "&count=1&language=zh&format=json", 6000));
+    if (!jsonNum(body, "latitude", lat) || !jsonNum(body, "longitude", lon)) return false;
+    g_geoCity = city; g_geoLat = lat; g_geoLon = lon;
+  }
+  lat = g_geoLat; lon = g_geoLon;
+  char p[176];
+  snprintf(p, sizeof(p), "/v1/forecast?latitude=%.4f&longitude=%.4f&current=temperature_2m,weather_code&timezone=auto", lat, lon);
+  String body = dechunk(httpGetText("api.open-meteo.com", p, 6000));
+  float tempC = 0, code = 0;
+  if (!jsonNum(body, "temperature_2m", tempC) || !jsonNum(body, "weather_code", code)) return false;
+  out = wmoCn((int)code) + " " + String((int)(tempC + (tempC >= 0 ? 0.5f : -0.5f))) + "度";
+  g_omCity = city; g_omText = out; g_omMs = millis();
+  Serial.printf("[WEA-OM] %s → %s（lat %.3f lon %.3f）\n", city.c_str(), out.c_str(), lat, lon);
+  return true;
+}
+
 static String weatherReport(const String& city, String& resolvedLoc) {
   // 5 分钟缓存：连着问不重复打网络
   static String cCity; static String cText; static String cLoc; static uint32_t cMs = 0;
@@ -279,17 +354,24 @@ String laapToolsDispatch(const String& text) {
   if (containsAny(text, wkeys, 7) && text.indexOf("搜索") < 0 && !text.startsWith("搜")) {
     String city = weatherCityOf(text);
     Serial.printf("[TOOLS] weather: 城市「%s」\n", city.length() ? city.c_str() : "(按出口IP定位)");
-    String loc;
-    String cond = weatherReport(city, loc);
-    if (!cond.length()) return "网络这会儿不太顺，天气没查着，过会儿再问我一次吧。";
     String say;
-    if (city.length()) say = city + "现在" + cond;                          // 主人点的城市
-    else if (cfg.s.city[0]) say = String(cfg.s.city) + "现在" + cond;       // 配置的城市
-    else {
-      say = String("你那边现在") + cond;
-      // IP 定位模式下 %l 常是坐标（数字开头），透出来没意义；地名才值得展示
-      if (loc.length() && (loc[0] < '0' || loc[0] > '9'))
-        say += String("（wttr 定位到：") + loc + "，不准就在后台设置里填城市名）";
+    String cond;
+    float tempC = 0;
+    // 主源 Open-Meteo（数据新鲜准确）；wttr.in 数据源陈旧，只作兜底
+    if (city.length() && weatherOpenMeteo(city, cond)) {
+      say = city + "现在" + cond;
+    } else {
+      String loc;
+      cond = weatherReport(city, loc);
+      if (!cond.length()) return "网络这会儿不太顺，天气没查着，过会儿再问我一次吧。";
+      if (city.length()) say = city + "现在" + cond;                          // 主人点的城市
+      else if (cfg.s.city[0]) say = String(cfg.s.city) + "现在" + cond;       // 配置的城市
+      else {
+        say = String("你那边现在") + cond;
+        // IP 定位模式下 %l 常是坐标（数字开头），透出来没意义；地名才值得展示
+        if (loc.length() && (loc[0] < '0' || loc[0] > '9'))
+          say += String("（wttr 定位到：") + loc + "，不准就在后台设置里填城市名）";
+      }
     }
     Serial.printf("[TOOLS] weather → %s\n", say.c_str());
     return say;
