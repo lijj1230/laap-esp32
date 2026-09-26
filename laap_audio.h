@@ -54,10 +54,17 @@ public:
   // 播放期间打断监测开关（默认开）
   void bargeInEnable(bool en) { _bargeEn = en; }
 
+  // ---- 麦克风 PGA 增益（ES7210，0..37.5dB）----
+  // 实测 30dB 时近场自响只有 RMS 200（底噪 102，仅 6dB 余量）→ 远场说话会被埋掉，
+  // 默认提到 37.5dB（最大档）。用 /micgain 可在运行时逐档试。
+  bool setMicGainDb(int db);         // 传 0/3/6/.../36/37.5
+  int micGainDb() const { return _micGainDb; }
+
 private:
   void pump();                       // 从 I2S 读数据→降采样→VAD/录音缓冲
   bool _ok = false;
   uint8_t _volume = 70;
+  int _micGainDb = 375;              // ×10 存（375 = 37.5dB）
   bool _recording = false;
   int16_t* _recBuf = nullptr;
   size_t _recCap = 0, _recLen = 0;

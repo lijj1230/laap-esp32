@@ -97,6 +97,40 @@ static HMP3Decoder s_mp3Dec = nullptr;
 // "没声音"诊断：收到多少音频字节 / 解出多少帧 / 样本峰值（0=解出来就是静音）
 static uint32_t s_ttsBytes = 0, s_ttsFrames = 0, s_ttsSamples = 0;
 static int s_ttsPeak = 0;
+// ============================================================
+//  自听回环诊断（/asrloop 用）：把解码出的 PCM 攒进外部缓冲（重采样 16k 单声道），
+//  调用方随后边播边录，就能让设备"听自己说话"→ 发 ASR。用来把
+//  "ASR 请求/服务端" 与 "麦克风拾音" 两件事彻底分开验证。
+// ============================================================
+static int16_t* s_capBuf = nullptr;
+static size_t   s_capCap = 0, s_capSamples = 0;
+static bool     s_capOn = false;
+static int      s_capSrcRate = 24000;
+static double   s_capPos = 0;
+
+void laapTtsCaptureBegin(int16_t* buf, size_t cap, int srcRate) {
+  s_capBuf = buf; s_capCap = cap; s_capSamples = 0; s_capPos = 0;
+  s_capSrcRate = srcRate > 0 ? srcRate : 24000; s_capOn = true;
+}
+size_t laapTtsCaptureEnd(void) { s_capOn = false; return s_capSamples; }
+
+// 把一帧解码结果线性插值重采样进捕获缓冲
+static void captureFrame(const int16_t* pcm, size_t samples, int rate) {
+  if (!s_capOn || !s_capBuf || !s_capCap) return;
+  if (rate > 0) s_capSrcRate = rate;
+  double step = (double)s_capSrcRate / 16000.0;
+  while (s_capPos < (double)samples && s_capSamples < s_capCap) {
+    size_t i0 = (size_t)s_capPos;
+    double frac = s_capPos - i0;
+    int32_t s = pcm[i0];
+    if (i0 + 1 < samples) s = (int32_t)(pcm[i0] * (1.0 - frac) + pcm[i0 + 1] * frac);
+    s_capBuf[s_capSamples++] = (int16_t)s;
+    s_capPos += step;
+  }
+  s_capPos -= (double)samples;
+  if (s_capPos < 0) s_capPos = 0;
+}
+
 static bool playMp3Stream() {
   if (!s_mp3Dec) { s_mp3Dec = MP3InitDecoder(); if (!s_mp3Dec) return false; }
   HMP3Decoder dec = s_mp3Dec;
@@ -127,6 +161,7 @@ static bool playMp3Stream() {
       for (size_t i = 0; i < samples; i++) { int a = pcm[i] < 0 ? -pcm[i] : pcm[i]; if (a > pk) pk = a; }
       if (pk > s_ttsPeak) s_ttsPeak = pk;
       s_ttsFrames++; s_ttsSamples += samples;
+      if (s_capOn) captureFrame(pcm, samples, fi.samprate ? fi.samprate : 24000);
       audio.playPcm(pcm, samples, fi.samprate ? fi.samprate : 24000);
       any = true;
     }

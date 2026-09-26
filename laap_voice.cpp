@@ -88,6 +88,13 @@ void laapVoiceSetManualOnce() { g_manualOnce = true; }
 
 String LaapVoice::converse() {
   if (_busy || !_ready) return "";
+  // 播报后冷却期内不接受新的按键轮次（VAD 路径一直有这层，按键路径以前没有）：
+  // 麦克风增益调到 37.5dB 后，它自己的回声足以被判成"有人在说话"，紧接着按一下 BOOT
+  // 就会让它对着自己的尾音再答一次 —— 症状同样是"回答了两次"。
+  if ((int32_t)(millis() - _cooldownMs) < 0) {
+    Serial.println("[VOICE] 刚播报完还在冷却期，忽略这次触发（防自听见）");
+    return "";
+  }
   String heard;
   if (!listenAndTranscribe(heard)) {
     if (lastError == "没听清") voice.speak("嗯？刚才没听清。", "curious");
@@ -104,10 +111,23 @@ String LaapVoice::converse() {
     return "";
   }
   g_manualOnce = false;
+  return respond(heard);
+}
+
+// 应答段：主程序全流程 + "这句该不该由我念"的判断（converse 与 /voicetest 共用）
+String LaapVoice::respond(const String& heard) {
   String reply = laapInteractSearch(heard); // 主程序: 需求/记忆/搜索/LLM 全流程
   const char* expr = laapLastExpr();
-  speak(reply, expr);
-  return heard;
+  // 说得刚刚好一次：
+  // ① 本地直答（工具指令/看东西）在上面那步里已经念过了 → 这里不能再念（用户实测"回答两次"）；
+  // ② 受理回执"……"没有可说的内容，真回复由后台 llmHarvest 念出来（原来这里会把"……"
+  //    也丢给 TTS 跑一趟，白等一次 TLS 握手，还可能蹦出奇怪的音）。
+  bool already = laapReplySpoken();
+  bool pending = laapChatPending();
+  if (!already && !pending) speak(reply, expr);
+  Serial.printf("[VOICE] 应答「%s」→ %s\n", reply.substring(0, 24).c_str(),
+                already ? "内部已念过，这里不再念" : (pending ? "异步受理，等后台念" : "由这里念"));
+  return reply;
 }
 
 void LaapVoice::setVadPaused(bool paused) {

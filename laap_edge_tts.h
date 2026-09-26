@@ -17,3 +17,8 @@ public:
 };
 
 extern EdgeTts edgeTts;
+
+// 自听回环诊断（/asrloop）：合成期间把解码后的 PCM 也攒进 buf（重采样成 16k 单声道），
+// 调用方拿到样本数后即可边播边录。用来把"ASR 请求/服务端"与"麦克风拾音"分开验证。
+void laapTtsCaptureBegin(int16_t* buf, size_t cap, int srcRate);
+size_t laapTtsCaptureEnd(void);

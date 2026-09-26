@@ -37,6 +37,7 @@
 #include "laap_audio.h"
 #include "laap_voice.h"
 #include "laap_speech.h"
+#include "laap_edge_tts.h"
 #include "laap_search.h"
 #include "laap_vision.h"
 #include "laap_tools.h"
@@ -61,9 +62,14 @@ const char* laapLastReqShape() { return g_lastReqShape; }
 static uint32_t g_chatSeq = 0;
 static String g_chatReply;
 static bool g_chatPending = false;
+// 本地直答（工具指令/看东西）在 laapInteractSearch 内部就把话说完了；返回值只是同一个字符串。
+// 调用方（语音那条链路）若再念一次，同一句话就会说两遍——用户实测"语音问了会回答两次"。
+// 这个标志告诉调用方：这句已经念过了，别再念。
+static bool g_replySpoken = false;
 uint32_t laapChatSeq() { return g_chatSeq; }
 String laapChatReply() { return g_chatReply; }
 bool laapChatPending() { return g_chatPending; }
+bool laapReplySpoken() { return g_replySpoken; }
 
 // 静默息屏 / 累计运行时长
 static uint32_t g_lastActivityMs = 0;      // 最近一次"值得亮屏"的活动
@@ -335,6 +341,7 @@ static String searchQueryOf(const String& text) {
 String laapInteractSearch(const String& userText) {
   laapActivity();                      // 有人跟它说话 = 活动（息屏则唤醒）
   g_chatPending = false;
+  g_replySpoken = false;               // 本次交互还没念过（本地直答分支会置位）
   // 注意：本次提问的 logEvent 故意放到"历史快照之后"再记。
   // 原来先记账再取最近对话 → 同一句话既在历史里又在队尾，模型会看到主人把话说了两遍。
   mind.onUserInteraction();
@@ -352,6 +359,7 @@ String laapInteractSearch(const String& userText) {
     Serial.printf("[Aris] %s\n", toolReply.c_str());
     display.drawFace("calm");
     voice.speak(toolReply, "calm");
+    g_replySpoken = true;                        // 已经念过：调用方别再念（否则说两遍）
     return toolReply;
   }
 
@@ -374,6 +382,7 @@ String laapInteractSearch(const String& userText) {
         Serial.printf("[Aris·看] %s\n", d.c_str());
         display.drawFace("curious", false);
         voice.speak(d, "curious");
+        g_replySpoken = true;                    // 已经念过：调用方别再念（否则说两遍）
         return d;
       }
       Serial.printf("[LAAP] 视觉失败（%s），交给搜索/大模型兜底\n", vision.lastError.c_str());
@@ -895,7 +904,7 @@ void serialCli() {
     if (!line.length()) continue;
     laapActivity();     // 串口打字也是交互
     if (line == "/help") {
-      Serial.println("命令: /status /look(视觉识图) /search 词 /weather 城市 /touch(摇晃) /touchpad(触摸) /screen N /redraw /i2cscan /portal /mem /reflect(立刻反思) /mono(立刻独白) /nothink 0|1 /beep(回环测声) /tick /lcd /pa /imu /asrtest /reset");
+      Serial.println("命令: /status /look(视觉识图) /search 词 /weather 城市 /touch(摇晃) /touchpad(触摸) /screen N /redraw /i2cscan /portal /mem /reflect(立刻反思) /mono(立刻独白) /nothink 0|1 /beep(回环测声) /tick /lcd /pa /imu /micgain(麦克风增益) /voicetest 文本(应答路径) /asrsend(不录音测请求) /asrloop 话(自听回环) /asrtest(录音识别) /reset");
       Serial.println("      直接打字回车 = 跟它说话（走完整对话链路）");
     } else if (line == "/touch") {
       // 触觉实测：5 秒采样，摇晃/扣翻板子看峰值与判定
@@ -1087,6 +1096,112 @@ void serialCli() {
         Serial.println();
       }
       Serial.printf("[IMU] g_imuOk=%d\n", g_imuOk);
+    } else if (line == "/voicetest") {
+      Serial.println("[VOICE] 用法: /voicetest 文本  → 用文本走「按键对讲」的应答段（不起麦克风）");
+      Serial.println("[VOICE] 判据：本地直答只应有 1 次 TTS；走大模型的提问应当场不念、稍后念真回复");
+    } else if (line.startsWith("/voicetest ")) {
+      // 复现"回答两次"这类问题的现场仪器：与按键对讲共用 LaapVoice::respond()
+      String t = line.substring(11);
+      t.trim();
+      Serial.printf("[VOICE] 模拟听到「%s」\n", t.c_str());
+      uint32_t tv = millis();
+      voice.respond(t);
+      Serial.printf("[VOICE] 应答段返回（%lums）——上面一行标了这句由谁念\n", millis() - tv);
+    } else if (line == "/asrloop") {
+      Serial.println("[ASR] 用法: /asrloop 要它说的话  → 设备自己说、自己录、发 ASR");
+    } else if (line.startsWith("/asrloop ")) {
+      // 自听回环：TTS 合成 → 自己喇叭播 → 自己麦克风收 → ASR。
+      // 不依赖任何外部音源，是"ASR 到底能不能识别人声"的现场判据（也顺手验麦克风灵敏度）。
+      String txt = line.substring(8);
+      txt.trim();
+      static int16_t* capBuf = nullptr;
+      const size_t CAP = 16000 * 8;             // 最多 8 秒
+      if (!capBuf) {
+        capBuf = (int16_t*)heap_caps_malloc(CAP * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+        if (!capBuf) capBuf = (int16_t*)malloc(CAP * sizeof(int16_t));
+      }
+      if (!capBuf) { Serial.println("[ASR] 缓冲分配失败"); continue; }
+      Serial.printf("[ASR] 自听回环：让它说「%s」…\n", txt.c_str());
+      laapTtsCaptureBegin(capBuf, CAP, 24000);
+      bool spoke = edgeTts.speak(txt, String(cfg.s.ttsVoice), String(cfg.s.ttsRate), false);
+      size_t n = laapTtsCaptureEnd();
+      if (!spoke || n < 1600) {
+        Serial.printf("[ASR] TTS 失败(%s) 或样本太少(%u) → 换 /asrsend 测请求\n",
+                      edgeTts.lastError.c_str(), (unsigned)n);
+        continue;
+      }
+      Serial.printf("[ASR] 合成 %u 样本（%.1fs@16k），边播边录…\n", (unsigned)n, n / 16000.0);
+      if (!audio.recordStart(10)) { Serial.println("[ASR] 录音启动失败"); continue; }
+      // 必须开 barge-in：只有它会让 playPcm 内部每 10ms 抽一次麦克风。
+      // 否则 100ms 一块的播放期间 I2S RX 溢出，录到的只有约两成（实测 4.6s 语音只录到 0.8s）。
+      // 每一块只有 100ms，短于打断判定的 300ms 泄漏基线窗口 → 不会被自己的声音打断。
+      audio.bargeInEnable(true);
+      for (size_t off = 0; off < n; off += 1600) {      // 100ms 一块：块内按实时节奏阻塞
+        size_t m = (n - off) < 1600 ? (n - off) : 1600;
+        audio.playPcm(capBuf + off, m, 16000);
+        audio.recordTick();                             // 兜底再抽一次
+      }
+      for (uint32_t t = millis(); millis() - t < 500;) { audio.recordTick(); delay(5); }
+      audio.bargeInEnable(false);
+      size_t got = audio.recordBytes();
+      audio.recordStop();
+      { float rms = 0; const int16_t* p = audio.recordData(); int cnt = got / 2;
+        for (int i = 0; i < cnt; i += 16) rms += (float)p[i] * p[i];
+        rms = sqrtf(rms / (cnt / 16 + 1));
+        Serial.printf("[ASR] 录到 %u 字节（%.1fs），RMS=%.0f（麦克风增益 %.1f dB）\n",
+                      (unsigned)got, got / 32000.0, rms, audio.micGainDb() / 10.0); }
+      String el2;
+      uint32_t ta2 = millis();
+      String heard = asr.transcribe(audio.recordData(), got, el2);
+      if (heard.length())
+        Serial.printf("[ASR] ✓ 回环识别成功（%lums）→「%s」\n", millis() - ta2, heard.c_str());
+      else
+        Serial.printf("[ASR] ✗ 未识别（%lums）: %s\n", millis() - ta2, el2.c_str());
+    } else if (line == "/micgain") {
+      Serial.printf("[AUD] 麦克风增益 %.1f dB（用法: /micgain 0-37.5，档位 3dB 一档）\n",
+                    audio.micGainDb() / 10.0);
+      Serial.println("[AUD] 判据：/beep 看近场回环 RMS、说话时 /asrtest 看 RMS（<50 无声，>300 正常）");
+    } else if (line.startsWith("/micgain ")) {
+      int db10 = (int)(line.substring(9).toFloat() * 10 + 0.5);
+      if (db10 < 0) db10 = 0; if (db10 > 375) db10 = 375;
+      bool okg = audio.setMicGainDb(db10);
+      Serial.printf("[AUD] 麦克风增益 → %.1f dB%s\n", audio.micGainDb() / 10.0,
+                    okg ? "" : "（寄存器写入失败）");
+      Serial.println("[AUD] 接着打 /asrtest 或 /asrloop 看效果（增益过高会削顶，RMS 长期贴近 3 万就是不合适）");
+    } else if (line == "/asrsend") {
+      // ASR 请求自检（不录音、不用出声）：合成 1s 音 → 打印 WAV 头关键字段 → 发给配置的 ASR。
+      // 用来把"请求格式/服务端"与"麦克风录音内容"彻底分开：这里通了才轮到查录音。
+      static int16_t* t1 = nullptr;
+      if (!t1) { t1 = (int16_t*)heap_caps_malloc(16000 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+                 if (!t1) t1 = (int16_t*)malloc(16000 * sizeof(int16_t)); }
+      if (!t1) { Serial.println("[ASR] 缓冲分配失败"); continue; }
+      for (int i = 0; i < 16000; i++) t1[i] = (int16_t)(9000 * sinf(2 * PI * 440 * i / 16000.0));
+      size_t cap = 32000 + 64;
+      uint8_t* wv = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+      if (!wv) wv = (uint8_t*)malloc(cap);
+      if (!wv) { Serial.println("[ASR] 缓冲分配失败"); continue; }
+      size_t wl = wavWrap(t1, 32000, wv, cap);
+      auto rd32 = [&](int o) { return (uint32_t)wv[o] | ((uint32_t)wv[o+1] << 8) |
+                                      ((uint32_t)wv[o+2] << 16) | ((uint32_t)wv[o+3] << 24); };
+      auto rd16 = [&](int o) { return (uint16_t)(wv[o] | (wv[o+1] << 8)); };
+      Serial.printf("[ASR] WAV %u 字节 | 标记 %.4s/%.4s/%.4s | fmt块长=%u(应16) PCM=%u 声道=%u "
+                    "采样率=%u 字节率=%u(应采样率*声道*2) 位深=%u | data块长=%u(应 %u)\n",
+                    (unsigned)wl, (const char*)wv, (const char*)wv + 8, (const char*)wv + 12,
+                    (unsigned)rd32(16), (unsigned)rd16(20), (unsigned)rd16(22),
+                    (unsigned)rd32(24), (unsigned)rd32(28), (unsigned)rd16(34),
+                    (unsigned)rd32(40), (unsigned)(wl - 44));
+      free(wv);
+      Serial.printf("[ASR] 后端 %s | 模型 %s | 发送中…\n", cfg.s.asrBase, cfg.s.asrModel);
+      String e1;
+      uint32_t ta = millis();
+      String r1 = asr.transcribe(t1, 32000, e1);
+      if (r1.length())
+        Serial.printf("[ASR] ✓ 服务端接受请求，%lums，识别文本「%s」\n", millis() - ta, r1.c_str());
+      else if (e1.indexOf("响应无") >= 0)
+        Serial.printf("[ASR] ✓ 服务端接受请求（合成音无语音，故无文本），%lums\n", millis() - ta);
+      else
+        Serial.printf("[ASR] ✗ %s（%lums）→ 请求格式或服务端问题，与麦克风无关\n",
+                      e1.c_str(), millis() - ta);
     } else if (line == "/asrtest") {
       // ASR 端到端诊断: 录 5s（请对着板子说话）→ RMS 判定麦克风 → SiliconFlow 转写
       if (!audio.micOk) { Serial.println("[ASR] 无麦克风"); continue; }

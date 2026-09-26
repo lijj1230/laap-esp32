@@ -30,6 +30,23 @@ extern "C" int laap_i2c_write_read(uint8_t addr, uint8_t reg, uint8_t* out, size
 static I2SClass i2s;
 static es8311_handle_t spk = nullptr;
 static es7210_dev_handle_t mic = nullptr;
+static es7210_codec_config_t s_cc = {};      // ES7210 当前配置（/micgain 改增益时复用）
+
+// ES7210 PGA 档位（dB×10 → 枚举序号），顺序同 es7210_mic_gain_t
+static const int kMicGainDb10[] = {0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 345, 360, 375};
+static const int kMicGainN = sizeof(kMicGainDb10) / sizeof(kMicGainDb10[0]);
+
+bool LaapAudio::setMicGainDb(int db10) {
+  if (!mic) return false;
+  int best = 0, bestDiff = 100000;
+  for (int i = 0; i < kMicGainN; i++) {
+    int d = abs(kMicGainDb10[i] - db10);
+    if (d < bestDiff) { bestDiff = d; best = i; }
+  }
+  s_cc.mic_gain = (es7210_mic_gain_t)best;
+  _micGainDb = kMicGainDb10[best];
+  return es7210_config_codec(mic, &s_cc) == ESP_OK;
+}
 
 bool LaapAudio::begin() {
   // I2S 全双工（Wire 已由 display 初始化）
@@ -63,16 +80,16 @@ bool LaapAudio::begin() {
   // ---- ES7210 麦克风 ----
   const es7210_i2c_config_t i2cc = { .i2c_port = 0, .i2c_addr = ES7210_ADDR };
   if (es7210_new_codec(&i2cc, &mic) == ESP_OK && mic) {
-    const es7210_codec_config_t cc = {
+    s_cc = {
       .sample_rate_hz = AUD_I2S_RATE,
       .mclk_ratio = 256,
       .i2s_format = ES7210_I2S_FMT_I2S,          // 官方例程同为 I2S 格式
       .bit_width = ES7210_I2S_BITS_16B,
       .mic_bias = ES7210_MIC_BIAS_2V87,
-      .mic_gain = ES7210_MIC_GAIN_30DB,
+      .mic_gain = ES7210_MIC_GAIN_37_5DB,        // 默认拉满：30dB 实测只有 6dB 余量，远场说话会被埋
       .flags = { .tdm_enable = true },
     };
-    if (es7210_config_codec(mic, &cc) == ESP_OK) micOk = true;
+    if (es7210_config_codec(mic, &s_cc) == ESP_OK) micOk = true;
     else Serial.println("[AUD] ES7210 config 失败");
   } else {
     Serial.println("[AUD] ES7210 create 失败");

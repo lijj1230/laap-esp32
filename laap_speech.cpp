@@ -26,7 +26,9 @@ size_t wavWrap(const int16_t* pcm, size_t bytes, uint8_t* out, size_t outCap) {
     hdr[off] = v & 0xFF; hdr[off+1] = (v>>8)&0xFF; hdr[off+2] = (v>>16)&0xFF; hdr[off+3] = (v>>24)&0xFF;
   };
   put32(4, 36 + dataLen);
-  put32(16, byteRate);
+  put32(28, byteRate);        // 偏移 28 = 字节率。曾误写成 put32(16,...)：那里是 fmt 块长（应为 16），
+                              // 结果 fmt 块长被写成 32000、字节率为 0 —— 整份 WAV 非法，
+                              // 服务端解码失败一律回 HTTP 500（这就是 ASR 一直不通的根因）
   put32(40, dataLen);
   if (44 + dataLen > outCap) dataLen = (outCap > 44) ? outCap - 44 : 0;
   put32(4, 36 + dataLen); put32(40, dataLen);          // 截断后重填两处长度
@@ -209,8 +211,15 @@ static int transcribeOnce(const char* baseC, const char* keyC, const char* model
   memcpy(body + head.length() + wavLen, tail.c_str(), tail.length());
 
   String resp;
+  uint32_t tSendStart = millis();
   int code = httpsPost(url, String("multipart/form-data; boundary=") + bound, body, total, keyC, resp, warm);
+  size_t sentLen = total;
   free(body);
+  // 把"发了多大、花了多久、HTTP 几"打出来：服务端排队慢 vs 请求被拒，一眼可分
+  // （实测 SiliconFlow 免费 SenseVoiceSmall 排队时，同一个 32KB 请求会在 1s~40s 之间变化）
+  Serial.printf("[ASR] %s 上行 %uB 用时 %lums → HTTP %d\n",
+                String(baseC).indexOf("dashscope") >= 0 ? "百炼" : "OpenAI兼容",
+                (unsigned)sentLen, (unsigned)(millis() - tSendStart), code);
   if (code != 200) { err = "HTTP " + String(code) + " " + resp.substring(0, 120); return code; }
   // OpenAI 兼容取 "text"；百炼原生取 "headers"...(响应在 output.text / 或结果数组内)，宽松依次试
   if (!extractJsonStr(resp, "text", text))
@@ -232,15 +241,28 @@ String AsrClient::transcribe(const int16_t* pcm16k, size_t bytes, String& err) {
   String text;
   warmLock();
   WiFiClient* warmConn = g_warmOk ? (WiFiClient*)&g_warm : nullptr;
+  bool usedWarm = (warmConn != nullptr);
   int code = transcribeOnce(cfg.s.asrBase, cfg.s.asrKey, cfg.s.asrModel, wav, wavLen, text, err, warmConn);
   if (g_warmOk) { g_warmOk = false; g_warm.stop(); }   // 热连接一次性（Connection: close）
   warmUnlock();
+  // 预热连接是录音前握好的，服务端 keep-alive 超时/LB 回收可能在这几秒里把它关掉 →
+  // 写失败（-3）而不是请求被拒。这种情况必须用新连接重发一次，否则 ASR 会在"看起来
+  // 什么都正常"的情况下静默失败（实测坑）。
+  if (usedWarm && code != 200) {
+    Serial.printf("[ASR] 热连接失败(%s) → 改用新连接重试\n", err.c_str());
+    String t2b, e2b;
+    int c2b = transcribeOnce(cfg.s.asrBase, cfg.s.asrKey, cfg.s.asrModel, wav, wavLen, t2b, e2b, nullptr);
+    if (c2b == 200) { free(wav); err = ""; return t2b; }
+    code = c2b; text = t2b; err = e2b;
+  }
   if (code != 200 && code != -1) {
     // 主 ASR 失败 → 备用 ASR 自动回退（配置了才试）
     Serial.printf("[ASR] 主服务商失败(%s)，尝试备用…\n", err.c_str());
+    String errMain = err;                 // 备用失败时会写 err，别让它盖掉主服务的真报错
     String text2;
     int code2 = transcribeOnce(cfg.s.asr2Base, cfg.s.asr2Key, cfg.s.asr2Model, wav, wavLen, text2, err);
     if (code2 == 200) { free(wav); return text2; }
+    err = errMain + " ｜ 备用: " + err;   // 两条都留着，排障时一眼看清是谁的问题
   }
   free(wav);
   if (code != 200) return "";

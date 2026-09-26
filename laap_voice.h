@@ -25,6 +25,10 @@ public:
   // 返回识别到的用户文本（空=未识别/取消）
   String converse();
 
+  // 应答段（converse 的后半截）：把一句"听到的话"交给主程序并决定怎么念。
+  // 抽出来是为了让诊断命令 /voicetest 能走**同一条**路径（不起麦也能验"只说一次"）。
+  String respond(const String& heard);
+
   // 空闲轮询（VAD 模式下检测到人声→自动开启一轮对话）
   void loopTick();
 
