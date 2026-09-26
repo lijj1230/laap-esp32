@@ -1,6 +1,7 @@
 #include "laap_cognition.h"
 #include "laap_memory.h"
 #include "laap_snap.h"   // evolution.json 每次心跳都可能重写：快照走自动档节流
+#include "laap_llm.h"    // utf8Cut（意图文本按字符边界截断）
 #include <LittleFS.h>
 #include <time.h>
 
@@ -37,6 +38,8 @@ void Cognition::begin() {
   loadEvolution();
   _gen++;
   saveEvolution();
+  loadIntents();
+  dropStaleIntents((uint32_t)time(nullptr));
   lastUserMs = millis();
 }
 
@@ -48,33 +51,37 @@ void Cognition::tick(float dtMin) {
   if (now > 1700000000) { // NTP 已同步
     struct tm tmv; localtime_r(&now, &tmv); hour = tmv.tm_hour;
   }
-  // 能量：夜间积累快，白天慢
+  // ============================================================
+  //  稳态化（active inference 的 homeostasis）：增长项乘饱和因子 (1-x)。
+  //  每个"增长-衰减"对从此有稳定平衡点 x* = g/(g+d) < 1——需求永不可能
+  //  被钉死在 1.0（结构性防跑飞），也不再依赖"回补速率必须大于累积速率"
+  //  的调参巧合（那是当年"卡阈值死循环"补丁的根因）。各平衡点：
+  //    夜间能量 0.375（安睡）/ 白天独处能量 0.31（打盹）/ 独处社交 0.42~0.59
+  //    独处表达 0.44 / 稳定网络安全 0.33 —— 全部落在各自情绪阈值的合理侧。
+  //  ============================================================
   float night = (hour >= 22 || hour < 7);
-  _n.energy += (night ? 0.012f : 0.004f) * dtMin;
-  _n.curiosity += 0.008f * dtMin;
-  _n.social += 0.010f * dtMin;
-  _n.expression += 0.007f * dtMin;
-  _n.security += 0.002f * dtMin;
+  _n.energy     += (night ? 0.012f : 0.004f) * dtMin * (1.0f - _n.energy);
+  _n.curiosity  += 0.008f * dtMin * (1.0f - _n.curiosity);
+  _n.social     += 0.010f * dtMin * (1.0f - _n.social);
+  _n.expression += 0.007f * dtMin * (1.0f - _n.expression);
+  _n.security   += 0.002f * dtMin * (1.0f - _n.security);
 
   // ============================================================
-  //  自我回补（没有这一段，需求只涨不落 → 主动表达会变成死循环）
-  //  实测逻辑：energy 只增不减 + onExpressed 还 +0.03，一旦越过阈值
-  //  dominance() 永远 ≥ 阈值 → 每 10 秒心跳都调一次 arisExpress（LLM 一空就说话），
-  //  且情绪永久停在"疲惫"、每次都嘟囔"我累了"。social/security 同理。
-  //  回补速率必须**大于**上面的累积速率，否则只是把"涨"变成"冻结"（仍会卡在阈值上）。
+  //  自我回补（独处/夜间回落）：线性衰减在低值区自然趋缓（×x 的比例式也一样），
+  //  与上面的饱和增长构成完整稳态环。
   // ============================================================
   float aloneMin = (millis() - lastUserMs) / 60000.0f;
   bool quiet = aloneMin > 5.0f;                       // 五分钟没人理 = 独处静息
-  if (night)        _n.energy -= 0.020f * dtMin;      // 夜里睡了：净 -0.008/分（1.0→0.3 约 90 分钟）
-  else if (quiet)   _n.energy -= 0.009f * dtMin;      // 白天独处打盹：净 -0.005/分
+  if (night)        _n.energy -= 0.020f * dtMin;      // 夜里睡下：平衡点 0.375
+  else if (quiet)   _n.energy -= 0.009f * dtMin;      // 白天独处打盹：平衡点 0.31
   if (quiet) {                                        // 独处久了会自我调适（不调适就永远黏人）
-    _n.social     -= 0.014f * dtMin;                  // 与 +0.010/+0.005 相抵后≈持平：孤独高位盘整
-    _n.expression -= 0.009f * dtMin;                  // 与 +0.007 相抵：缓慢回落
+    _n.social     -= 0.014f * dtMin;                  // 平衡点 0.42（<30min 时）
+    _n.expression -= 0.009f * dtMin;                  // 平衡点 0.44
   }
-  if (rssiDb == 0 || rssiDb > -70) _n.security -= 0.004f * dtMin;  // 环境稳定=安全感回落
+  if (rssiDb == 0 || rssiDb > -70) _n.security -= 0.004f * dtMin;  // 环境稳定=安全感回落（平衡 0.33）
   if (rssiDb != 0 && rssiDb < -80) _n.security += 0.02f * dtMin;   // 信号差/断网 → 不安（原来的环境调制）
   if (motionLevel > 0.3f) _n.curiosity -= 0.02f * dtMin;           // 世界有动静 → 好奇被满足
-  if (aloneMin > 30) _n.social += 0.005f * dtMin;                  // 太久没人理仍会想念（与回补相抵，形成平衡）
+  if (aloneMin > 30) _n.social += 0.010f * dtMin * (1.0f - _n.social); // 太久没人理仍会想念（0.010 保平衡点 ≈0.59，孤独阈值 0.62 附近）
 
   // 愉悦度回归中位
   _pleasure += (0.5f - _pleasure) * 0.02f * dtMin;
@@ -111,6 +118,82 @@ void Cognition::onMonologue() {
   _n.social *= 0.88f;
   _n.energy += 0.015f;                       // 动脑子也耗精力
   _pleasure = _pleasure * 0.85f + 0.15f * 0.6f;
+}
+
+// 发现新知：好奇的消解量随新颖度走——查到全新的东西（gain 高）比把已知的事再聊一遍
+// （gain 低）满足得多（active inference：好奇 = 不确定性下降，Schmidhuber 的学习进度）
+void Cognition::onDiscovery(float gain01) {
+  if (gain01 < 0) return;
+  if (gain01 > 1) gain01 = 1;
+  _n.curiosity -= 0.02f + 0.06f * gain01;
+  if (_n.curiosity < 0.05f) _n.curiosity = 0.05f;
+  _pleasure = _pleasure * 0.9f + 0.1f * (0.6f + 0.3f * gain01);
+}
+
+// ================= 意图栈（PIANO goals 模块） =================
+static const char* INTENTS_PATH = "/mem/intents.txt";
+
+void Cognition::loadIntents() {
+  intentN = 0;
+  File f = LittleFS.open(INTENTS_PATH, "r");
+  if (!f) return;
+  while (f.available() && intentN < 3) {
+    String ln = f.readStringUntil('\n');
+    ln.trim();
+    int bar = ln.indexOf('|');
+    if (bar <= 0) continue;
+    intentBorn[intentN] = (uint32_t)ln.substring(0, bar).toInt();
+    intents[intentN] = ln.substring(bar + 1);
+    if (intents[intentN].length()) intentN++;
+  }
+  f.close();
+}
+
+void Cognition::saveIntents() {
+  File f = LittleFS.open(INTENTS_PATH, "w");
+  if (!f) return;
+  for (int i = 0; i < intentN; i++)
+    f.printf("%lu|%s\n", (unsigned long)intentBorn[i], intents[i].c_str());
+  f.close();
+}
+
+bool Cognition::addIntent(const String& text, uint32_t ts) {
+  String t = text;
+  t.trim();
+  t = utf8Cut(t, 60);                        // ≤20 字
+  if (t.length() < 6) return false;
+  for (int i = 0; i < intentN; i++)
+    if (intents[i] == t) return false;       // 已有
+  if (intentN >= 3) {                        // 满：放下最老的
+    int oldest = 0;
+    for (int i = 1; i < intentN; i++) if (intentBorn[i] < intentBorn[oldest]) oldest = i;
+    for (int i = oldest; i < intentN - 1; i++) { intents[i] = intents[i + 1]; intentBorn[i] = intentBorn[i + 1]; }
+    intentN--;
+  }
+  intents[intentN] = t; intentBorn[intentN] = ts; intentN++;
+  saveIntents();
+  return true;
+}
+
+void Cognition::dropIntent(int i) {
+  if (i < 0 || i >= intentN) return;
+  for (int k = i; k < intentN - 1; k++) { intents[k] = intents[k + 1]; intentBorn[k] = intentBorn[k + 1]; }
+  intentN--;
+  saveIntents();
+}
+
+void Cognition::dropStaleIntents(uint32_t nowTs) {
+  bool changed = false;
+  for (int i = intentN - 1; i >= 0; i--)
+    if (intentBorn[i] && nowTs > intentBorn[i] + 7UL * 86400UL) { dropIntent(i); changed = true; }
+  (void)changed;
+}
+
+String Cognition::intentsLine() const {
+  if (intentN == 0) return "";
+  String s = "心里惦记的事：";
+  for (int i = 0; i < intentN; i++) { if (i) s += "、"; s += "「" + intents[i] + "」"; }
+  return s;
 }
 
 void Cognition::onError() {

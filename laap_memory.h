@@ -29,6 +29,11 @@ public:
   void setSemantic(const String& s);
   uint32_t eventCount() const { return _count; }
   String episodicTail(int n);                            // 最近 n 条（Web 查看）
+  // 夜间记忆整理（Letta 式 sleep-time compute）：带绝对行号的尾部导出 + 执行 LLM 给出的删除清单。
+  // 只允许"删"这一种操作且固件侧验证上限——绝不把记忆正文交回模型重写（防幻觉篡改人格）
+  String episodicNumberedTail(int n);                    // "12. {json}"（绝对行号）
+  void applyTidyOps(const String& opsJson);              // [{"n":行号,"op":"del"}]，≤12 条
+  float noveltyOf(const String& text);                   // 新颖度 0..1（-1=无法评估）
   void clearAll();
   // 记忆搬家（备份/恢复/换分区）：分段纯文本，含情景+语义+性格进化。
   // 导入先落临时文件再逐行解析，整份不进内存（300 行也只要几 KB 缓冲）

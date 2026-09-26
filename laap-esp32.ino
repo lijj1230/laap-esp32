@@ -109,8 +109,8 @@ static String g_recentTopics;          // 最近自问话题（防重复，滚�
 #define BTN_PIN 0
 static uint32_t g_btnDown = 0;
 
-// LLM 请求种类（F4 后台任务的收割分流）：聊天/主动表达/独白/记忆压缩/夜间反思/规则归纳/技能提取
-enum LlmKind : uint8_t { LK_CHAT = 0, LK_EXPRESS, LK_MONO, LK_CONSOLIDATE, LK_REFLECT, LK_RULES, LK_SKILL };
+// LLM 请求种类（F4 后台任务的收割分流）：聊天/主动表达/独白/记忆压缩/夜间反思/规则归纳/技能提取/意图生成/记忆整理
+enum LlmKind : uint8_t { LK_CHAT = 0, LK_EXPRESS, LK_MONO, LK_CONSOLIDATE, LK_REFLECT, LK_RULES, LK_SKILL, LK_INTENT, LK_TIDY };
 
 // ---------- 函数声明 ----------
 void psiTick();
@@ -212,6 +212,8 @@ static volatile bool g_llmHasNew = false;
 static volatile uint8_t g_resultKind = LK_CHAT;       // 本次结果的请求种类
 static uint8_t g_llmFailStreak = 0;                   // LLM 连续失败次数（≥2 独白让路）
 static String g_monoTopic, g_monoSight, g_monoKnow;   // 独白中间产物（收割侧落盘）
+static String g_monoGoal;       // 本轮独白若由意图驱动，这里带目标快照（提交侧拍好，任务只读）
+static bool g_monoDone = false; // 模型在独白里报了【完成】= 意图已弄明白
 
 // 独白流水线（跑在后台 LLM 任务里：出题→看一眼→搜索→成文，纯网络无 UI）
 static String g_monoCtx;    // 提交侧（loopTask）拍的上下文快照，llmTask 只读它
@@ -219,9 +221,17 @@ static String g_monoSys;    // 同上：buildSystemPrompt 也读 mind 全量，�
 static String g_monoTopics; // 同上：g_recentTopics 由收割侧（loopTask）追加，后台读会撕裂 String
 
 static LlmReply monologueGenerate() {
+  // 意图驱动（PIANO goals）：隔一轮独白，把"心里惦记的事"当作出题方向——
+  // 想法有了跨轮连续性；模型判断目标已弄明白时输出【完成】，收割侧结算
+  String goalPart;
+  if (g_monoGoal.length()) {
+    goalPart = String("你心里一直惦记着一个目标：「") + g_monoGoal +
+               "」。这次围绕它推进一步。若判断已经弄明白了，最后另起一行只写【完成】。";
+  }
   LlmMsg m1[2] = {
-    {"system", String("你是") + cfg.s.agentName + "，正在独立思考。基于你的性格参数与最近经历，"
-               "提出一个此刻最好奇的具体问题。只回两行：第一行是问题本身（15字内，不要标点结尾）；"
+    {"system", String("你是") + cfg.s.agentName + "，正在独立思考。基于你的性格参数与最近经历，" +
+               (goalPart.length() ? goalPart : "提出一个此刻最好奇的具体问题。") +
+               "只回两行：第一行是问题本身（15字内，不要标点结尾）；"
                "第二行是搜索它的关键词（2到4个词，主语在前，空格分隔，不要解释）。"
                "最近已经想过这些（不要重复）：" + g_monoTopics},
     {"user", String("主导欲望是「") + mind.goalCn() + "」，情绪「" + mind.moodCn() + "」。想一个新问题。"} };
@@ -236,6 +246,8 @@ static LlmReply monologueGenerate() {
   // 第一行=问题，第二行=搜索词（防主语劫持：必应按首词排序，主语要放最前）
   String topic = q.say, query = q.say;
   topic.trim(); query.trim();
+  // 意图结算：模型多出的第三行【完成】= 这个目标已经弄明白了（收割侧 dropIntent）
+  if (topic.indexOf("【完成】") >= 0) { g_monoDone = true; topic.replace("【完成】", ""); query.replace("【完成】", ""); topic.trim(); query.trim(); }
   int nl = query.indexOf('\n');
   if (nl > 0) {
     String kw = query.substring(nl + 1); query = query.substring(0, nl);
@@ -540,6 +552,19 @@ void llmHarvest() {
     }
     return;
   }
+  if (kind == LK_INTENT) {                             // 意图生成：新增"心里惦记的事"
+    String s = r.say; s.trim();
+    if (r.ok && !s.startsWith("NO") && s.length() >= 6 && s.length() <= 90) {
+      if (mind.addIntent(utf8Cut(s, 60), time(nullptr)))
+        Serial.printf("[LAAP·意图] 心里升起一个目标：%s\n", s.c_str());
+    }
+    return;
+  }
+  if (kind == LK_TIDY) {                               // 记忆整理：执行删除清单
+    if (r.ok) memory.applyTidyOps(r.say);
+    else Serial.printf("[TIDY] 整理失败: %s\n", llm.lastError.c_str());
+    return;
+  }
   if (kind == LK_MONO) {                                          // 独白：失败保持安静，不本地兜底
     if (g_monoSight.length()) vision.logSight(g_monoSight);
     if (!r.ok) {
@@ -550,9 +575,26 @@ void llmHarvest() {
     g_lastSay = r.say;
     g_lastExpr = r.expr.length() ? r.expr : "curious";
     mind.onMonologue();      // 自言自语也算表达/好奇被满足（原来不算 → 需求只涨不落）
+    // 好奇=信息增益（active inference）：算这条新知相对已有记忆的新颖度，
+    // 新颖度高多消解好奇、陈词滥调少消解——好奇从此指向学习进度而非时间流逝
+    float nov = memory.noveltyOf(g_monoKnow.length() ? g_monoKnow : g_monoTopic);
+    if (nov >= 0) {
+      mind.onDiscovery(nov);
+      Serial.printf("[Cognition] 新知新颖度 %.0f%% → 好奇额外消解\n", nov * 100);
+    }
     display.drawFace(g_lastExpr.c_str());
     memory.logEvent("aris", "【自发】我刚才在想「" + g_monoTopic + "」：" + r.say);
     if (g_monoKnow.length()) memory.logEvent("world", g_monoTopic + " → " + utf8Cut(g_monoKnow, 80));  // 字节截断会切半汉字（曾污染 episodes.jsonl）
+    if (g_monoDone && g_monoGoal.length()) {   // 意图结算：目标弄明白了
+      while (mind.intentCount() > 0 && mind.intent(0) != g_monoGoal) mind.dropIntent(0);
+      if (mind.intentCount() > 0 && mind.intent(0) == g_monoGoal) {
+        mind.dropIntent(0);
+        mind.onDiscovery(1.0f);                // 达成目标 = 最强的确定性下降
+        memory.logEvent("event", "【达成】" + g_monoGoal);
+        Serial.printf("[LAAP·意图] 目标已弄明白：「%s」（放下）\n", g_monoGoal.c_str());
+      }
+      g_monoGoal = ""; g_monoDone = false;
+    }
     Serial.printf("[Aris·独白] %s\n", r.say.c_str());
     display.drawNeeds(mind.needs().energy, mind.needs().curiosity, mind.needs().social,
                       mind.needs().security, mind.needs().expression);
@@ -618,6 +660,11 @@ bool arisIdleMonologue() {
   // 提交侧（loopTask）清中间产物：清空这个动作必须在任务开始写之前、且只由主线程做，
   // 否则"任务重置 + 收割侧读取"同刻发生就是 String 撕裂
   g_monoTopic = g_monoSight = g_monoKnow = "";
+  g_monoDone = false;
+  // 意图驱动：隔一轮独白把第一号目标当作出题方向（提交侧拍快照，任务只读）
+  static uint8_t s_monoSeq = 0;
+  g_monoGoal = "";
+  if (mind.intentCount() > 0 && (s_monoSeq++ & 1)) g_monoGoal = mind.intent(0);
   // 提交侧拍快照：llmTask 里不再遍历 _work String 环 / mind / g_recentTopics
   // （这些都由 loopTask 并发改写，后台直接读=String 撕裂→堆损坏）
   g_monoCtx = memory.recentContext(300);
@@ -704,6 +751,10 @@ String buildSystemPrompt() {
   {   // RSI④: 主人亲手教的口令技能（/mem/skills.txt，说"以后每当我说X你就Y"就能教）
     String sk = skills.promptLine();
     if (sk.length()) p += sk + "\n";
+  }
+  {   // 意图栈：心里惦记的事（跨轮推进的目标——聊天里若主人提到相关话题，自然接上）
+    String it = mind.intentsLine();
+    if (it.length()) p += it + "\n";
   }
 
   // ---- 实时内在状态（需求→语气的行为指引，内核→皮层的正式通路） ----
@@ -967,6 +1018,63 @@ void rulesReflect(bool force) {
 }
 
 // ============================================================
+//  意图栈（PIANO goals）：好奇度高且目标不满 3 个时，让 LLM 从最近经历里
+//  提一个"此刻最想弄明白的小目标"→ 存 /mem/intents.txt，独白隔轮推进它。
+//  心跳节流：2 小时最多起一次意。
+// ============================================================
+static uint32_t s_lastIntentMs = 0;
+
+void intentSpawnTick() {
+  if (mind.intentCount() >= 3) return;
+  if (mind.needs().curiosity < 0.75f) return;         // 只有真好奇才立目标
+  if (s_lastIntentMs && millis() - s_lastIntentMs < 2UL * 3600UL * 1000UL) return;
+  if (time(nullptr) < 1700000000) return;             // 没钟没法记 born 时间
+  LlmMsg m[2] = {
+    {"system", String("基于数字生命") + cfg.s.agentName + "最近的经历与性格，提出一个它此刻最想弄明白"
+                "或想做的具体小目标（不超过18字，可以是观察主人的一个变化、探索一个话题、验证一个想法）。"
+                "只输出目标本身；若最近经历没有任何素材能形成目标，只输出 NO。"},
+    {"user", "最近经历：\n" + memory.recentContext(400) +
+             "\n已有的目标：" + (mind.intentsLine().length() ? mind.intentsLine() : String("无"))} };
+  if (llmSubmit(m, 2, 240, 0.8f, "", LK_INTENT))
+    s_lastIntentMs = millis();                        // 失败不计时，下个心跳还能试
+}
+
+// ============================================================
+//  记忆整理（Letta 式 sleep-time compute）：深夜窗口用 LLM 对情景记忆做
+//  合并重复/清理过期——模型只输出"删除行号清单"，执行与验证全在固件侧
+//  （绝不把记忆正文交回模型重写，防幻觉篡改人格）。
+// ============================================================
+static int g_lastTidyDay = -1;
+
+void memoryTidy(bool force) {
+  time_t now = time(nullptr);
+  if (now < 1700000000 && !force) return;
+  struct tm t; localtime_r(&now, &t);
+  int day = t.tm_yday;
+  if (!force) {
+    if (g_lastTidyDay == day) return;
+    if (t.tm_hour >= 6) { g_lastTidyDay = day; return; }
+    g_lastTidyDay = day;
+  }
+  String mat = memory.episodicNumberedTail(60);
+  if (mat.length() < 400) {                            // 少于 ~15 条不值一次调用
+    if (!force) g_lastTidyDay = day;
+    Serial.println("[TIDY] 记忆太少，跳过整理");
+    return;
+  }
+  Serial.println("[TIDY] 提交整理（素材：最近 60 条）…");
+  LlmMsg m[2] = {
+    {"system", String("你是数字生命") + cfg.s.agentName + "的记忆管理员。下面带编号的行是它的情景记忆"
+                "（越靠后越新）。找出：①内容重复或高度相似的行（只保留编号最小的一条，其余删除）"
+                "②已过期的一次性临时信息（几小时前的天气、当时的临时状态）③纯噪声。"
+                "关于主人的记忆和它的感受，绝不删。"
+                "只输出 JSON 数组，最多 12 条：[{\"n\":行号,\"op\":\"del\"}]；没有可删的输出 []。禁止解释。"},
+    {"user", mat} };
+  if (!llmSubmit(m, 2, 600, 0.2f, "", LK_TIDY))
+    Serial.println("[TIDY] LLM 正忙，下个心跳再试");
+}
+
+// ============================================================
 //  PSI 心跳
 // ============================================================
 void psiTick() {
@@ -976,6 +1084,8 @@ void psiTick() {
   mind.incCycle();
   nightlyReflect(false);   // F7: 深夜复盘（内部自带每天一次节流）
   rulesReflect(false);     // RSI: 深夜规则归纳（反馈+失败→行为规则集；LLM 忙则下个心跳再试）
+  memoryTidy(false);       // 睡眠期记忆整理：合并重复/清理过期（Letta 式 sleep-time compute）
+  intentSpawnTick();       // 意图栈：好奇高且目标不满 → 提一个新目标（2h 节流）
   voice.tuneTick();        // RSI⑥: 参数自调优（内部按 5 分钟窗口评估，纯 C 零 LLM 成本）
 
   // IMU 世界感知
@@ -1041,7 +1151,7 @@ void serialCli() {
     if (!line.length()) continue;
     laapActivity();     // 串口打字也是交互
     if (line == "/help") {
-      Serial.println("命令: /status /look(视觉识图) /search 词 /weather 城市 /touch(摇晃) /touchpad(触摸) /screen N /redraw /i2cscan /portal /mem /reflect(立刻反思) /rules(看行为规则) /rulesreflect(立刻归纳规则) /skills(看口令技能) /mono(立刻独白) /nothink 0|1 /beep(回环测声) /tick /lcd /pa /imu /micgain(麦克风增益) /voicetest 文本(应答路径) /asrsend(不录音测请求) /asrloop 话(自听回环) /asrtest(录音识别) /metrics(评估埋点) /snap(快照列表) /snap restore 名 版本 /snaptake(强制快照) /reset");
+      Serial.println("命令: /status /look(视觉识图) /search 词 /weather 城市 /touch(摇晃) /touchpad(触摸) /screen N /redraw /i2cscan /portal /mem /reflect(立刻反思) /rules(看行为规则) /rulesreflect(立刻归纳规则) /skills(看口令技能) /intents(看意图) /intent 词(手动加目标) /tidy(整理记忆) /mono(立刻独白) /nothink 0|1 /beep(回环测声) /tick /lcd /pa /imu /micgain(麦克风增益) /voicetest 文本(应答路径) /asrsend(不录音测请求) /asrloop 话(自听回环) /asrtest(录音识别) /metrics(评估埋点) /snap(快照列表) /snap restore 名 版本 /snaptake(强制快照) /reset");
       Serial.println("      直接打字回车 = 跟它说话（走完整对话链路）");
     } else if (line == "/touch") {
       // 触觉实测：5 秒采样，摇晃/扣翻板子看峰值与判定
@@ -1450,6 +1560,16 @@ void serialCli() {
     } else if (line == "/skills clear") {
       skills.clear();
       Serial.println("[SKILLS] 技能已清空");
+    } else if (line == "/intents") {
+      String it = mind.intentsLine();
+      Serial.println(it.length() ? it : String("[INTENTS] 心里没有惦记的事（好奇 >0.75 且空闲时会自己升起目标）"));
+    } else if (line.startsWith("/intent ")) {
+      // 手动塞一个目标（测试意图驱动独白用）：/intent 观察主人喝水的规律
+      if (mind.addIntent(line.substring(8), time(nullptr))) Serial.println("[INTENTS] 已加入");
+      else Serial.println("[INTENTS] 加入失败（太短/重复/已满）");
+    } else if (line == "/tidy") {
+      memoryTidy(true);
+      Serial.println("[TIDY] 已提交整理，LLM 出清单后自动执行（约 10~30 秒）");
     } else if (line.startsWith("/vol")) {
       // 必须区分"查询"和"设置"：旧代码对空参数 `"".toInt()`=0 也放行，
       // 于是打一句 /vol 查询就把音量写成 0 并落盘 → 整机静音（且重启也不恢复）

@@ -30,6 +30,18 @@ public:
   // 独白（自言自语）：也算"说了话"，好奇/表达/社交都该被满足一点——
   // 原来独白走的是 LK_MONO 提前 return 的支路，完全不计入满足，需求照样只涨不落
   void onMonologue();
+  // 发现新知（active inference：好奇=不确定性下降）。gain01=新颖度 0..1
+  // （1=查到全新的东西，0=全是已知），新颖越高满足越多。gain01<0 表示无法评估，不调用。
+  void onDiscovery(float gain01);
+
+  // ---- 意图栈（PIANO goals 模块）：1~3 个持久小目标，跨轮推进（/mem/intents.txt） ----
+  // 行格式 "ts|text"；独白隔轮围绕 intent[0] 推进，模型报【完成】即结算并大降好奇
+  bool addIntent(const String& text, uint32_t ts);  // 去重/≤60B/满3淘汰最老
+  void dropIntent(int i);
+  void dropStaleIntents(uint32_t nowTs);            // 7 天未完成自动放下
+  String intentsLine() const;                       // "心里惦记的事：「X」「Y」"（无则空）
+  const String& intent(int i) const { return intents[i]; }
+  int intentCount() const { return intentN; }
   void onError();                     // LLM/网络出错：不安全感上升
   void sense(float motion, int rssi); // 世界模型传感器输入
   void senseBody(float tempC, int rssi, uint32_t upMs, float dtMin); // 小凌②③: 身体状态调制系数（按分钟计率）
@@ -79,6 +91,11 @@ private:
   float _sensitivity = 0.5f;   // 敏感度：放大安全权重
   uint32_t _gen = 0, _cycles = 0, _chats = 0;
   float _pleasure = 0.5f;      // 近期愉悦度（情绪用）
+  String intents[3];           // 意图栈（PIANO goals）
+  uint32_t intentBorn[3] = {0, 0, 0};
+  int intentN = 0;
+  void loadIntents();          // begin() 读回 /mem/intents.txt
+  void saveIntents();
   bool loadEvolution();
 };
 

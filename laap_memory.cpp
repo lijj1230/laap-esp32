@@ -431,6 +431,149 @@ String MemorySystem::episodicTail(int n) {
   return out;
 }
 
+// ================= 夜间记忆整理（Letta 式 sleep-time compute 的执行端） =================
+// 带绝对行号的尾部导出（给 LLM 当素材；行号供删除指令引用）
+String MemorySystem::episodicNumberedTail(int n) {
+  File f = LittleFS.open(EP_PATH, "r");
+  if (!f) return "";
+  int total = 0;
+  while (f.available()) { if (f.read() == '\n') total++; }
+  f.close();
+  int start = total - n + 1;
+  if (start < 1) start = 1;
+  f = LittleFS.open(EP_PATH, "r");
+  if (!f) return "";
+  String out;
+  int lineno = 0;
+  while (f.available()) {
+    String l = f.readStringUntil('\n');
+    l.trim();
+    if (!l.length()) continue;
+    lineno++;
+    if (lineno >= start) out += String(lineno) + ". " + l + "\n";
+  }
+  f.close();
+  return out;
+}
+
+// 执行 LLM 给出的删除清单（宽容扫描，只认 n+del 配对，≤12 条）。
+// 向量缓存与行序绑死：删除时同步压缩 emb.bin（对不上就整份作废重建）
+void MemorySystem::applyTidyOps(const String& opsJson) {
+  File f = LittleFS.open(EP_PATH, "r");
+  if (!f) return;
+  int total = 0;
+  while (f.available()) { if (f.read() == '\n') total++; }
+  f.close();
+  if (!total) return;
+
+  std::vector<char> del(total, 0);
+  int cnt = 0;
+  int pos = 0;
+  while (cnt < 12) {
+    int np = opsJson.indexOf("\"n\":", pos);
+    if (np < 0) break;
+    int ob = opsJson.indexOf('}', np);
+    String chunk = opsJson.substring(np, ob > 0 ? ob : opsJson.length());
+    pos = (ob > 0) ? ob + 1 : (int)opsJson.length();
+    String numStr;
+    for (unsigned int k = 4; k < chunk.length(); k++) {
+      char c = chunk[k];
+      if (c == ',' || c == '}') break;
+      if (c >= '0' && c <= '9') numStr += c;
+    }
+    if (!numStr.length()) continue;
+    long n = numStr.toInt();
+    if (n < 1 || n > total || chunk.indexOf("\"del\"") < 0) continue;
+    if (!del[n - 1]) { del[n - 1] = 1; cnt++; }
+  }
+  if (!cnt) { Serial.println("[TIDY] 模型无可整理项（或清单为空）"); return; }
+
+  // 重写记忆文件（先 tmp 再 rename，掉电不丢整份），删除前强制快照
+  laapSnapMake("episodes", true);
+  File in = LittleFS.open(EP_PATH, "r");
+  File out = LittleFS.open("/mem/episodes.tmp", "w");
+  if (!in || !out) { if (in) in.close(); if (out) out.close(); return; }
+  int lineno = 0, kept = 0;
+  while (in.available()) {
+    String l = in.readStringUntil('\n');
+    if (!l.length()) continue;
+    lineno++;
+    if (lineno <= total && del[lineno - 1]) continue;
+    out.println(l);
+    kept++;
+  }
+  in.close(); out.close();
+  LittleFS.remove(EP_PATH);
+  LittleFS.rename("/mem/episodes.tmp", EP_PATH);
+  _count = kept;
+
+  // 向量缓存同步压缩（行号一一对应）；对不上号就整份作废（embedTick 会限速重建）
+  File ef = LittleFS.open(EMB_PATH, "r");
+  bool aligned = false;
+  if (ef && (int)_embCount == total) {
+    File eo = LittleFS.open("/mem/emb.tmp", "w");
+    if (eo) {
+      float* row = (float*)malloc(EMB_DIM * 4);
+      int idx = 0, keptv = 0;
+      bool okw = true;
+      while (row && ef.read((uint8_t*)row, EMB_DIM * 4) == EMB_DIM * 4) {
+        idx++;
+        if (idx <= total && del[idx - 1]) continue;
+        if (eo.write((uint8_t*)row, EMB_DIM * 4) != EMB_DIM * 4) { okw = false; break; }
+        keptv++;
+      }
+      if (row) free(row);
+      eo.close();
+      if (okw && idx == total && keptv == kept) {
+        LittleFS.remove(EMB_PATH);
+        LittleFS.rename("/mem/emb.tmp", EMB_PATH);
+        _embCount = keptv;
+        aligned = true;
+      } else {
+        LittleFS.remove("/mem/emb.tmp");
+      }
+    }
+  }
+  if (ef) ef.close();
+  if (!aligned) {
+    LittleFS.remove(EMB_PATH);
+    _embCount = 0;
+  }
+  Serial.printf("[TIDY] 整理完成：删 %d 条，剩 %d 条（向量缓存%s）\n",
+                cnt, kept, aligned ? "同步压缩" : "作废重建");
+}
+
+// 新知识相对已有记忆的新颖度 0..1（1=全新，0=完全已知）。-1=无法评估（熔断/无向量/失败）。
+// 供独白收割算"信息增益"：好奇心只该被真正的新知满足（active inference）。
+// 失败不计入 _embFail 熔断（独白后的堆紧张会造成假失败，不该连累召回通道）。
+float MemorySystem::noveltyOf(const String& text) {
+  if (_embFail >= 3) return -1;
+  float* qv = (float*)malloc(EMB_DIM * 4);
+  if (!qv) return -1;
+  _embLastMs = millis();
+  float novelty = -1;
+  if (callEmbedding(text, qv)) {
+    _embFail = 0;
+    float maxCos = 0;
+    File ef = LittleFS.open(EMB_PATH, "r");
+    if (ef) {
+      float* rv = (float*)malloc(EMB_DIM * 4);
+      if (rv) {
+        while (ef.read((uint8_t*)rv, EMB_DIM * 4) == EMB_DIM * 4) {
+          float c = cosineOf(qv, rv, EMB_DIM);
+          if (c > maxCos) maxCos = c;
+        }
+        free(rv);
+      }
+      ef.close();
+    }
+    novelty = 1.0f - maxCos;
+    if (novelty < 0) novelty = 0;
+  }
+  free(qv);
+  return novelty;
+}
+
 void MemorySystem::clearAll() {
   laapSnapAll(true);   // 清空前强制全量快照：格式化/误触还有得救（.pre 之外再留 3 版）
   LittleFS.remove(EP_PATH);
