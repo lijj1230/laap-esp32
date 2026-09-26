@@ -61,8 +61,13 @@ bool LaapVision::begin() {
   c.pin_pwdn = -1; c.pin_reset = -1;    // PWDN 手动经 PCA9557
   c.xclk_freq_hz = 24000000;
   c.pixel_format = PIXFORMAT_RGB565;    // GC0308 不支持片上 JPEG（实测报错），RGB565 直出
-  c.frame_size   = FRAMESIZE_QVGA;      // 320x240，RGB565=150KB/帧，PSRAM 装得下
-  c.fb_count = 1;
+  c.frame_size   = FRAMESIZE_QVGA;      // 320x240，RGB565=150KB/帧，PSRAM 装得下（双缓冲 300KB）
+  // fb_count 必须 ≥2：cam_hal 里 en=1 表示"该缓冲可被 DMA 抓取"，抓完一帧置 en=0 就
+  // 没有再抓的缓冲了。fb_count=1 时驱动"取一帧→停→归还后才抓下一帧"：
+  //   ① 开机后第一次取到的是 init 瞬间抓的那帧（AEC 未收敛，实测均值 28/255 全黑）；
+  //   ② 之后每次取到的都是"上次取帧后立刻抓的那帧"= 上一次看的时候的画面，不是现在。
+  // 双缓冲让 DMA 一直抓、队列里始终是最新帧（实测帧龄从 ~30s 降到 <100ms）。
+  c.fb_count = 2;
   c.grab_mode = CAMERA_GRAB_LATEST;
   c.fb_location = CAMERA_FB_IN_PSRAM;
   esp_err_t err = esp_camera_init(&c);
@@ -191,15 +196,25 @@ static uint8_t* rgb565ToPng(const uint8_t* src, int w, int h, size_t& outLen) {
   return buf;
 }
 
+// 帧龄：这一帧是"多久以前"抓的。摄像头诊断的关键数字——大 = 拿到的是旧帧
+// （fb_count=1 时曾恒等于"距上次取帧的时间"，双缓冲后应 <100ms）
+static long frameAgeMs(const camera_fb_t* fb) {
+  int64_t cap = (int64_t)fb->timestamp.tv_sec * 1000000 + (int64_t)fb->timestamp.tv_usec;
+  int64_t age = (esp_timer_get_time() - cap) / 1000;
+  return (long)(age < 0 ? 0 : age);
+}
+
 // 诊断用：抓帧 → PNG → base64（与 look 同一条链路），返回 base64 文本
 String LaapVision::debugPngB64(size_t& outLen) {
   outLen = 0;
   if (!_ok) { lastError = "摄像头未就绪"; return ""; }
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) { lastError = "抓帧失败"; return ""; }
+  long ageMs = frameAgeMs(fb);
   size_t pngLen = 0;
   uint8_t* png = rgb565ToPng(fb->buf, (int)fb->width, (int)fb->height, pngLen);
   esp_camera_fb_return(fb);
+  Serial.printf("[LOOKDUMP] 帧时间戳：距现在 %ld ms（越小越新）\n", ageMs);
   if (!png) { lastError = "PNG 生成失败"; return ""; }
   size_t need = 4 * ((pngLen + 2) / 3) + 8;
   char* b64 = (char*)ps_malloc(need);
@@ -243,6 +258,7 @@ String LaapVision::lookLocked(const String& question) {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) { lastError = "抓帧失败"; return ""; }
   if (fb->format != PIXFORMAT_RGB565) { esp_camera_fb_return(fb); lastError = "像素格式非 RGB565"; return ""; }
+  long ageMs = frameAgeMs(fb);          // 帧龄：这张"照片"是多久以前抓的
 
   // ---- 图像封装：RGB565 → 标准 PNG（BMP 会被 API 拒，实测 DeepSeek 直接 400）
   size_t pngLen = 0;
@@ -260,8 +276,8 @@ String LaapVision::lookLocked(const String& question) {
   }
   free(raw);
   b64[olen] = 0;
-  Serial.printf("[VISION] 帧 %ux%u %uB → PNG %uB → b64 %uB（heap %uKB / psram %uKB）\n",
-                (unsigned)320, (unsigned)240, (unsigned)px, (unsigned)pngLen, (unsigned)olen,
+  Serial.printf("[VISION] 帧 %ux%u %uB 帧龄 %ldms → PNG %uB → b64 %uB（heap %uKB / psram %uKB）\n",
+                (unsigned)320, (unsigned)240, (unsigned)px, ageMs, (unsigned)pngLen, (unsigned)olen,
                 (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getFreePsram() / 1024));
 
   // ---- 请求体拆成 前缀 + b64 + 后缀 三段流式发出：205KB base64 绝不进 String（会挤爆内部堆）
