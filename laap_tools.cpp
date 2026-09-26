@@ -138,14 +138,17 @@ static String dechunk(const String& in) {
   return out.length() ? out : in;
 }
 
-// 从"北京今天天气怎么样"里抠城市名（剥掉问句壳与天气词），空=按出口 IP 定位
+// 从"北京今天天气怎么样"里抠城市名（剥掉问句壳与天气词），空=按出口 IP 定位。
+// "市"不能进无条件剥离表：它会把"你们城市"啃成"你们城"这种假城市名——只在结尾时剥一次
 static String weatherCityOf(const String& text) {
   static const char* junk[] = {"今天","明天","后天","现在","目前","最近","怎么样","怎样","如何","咋样",
                                "查一下","查查","帮我","帮忙","看看","一下","天气","气温","预报","下雨",
                                "下雪","冷不冷","热不热","的","呢","吗","呀","啊","？","?"," ",
-                               "你那边","外面","这里","这边","本地","室内","室外","屋里","家里","市"};
+                               "你那边","外面","这里","这边","本地","室内","室外","屋里","家里"};
   String s = text;
   for (auto j : junk) s.replace(j, "");
+  s.trim();
+  if (s.endsWith("市")) s = s.substring(0, s.length() - 3);   // "苏州市"→"苏州"
   s.trim();
   if (s.length() > 12) s = utf8Cut(s, 12);
   return s;
@@ -235,14 +238,14 @@ static bool weatherOpenMeteo(const String& city, String& out) {
   float lat, lon;
   if (g_geoCity != city || g_geoLat > 900) {
     String body = dechunk(httpGetText("geocoding-api.open-meteo.com",
-                    "/v1/search?name=" + urlEncQuery(city) + "&count=1&language=zh&format=json", 6000));
+                    "/v1/search?name=" + urlEncQuery(city) + "&count=1&language=zh&format=json", 10000));
     if (!jsonNum(body, "latitude", lat) || !jsonNum(body, "longitude", lon)) return false;
     g_geoCity = city; g_geoLat = lat; g_geoLon = lon;
   }
   lat = g_geoLat; lon = g_geoLon;
   char p[176];
   snprintf(p, sizeof(p), "/v1/forecast?latitude=%.4f&longitude=%.4f&current=temperature_2m,weather_code&timezone=auto", lat, lon);
-  String body = dechunk(httpGetText("api.open-meteo.com", p, 6000));
+  String body = dechunk(httpGetText("api.open-meteo.com", p, 10000));
   float tempC = 0, code = 0;
   if (!jsonNum(body, "temperature_2m", tempC) || !jsonNum(body, "weather_code", code)) return false;
   out = wmoCn((int)code) + " " + String((int)(tempC + (tempC >= 0 ? 0.5f : -0.5f))) + "度";

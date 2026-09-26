@@ -34,6 +34,7 @@ static void escTo(String& o, const String& s) {
     if (c == '"' || c == '\\') { o += '\\'; o += c; }
     else if (c == '\n') o += "\\n";
     else if (c == '\r') o += "";
+    else if (c == '\t') o += ' ';
     else o += c;
   }
 }
@@ -98,7 +99,7 @@ void LaapMetrics::failNote(const String& s) {
   if (!s.length()) return;
   String note = s;
   note.trim();
-  if (note.length() > 90) note = note.substring(0, 90);
+  if (note.length() > 90) note = utf8Cut(note, 90);   // 字符边界截断（substring 半截汉字→归纳请求体 400）
   if (_failCnt && _failRing[(_failIdx + 5) % 6] == note) return;   // 连败同错误只记一条
   _failRing[_failIdx] = note;
   _failIdx = (_failIdx + 1) % 6;

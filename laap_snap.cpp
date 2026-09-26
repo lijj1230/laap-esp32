@@ -56,12 +56,19 @@ bool laapSnapMake(const char* name, bool force) {
   if (!force && LittleFS.exists(newest)) {
     File f = LittleFS.open(newest, "r");
     time_t lw = f ? f.getLastWrite() : 0;
-    // getLastWrite 是墙钟 epoch。<1.7e9 说明写它时 NTP 还没同步（time() 从 1970 起算=开机秒数），
-    // 时间戳不可信：当作"刚写过"跳过自动档，否则假年龄(几十万小时)会让节流失守、每次心跳都重拍
-    if (f && lw < 1700000000) { f.close(); return false; }
-    uint32_t ageS = f ? (uint32_t)((long)time(nullptr) - (long)lw) : SNAP_MIN_INTERVAL_MS / 1000;
+    bool clockOk = time(nullptr) > 1700000000;   // 本机时钟是否可信
+    bool skip = false;
+    if (!clockOk) {
+      skip = true;                // 自己的钟都不准，没法判新旧：宁可不拍（mtime 全是假的）
+    } else if (lw < 1700000000) {
+      skip = false;               // 旧快照写于无时钟期（mtime 是开机秒数）：时间不可考 → 放行重拍，
+                                  // 新快照写入真 mtime 后节流才恢复正常（否则节流永久锁死）
+    } else {
+      uint32_t ageS = (uint32_t)((long)time(nullptr) - (long)lw);
+      skip = (ageS < SNAP_MIN_INTERVAL_MS / 1000);
+    }
     if (f) f.close();
-    if (ageS < SNAP_MIN_INTERVAL_MS / 1000) return false;  // 自动档：12h 内拍过了
+    if (skip) return false;       // 自动档跳过
   }
   for (int v = SNAP_KEEP; v >= 2; v--) {                // .2→.3，.1→.2（老的被挤掉）
     String from = snapPath(name, v - 1), to = snapPath(name, v);

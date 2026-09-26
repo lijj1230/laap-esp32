@@ -69,3 +69,4 @@ bool laapReplySpoken();       // 上一次是否已自己念过（本地直答�
 String laapLastUserText();    // 最近一轮主人原话（反馈落盘用）
 String laapIdleInfo();        // 独白计时诊断（"还差多久冒泡"）
 void rulesReflect(bool force);// 立刻归纳一轮行为规则（记忆页"立刻归纳"按钮用）
+bool laapLlmBusy();           // 后台 LLM 任务在飞（含独白/反思/整理的多步流水线）

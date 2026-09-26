@@ -16,10 +16,36 @@ static const int   EMB_DIM  = 1024;
 bool MemorySystem::begin() {
   if (!LittleFS.begin(true)) return false;
   LittleFS.mkdir("/mem");
-  // 数一下已有条数
+  // 掉电残尾修复：append 半写留下的无换行尾行，会在下次追加时与新记录拼成损坏行
+  // （一条记忆丢失、一行 JSON 非法，且计数/对齐检查都发现不了）——直接截断残尾
+  {
+    File f = LittleFS.open(EP_PATH, "r");
+    if (f) {
+      size_t sz = f.size();
+      bool endsNl = true;
+      if (sz) { f.seek(sz - 1); endsNl = (f.read() == '\n'); }
+      f.close();
+      if (sz && !endsNl) {
+        f = LittleFS.open(EP_PATH, "r");
+        String all = f.readString();
+        f.close();
+        int cut = all.lastIndexOf('\n');
+        File w = LittleFS.open(EP_PATH, "w");
+        if (w) { if (cut >= 0) w.print(all.substring(0, cut + 1)); w.close(); }
+        Serial.println("[MEM] 修复掉电残尾：截断未写完的最后一行");
+      }
+    }
+  }
+  // 数一下已有条数（按非空行）
   _count = 0;
   File f = LittleFS.open(EP_PATH, "r");
-  if (f) { while (f.available()) { if (f.read() == '\n') _count++; } f.close(); }
+  if (f) {
+    while (f.available()) {
+      String l = f.readStringUntil('\n');
+      if (l.length()) _count++;
+    }
+    f.close();
+  }
   // 向量缓存对齐条数（emb.bin 与 episodes.jsonl 行序一一对应）
   _embCount = 0; _embFail = 0;
   File ef = LittleFS.open(EMB_PATH, "r");
@@ -29,7 +55,7 @@ bool MemorySystem::begin() {
       ef.close();
       LittleFS.remove(EMB_PATH);
       _embCount = 0;
-      return true;
+      // 不提前返回：残条修复后仍要 reloadWork 重建工作记忆环
     }
     ef.close();
   }
@@ -56,6 +82,8 @@ void MemorySystem::appendEpisodic(const char* role, const String& rawText) {
     char c = text[i];
     if (c == '"' || c == '\\') { esc += '\\'; esc += c; }
     else if (c == '\n') esc += "\\n";
+    else if (c == '\r') continue;              // \r 裸进 JSONL = 行非法（浏览器 JSON.parse 报错）
+    else if (c == '\t') esc += ' ';
     else esc += c;
   }
   f.printf("{\"t\":%lu,\"r\":\"%s\",\"w\":1.0,\"x\":\"%s\"}\n", (unsigned long)t, role, esc.c_str());
@@ -110,7 +138,7 @@ void MemorySystem::rewriteEpisodicByScore() {
   laapSnapMake("episodes", false);   // 重写会整份替换：覆盖前拍一份（12h 自动节流）
   File out = LittleFS.open("/mem/episodes.tmp", "w");
   if (!out) return;
-  for (auto& r : lines) if (r.line.length()) out.println(r.line);
+  for (auto& r : lines) if (r.line.length()) { out.print(r.line); out.print('\n'); }
   out.close();
   LittleFS.remove(EP_PATH);
   LittleFS.rename("/mem/episodes.tmp", EP_PATH);
@@ -249,8 +277,8 @@ void MemorySystem::embedTick() {
     _embCount = 0;
     return;
   }
-  int xe = line.length() - 3;                              // "}\n 尾
-  String text = sanitizeUtf8(line.substring(xp + 5, xe > xp + 5 ? xe : xp + 5));
+  int qe = line.lastIndexOf('"');                          // 正文到收尾引号为止（按长度倒推会因 CRLF/LF 尾不同多砍字）
+  String text = sanitizeUtf8(line.substring(xp + 5, qe > xp + 5 ? qe : line.length()));
 
   float* vec = (float*)malloc(EMB_DIM * 4);
   if (!vec) return;
@@ -400,10 +428,15 @@ void MemorySystem::rememberBoost(const String& fragment) {
     all += l; all += "\n";
   }
   in.close();
-  File out = LittleFS.open(EP_PATH, "w");
+  // 原子重写（先 tmp 再 rename + 快照）：rememberBoost 每次命中回忆的用户轮都会触发，
+  // 掉电落在 open("w") 截断之后 = 整份情景记忆被毁，必须与其他重写路径同规格
+  laapSnapMake("episodes", false);
+  File out = LittleFS.open("/mem/episodes.tmp", "w");
   if (!out) return;
   out.print(all);
   out.close();
+  LittleFS.remove(EP_PATH);
+  LittleFS.rename("/mem/episodes.tmp", EP_PATH);
 }
 
 String MemorySystem::semantic() const {
@@ -474,8 +507,14 @@ String MemorySystem::episodicNumberedTail(int n) {
 void MemorySystem::applyTidyOps(const String& opsJson) {
   File f = LittleFS.open(EP_PATH, "r");
   if (!f) return;
+  // 行数必须按"非空行"计——与 episodicNumberedTail 的编号、下面的重写计数保持同一口径：
+  // 文件里若混入空行，原始换行计数会让删除索引错位（删错记忆行是最坏情况）
   int total = 0;
-  while (f.available()) { if (f.read() == '\n') total++; }
+  while (f.available()) {
+    String l = f.readStringUntil('\n');
+    l.trim();
+    if (l.length()) total++;
+  }
   f.close();
   if (!total) return;
 
@@ -512,7 +551,7 @@ void MemorySystem::applyTidyOps(const String& opsJson) {
     if (!l.length()) continue;
     lineno++;
     if (lineno <= total && del[lineno - 1]) continue;
-    out.println(l);
+    out.print(l); out.print('\n');
     kept++;
   }
   in.close(); out.close();
@@ -666,7 +705,7 @@ bool MemorySystem::applyImport(String& msg) {
     }
     if (!l.length()) continue;
     if (section == 1) { semBuf += l; nSem++; }
-    else if (section == 2) { epsTmp.println(l); nEps++; }
+    else if (section == 2) { epsTmp.print(l); epsTmp.print('\n'); nEps++; }
     else if (section == 3) { evoBuf += l; nEvo++; }
   }
   in.close();

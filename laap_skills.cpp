@@ -44,6 +44,9 @@ bool LaapSkills::teach(const String& trigger, const String& instruction) {
   ensureLoaded();
   String trig = utf8Cut(trigger, 30);        // ≤10 字
   String instr = utf8Cut(instruction, 90);   // ≤30 字
+  // 存储格式是 trigger|instruction|hits：'|' 与换行会破坏行结构（重载解析错位/丢条目）
+  trig.replace("|", " "); trig.replace("\n", " ");
+  instr.replace("|", " "); instr.replace("\n", " ");
   trig.trim(); instr.trim();
   if (trig.length() < 6 || instr.length() < 8) return false;   // 太短不成技能
   int i = find(trig);

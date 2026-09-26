@@ -720,10 +720,11 @@ void LaapWeb::handleChatReply() {
 
 void LaapWeb::handleTest() {
   // 逐项体检：把所有已配置的模型/通道各探一次，独立报结果（原来只测主模型）。
-  // 后台 LLM 任务在飞时 TLS 会互相抢堆（每次握手要 ~40KB 最大连续块），结果会失真
-  if (laapChatPending()) {
+  // 后台 LLM 任务在飞时 TLS 会互相抢堆（每次握手要 ~40KB 最大连续块），结果会失真——
+  // laapChatPending 只覆盖聊天，独白/反思/整理的多步流水线要另查 laapLlmBusy
+  if (laapChatPending() || laapLlmBusy()) {
     server.send(409, "application/json",
-                "{\"ok\":false,\"results\":[{\"name\":\"体检\",\"ok\":false,\"msg\":\"后台 LLM 正在思考，等它说完再测（结果会被堆挤不准）\"}]}");
+                "{\"ok\":false,\"results\":[{\"name\":\"体检\",\"ok\":false,\"msg\":\"后台 LLM 正在忙（思考/独白/反思中），等它忙完再测（结果会被堆挤不准）\"}]}");
     return;
   }
   String j = "{\"ok\":true,\"results\":[";

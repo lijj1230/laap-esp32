@@ -355,7 +355,7 @@ String laapEmbed(const String& text, bool& ok) {
   WiFiClientSecure cli; cli.setInsecure(); cli.setTimeout(12000);
   if (!cli.connect(host.c_str(), port)) return "";
   String req = String("POST ") + path + " HTTP/1.1\r\nHost: " + host +
-    "\r\nAuthorization: Bearer " + cfg.s.asrKey +
+    "\r\nAuthorization: Bearer " + key +
     "\r\nContent-Type: application/json\r\nContent-Length: " + body.length() +
     "\r\nConnection: close\r\n\r\n" + body;
   cli.print(req);

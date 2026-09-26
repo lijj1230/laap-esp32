@@ -54,10 +54,13 @@ bool LaapRules::apply(const String& llmOutput) {
     // 剥前缀：- / • / * / 1. / 1、 / ①
     if (ln[0] == '-' || ln[0] == '•' || ln[0] == '*') { ln = ln.substring(1); ln.trim(); }
     else if (ln[0] >= '0' && ln[0] <= '9') {
+      // 数字必须紧跟 ". / 、 )" 才算序号：否则"12点睡觉"会被啃成"点睡觉"
       int d = 0;
-      while (d < (int)ln.length() && (ln[d] == '.' || ln[d] == '、' || ln[d] == ')' ||
-             (ln[d] >= '0' && ln[d] <= '9'))) d++;
-      if (d > 0 && d < (int)ln.length()) { ln = ln.substring(d); ln.trim(); }
+      while (d < (int)ln.length() && ln[d] >= '0' && ln[d] <= '9') d++;
+      if (d > 0 && d < (int)ln.length() && d <= 3 &&
+          (ln[d] == '.' || ln[d] == '、' || ln[d] == ')')) {
+        ln = ln.substring(d + 1); ln.trim();
+      }
     }
     else if (ln[0] == (char)0xE2 && ln.length() > 3) { ln = ln.substring(3); ln.trim(); } // ①等 U+2460 起 3B
     // 过滤：太短（<4B 不成话）、太长截到上限、明显是解释行（含"规则""输出"开头的元话语）

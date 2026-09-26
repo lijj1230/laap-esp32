@@ -26,12 +26,15 @@ bool Cognition::loadEvolution() {
 
 void Cognition::saveEvolution() {
   laapSnapMake("evolution", false);   // 心跳级写入×12h 节流 ≈ 每半天留一版性格
-  File f = LittleFS.open("/evolution.json", "w");
+  // 原子重写：心跳级高频写 + 掉电窗口，直接 open("w") 半写会让性格/代数静默回退默认值
+  File f = LittleFS.open("/evolution.tmp", "w");
   if (!f) return;
   f.printf("{\"gen\":%lu,\"cycles\":%lu,\"chats\":%lu,\"open\":%.3f,\"soc\":%.3f,\"sens\":%.3f}",
            (unsigned long)_gen, (unsigned long)_cycles, (unsigned long)_chats,
            _openness, _sociability, _sensitivity);
   f.close();
+  LittleFS.remove("/evolution.json");
+  LittleFS.rename("/evolution.tmp", "/evolution.json");
 }
 
 void Cognition::begin() {
@@ -219,9 +222,10 @@ void Cognition::senseBody(float tempC, int rssi, uint32_t upMs, float dtMin) {
   bodyStrain = strain > 1 ? 1 : strain;
 
   // tick 里的衰减是"平静身体"基准；负荷高时能量掉更快、安全更难维持
+  // （与 tick 主环同款饱和因子：需求趋近 1 时增长自然收束，不再线性顶满）
   if (bodyStrain > 0.05f && dtMin > 0) {
-    _n.energy   += 0.010f * bodyStrain * dtMin;   // 需求值=渴求度，负担高更渴望休息
-    _n.security += 0.008f * bodyStrain * dtMin;   // 也更没有安全感
+    _n.energy   += 0.010f * bodyStrain * dtMin * (1.0f - _n.energy);
+    _n.security += 0.008f * bodyStrain * dtMin * (1.0f - _n.security);
   }
 }
 

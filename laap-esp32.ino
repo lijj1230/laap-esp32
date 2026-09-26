@@ -211,6 +211,9 @@ static LlmReply g_llmResult;
 static volatile bool g_llmHasNew = false;
 static volatile uint8_t g_resultKind = LK_CHAT;       // 本次结果的请求种类
 static uint8_t g_llmFailStreak = 0;                   // LLM 连续失败次数（≥2 独白让路）
+// 后台 LLM 是否在飞（含独白/反思/整理——多步流水线一跑就是几十秒）。
+// 逐项体检前必须看这个：TLS 握手互相抢 ~40KB 最大连续块，抢到的结果也是失真的
+bool laapLlmBusy() { return g_llmBusy; }
 static String g_monoTopic, g_monoSight, g_monoKnow;   // 独白中间产物（收割侧落盘）
 static String g_monoGoal;       // 本轮独白若由意图驱动，这里带目标快照（提交侧拍好，任务只读）
 static bool g_monoDone = false; // 模型在独白里报了【完成】= 意图已弄明白
@@ -701,9 +704,13 @@ void llmHarvest() {
     memory.logEvent("aris", "【自发】我刚才在想「" + g_monoTopic + "」：" + r.say);
     if (g_monoKnow.length()) memory.logEvent("world", g_monoTopic + " → " + utf8Cut(g_monoKnow, 80));  // 字节截断会切半汉字（曾污染 episodes.jsonl）
     if (g_monoDone && g_monoGoal.length()) {   // 意图结算：目标弄明白了
-      while (mind.intentCount() > 0 && mind.intent(0) != g_monoGoal) mind.dropIntent(0);
-      if (mind.intentCount() > 0 && mind.intent(0) == g_monoGoal) {
-        mind.dropIntent(0);
+      // 只删匹配的那条：addIntent 满员时可能已把 g_monoGoal 挤出栈，
+      // 原来的"从头删到匹配"会把无辜的新目标一起清掉
+      int mi = -1;
+      for (int i = 0; i < mind.intentCount(); i++)
+        if (mind.intent(i) == g_monoGoal) { mi = i; break; }
+      if (mi >= 0) {
+        mind.dropIntent(mi);
         mind.onDiscovery(1.0f);                // 达成目标 = 最强的确定性下降
         memory.logEvent("event", "【达成】" + g_monoGoal);
         Serial.printf("[LAAP·意图] 目标已弄明白：「%s」（放下）\n", g_monoGoal.c_str());
