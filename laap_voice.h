@@ -32,6 +32,13 @@ public:
   // 空闲轮询（VAD 模式下检测到人声→自动开启一轮对话）
   void loopTick();
 
+  // 参数自调优（RSI⑥，psiTick 心跳调用，内部按 5 分钟窗口评估）：
+  // A 播报冷却 1200~3000ms（冷却期误触发多→拉长）；B VAD 阈值乘数 1.0~2.0
+  // （"触发但没听清"多→抬）。RAM 常驻每次开机回默认，所有调整打 [TUNE] 日志。
+  void tuneTick();
+  uint32_t cooldownDur() const { return _cooldownDur; }
+  float vadMul() const { return _vadMul; }
+
   bool busy() const { return _busy; }
   String lastError;
 
@@ -43,7 +50,9 @@ private:
   bool listenAndTranscribe(String& heard);
   bool _ready = false;
   bool _busy = false;
-  uint32_t _cooldownMs = 0;   // 播报后冷却，避免自听见
+  uint32_t _cooldownMs = 0;   // 播报后冷却截止时刻，避免自听见
+  uint32_t _cooldownDur = 1200; // 冷却时长（自调优旋钮 A，1200~3000ms）
+  float _vadMul = 1.0f;         // VAD 阈值乘数（自调优旋钮 B，1.0~2.0）
   bool _vadHold = false;
   uint32_t _vadHoldStart = 0;
   bool _vadPaused = false;

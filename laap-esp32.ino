@@ -976,6 +976,7 @@ void psiTick() {
   mind.incCycle();
   nightlyReflect(false);   // F7: 深夜复盘（内部自带每天一次节流）
   rulesReflect(false);     // RSI: 深夜规则归纳（反馈+失败→行为规则集；LLM 忙则下个心跳再试）
+  voice.tuneTick();        // RSI⑥: 参数自调优（内部按 5 分钟窗口评估，纯 C 零 LLM 成本）
 
   // IMU 世界感知
   float motion = 0;
@@ -1415,6 +1416,10 @@ void serialCli() {
                     (unsigned long)metrics.llmOk, (unsigned long)metrics.llmFail,
                     (unsigned long)metrics.rspLlmMs(), (unsigned long)metrics.fbUp,
                     (unsigned long)metrics.fbDown);
+    } else if (line == "/tune") {
+      // 自调优状态（RSI⑥）：调整历史看 [TUNE] 日志；评估窗 5 分钟一次
+      Serial.printf("[TUNE] 播报冷却 %lu ms（1200~3000）｜VAD 阈值 ×%.2f（1.00~2.00）｜每次开机回默认\n",
+                    (unsigned long)voice.cooldownDur(), voice.vadMul());
     } else if (line == "/snap") {
       Serial.print(laapSnapListText());
     } else if (line.startsWith("/snap restore ")) {

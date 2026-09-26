@@ -42,6 +42,9 @@ public:
   void vadCalibrate(uint32_t ms);    // 静默环境校准
   bool vadSpeaking() const { return _vadSpeech; }
   float micRms() const { return _fastRms; }
+  // 触发阈值乘数（自调优旋钮，RSI⑥）：1.0=默认灵敏度，>1 更不敏感（防环境噪声/回声误触发）
+  void setVadThresholdMul(float m) { _vadThMul = (m < 1.0f ? 1.0f : (m > 2.0f ? 2.0f : m)); }
+  float vadThresholdMul() const { return _vadThMul; }
 
   // ---- PA（读-改-写 PCA9557，不动 LCD_CS 位） ----
   void paSet(bool on);
@@ -70,6 +73,7 @@ private:
   size_t _recCap = 0, _recLen = 0;
   int32_t _dsAcc = 0; int8_t _dsCnt = 0;      // 3:1 降采样累加器
   float _slowRms = 30, _fastRms = 30;          // 环境基线 / 瞬时
+  float _vadThMul = 1.0f;                      // 触发阈值乘数（自调优，钳位 1.0~2.0）
   bool _vadSpeech = false;
   uint32_t _speechStartMs = 0, _silenceMs = 0;
   bool _interrupted = false, _bargeEn = false;   // 默认关：播放期间不收麦（防回环/自触发）

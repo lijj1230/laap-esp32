@@ -809,7 +809,10 @@ void LaapWeb::handleSpeak() {
 // ---- 评估埋点 / 反馈 / 快照（RSI 闭环：评估端 + 回滚安全网） ----
 void LaapWeb::handleMetrics() {
   server.send(200, "application/json",
-              String("{\"ok\":true,\"boot_ms\":") + millis() + ",\"metrics\":{" + metrics.json() + "}}");
+              String("{\"ok\":true,\"boot_ms\":") + millis() +
+              ",\"tune\":{\"cooldown_ms\":" + voice.cooldownDur() +
+              ",\"vad_mul\":" + String(voice.vadMul(), 2) + "}" +
+              ",\"metrics\":{" + metrics.json() + "}}");
 }
 
 void LaapWeb::handleFeedback() {

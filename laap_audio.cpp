@@ -151,8 +151,8 @@ void LaapAudio::pump() {
   _fastRms = _fastRms * 0.6f + rms * 0.4f;
   _slowRms = _slowRms * 0.995f + rms * 0.005f;
 
-  // VAD 判定：快均值显著高于慢基线
-  float th = _slowRms * 2.2f + 120;
+  // VAD 判定：快均值显著高于慢基线（乘数由自调优旋钮控制，1.0=原始灵敏度）
+  float th = (_slowRms * 2.2f + 120) * _vadThMul;
   if (_fastRms > th) {
     if (!_vadSpeech) { _vadSpeech = true; _speechStartMs = millis(); }
     _silenceMs = 0;

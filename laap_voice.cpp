@@ -53,8 +53,8 @@ void LaapVoice::speak(const String& text, const char* expr) {
     if (expr) display.drawFace(expr, false);
   }
   if (audio.interrupted()) metrics.interruptedPlay();   // 播放被人声/按键打断（barge-in）
-  // 播报冷却：等回声消散，避免 VAD 自触发
-  _cooldownMs = millis() + 1200;
+  // 播报冷却：等回声消散，避免 VAD 自触发（时长由自调优旋钮 A 控制）
+  _cooldownMs = millis() + _cooldownDur;
   _busy = false;
 }
 
@@ -191,4 +191,54 @@ void LaapVoice::loopTick() {
   } else {
     _vadHold = false;
   }
+}
+
+// ============================================================
+//  参数自调优（RSI⑥）：5 分钟窗口的带式控制器，纯 C 零 LLM 成本
+//  只修"确凿变差"的方向，硬钳位防跑飞（最怕把 VAD 调聋——漏触发无法
+//  从计数器观测，所以灵敏度只在小幅区间内浮动，且干净窗口自动回落）。
+//  RAM 常驻：每次开机回默认值，坏参数不会跨重启固化。
+// ============================================================
+void LaapVoice::tuneTick() {
+  static uint32_t s_lastRun = 0;
+  static uint32_t s_cs = 0, s_ns = 0, s_wm = 0;   // 上次采样时的累计值（算窗口增量）
+  static uint8_t s_cleanA = 0, s_cleanB = 0;
+  if (!_ready) return;
+  uint32_t now = millis();
+  if (s_lastRun == 0) { s_lastRun = now; return; }
+  if (now - s_lastRun < 300000UL) return;         // 5 分钟一评估
+  s_lastRun = now;
+
+  uint32_t dCs = metrics.cooldownSkip - s_cs; s_cs = metrics.cooldownSkip;
+  uint32_t dNs = metrics.noSpeech     - s_ns; s_ns = metrics.noSpeech;
+  uint32_t dWm = metrics.wakeMiss     - s_wm; s_wm = metrics.wakeMiss;
+
+  // 旋钮 A：冷却期内仍被触发（回声/抢话）→ 拉长冷却；连续 2 窗干净 → 回缩
+  if (dCs > 0 && _cooldownDur < 3000) {
+    _cooldownDur += 300;
+    Serial.printf("[TUNE] 播报冷却 %lu→%lu ms（本窗口 %lu 次冷却期触发）\n",
+                  (unsigned long)(_cooldownDur - 300), (unsigned long)_cooldownDur, (unsigned long)dCs);
+    s_cleanA = 0;
+  } else if (dCs == 0 && _cooldownDur > 1200) {
+    if (++s_cleanA >= 2) {
+      _cooldownDur -= 300; s_cleanA = 0;
+      Serial.printf("[TUNE] 连续干净，冷却回缩到 %lu ms\n", (unsigned long)_cooldownDur);
+    }
+  } else s_cleanA = 0;
+
+  // 旋钮 B：VAD 触发了却没听到有效内容（环境噪声/回声误触发）→ 抬阈值；连续 3 窗干净 → 回落
+  uint32_t miss = dNs + dWm;
+  if (miss >= 3 && _vadMul < 2.0f) {
+    _vadMul += 0.15f;
+    audio.setVadThresholdMul(_vadMul);
+    Serial.printf("[TUNE] VAD 阈值 ×%.2f（本窗口 %lu 次『触发但没听清』）\n", _vadMul, (unsigned long)miss);
+    s_cleanB = 0;
+  } else if (miss == 0 && _vadMul > 1.0f) {
+    if (++s_cleanB >= 3) {
+      _vadMul -= 0.15f;
+      audio.setVadThresholdMul(_vadMul);
+      Serial.printf("[TUNE] 连续干净，VAD 阈值回落 ×%.2f\n", _vadMul);
+      s_cleanB = 0;
+    }
+  } else s_cleanB = 0;
 }
