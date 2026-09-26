@@ -14,8 +14,50 @@
 #include "laap_snap.h"
 #include "laap_rules.h"
 #include "laap_skills.h"
+#include "laap_speech.h"
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <ESPmDNS.h>
+
+// 语义向量调用（实现在 laap_llm.cpp，配置解析 emb→ASR 回退都在里面）
+extern String laapEmbed(const String& text, bool& ok);
+
+// 文本探针：向 OpenAI 兼容 chat/completions 发一条 max_tokens=8 的消息，HTTP 200 即通。
+// 供"逐项体检"测视觉直连等自定义端点（base/key/model 与主模型不同源，不能走 LlmClient::ping）
+static bool probeChat(const String& url, const String& key, const String& model, String& detail) {
+  if (!url.startsWith("http") || !key.length()) { detail = "未配置/URL 无效"; return false; }
+  int dp = url.indexOf("://"), hp = url.indexOf('/', dp + 3);
+  String host = (hp < 0) ? url.substring(dp + 3) : url.substring(dp + 3, hp);
+  String path = (hp < 0) ? "/" : url.substring(hp);
+  int port = 443;
+  if (host.indexOf(':') >= 0) {
+    port = host.substring(host.indexOf(':') + 1).toInt();
+    host = host.substring(0, host.indexOf(':'));
+  }
+  String body = String("{\"model\":\"") + model +
+    "\",\"messages\":[{\"role\":\"user\",\"content\":\"回复OK两个字母即可\"}],\"max_tokens\":8}";
+  WiFiClientSecure cli;
+  cli.setInsecure();
+  cli.setTimeout(15000);
+  if (!cli.connect(host.c_str(), port)) { detail = "连接失败: " + host; return false; }
+  cli.print(String("POST ") + path + " HTTP/1.1\r\nHost: " + host +
+            "\r\nAuthorization: Bearer " + key +
+            "\r\nContent-Type: application/json\r\nContent-Length: " + body.length() +
+            "\r\nConnection: close\r\n\r\n" + body);
+  String resp;
+  uint32_t dl = millis() + 25000;
+  while (cli.connected() && millis() < dl) {
+    while (cli.available()) { resp += (char)cli.read(); if (resp.length() > 20000) break; }
+    if (resp.length() > 20000) break;
+    delay(2);
+  }
+  cli.stop();
+  int sp = resp.indexOf(' ');
+  int code = sp > 0 ? resp.substring(sp + 1, sp + 4).toInt() : 0;
+  if (code != 200) { detail = "HTTP " + String(code) + " " + resp.substring(0, 100); return false; }
+  detail = host;
+  return true;
+}
 
 LaapWeb webui;
 
@@ -348,7 +390,7 @@ void LaapWeb::handleSettingsPage() {
     "<div class='row'><div style='flex:1'><label>搜索关键词（逗号分隔，清空=关聊天搜索）</label><input id='srchkeys' placeholder='什么,怎么,新闻,最新…'></div></div>"
     "<div class='row'><div style='flex:1'><label>搜索主源URL（{q}=查询词，清空=必应RSS默认）</label><input id='srchapi' placeholder='https://cn.bing.com/search?q={q}&format=rss'></div></div>"
     "<button onclick='save(event)'>保存</button> "
-    "<button class='ghost' onclick='testllm(event)'>测试大模型连通</button> "
+    "<button class='ghost' onclick='testllm(event)'>逐项体检所有模型/通道</button> "
     "<button class='ghost' onclick='reboot(event)'>重启设备</button></form>"
     "<div class='hint' id='testout'></div></div>"
     "<div class='card'><b>🎤 语音（v2）</b>"
@@ -433,9 +475,10 @@ void LaapWeb::handleSettingsPage() {
     "const fd=new FormData();fd.append('file',f,f.name);"
     "try{const b=await fetch('/api/ota',{method:'POST',body:fd});"
     "const r=await b.json();otaout.textContent=(r.ok?'✅ ':'❌ ')+r.msg;}catch(err){otaout.textContent='❌ 上传失败: '+err;}}"
-    "async function testllm(e){e.preventDefault();testout.textContent='测试中…';"
-    "const b=await fetch('/api/test',{method:'POST'});const r=await b.json();"
-    "testout.textContent=r.ok?'✅ 大模型正常: '+r.reply:'❌ '+r.reply;}"
+    "async function testllm(e){e.preventDefault();testout.textContent='逐项体检中（主模型/视觉/向量/ASR主备，约 10~40 秒）…';"
+    "try{const b=await fetch('/api/test',{method:'POST'});const r=await b.json();"
+    "testout.innerHTML=(r.results||[]).map(x=>(x.ok?'✅':'❌')+' '+x.name+'：'+String(x.msg).replace(/</g,'&lt;')).join('<br>');}"
+    "catch(err){testout.textContent='❌ 体检请求失败: '+err;}}"
     "async function reboot(e){e.preventDefault();if(!confirm('重启?'))return;"
     "await fetch('/api/reboot',{method:'POST'});testout.textContent='重启中…';}"
     "async function resetall(e){e.preventDefault();"
@@ -673,13 +716,62 @@ void LaapWeb::handleChatReply() {
 }
 
 void LaapWeb::handleTest() {
-  String reply;
-  // 用局部客户端实例：全局 llm 正被后台任务用来跑对话，两个任务同时写它的
-  // lastError（String 成员）会撕裂；连通性测试不值得冒这个险，也不该占着全局那把锁
-  LlmClient probe;
-  bool ok = probe.ping(reply);
-  server.send(200, "application/json",
-      String("{\"ok\":") + (ok ? "true" : "false") + ",\"reply\":\"" + jsonEsc(reply) + "\"}");
+  // 逐项体检：把所有已配置的模型/通道各探一次，独立报结果（原来只测主模型）。
+  // 后台 LLM 任务在飞时 TLS 会互相抢堆（每次握手要 ~40KB 最大连续块），结果会失真
+  if (laapChatPending()) {
+    server.send(409, "application/json",
+                "{\"ok\":false,\"results\":[{\"name\":\"体检\",\"ok\":false,\"msg\":\"后台 LLM 正在思考，等它说完再测（结果会被堆挤不准）\"}]}");
+    return;
+  }
+  String j = "{\"ok\":true,\"results\":[";
+  int n = 0;
+  auto add = [&](const char* name, bool ok, const String& msg) {
+    if (n++) j += ",";
+    j += String("{\"name\":\"") + name + "\",\"ok\":" + (ok ? "true" : "false") +
+         ",\"msg\":\"" + jsonEsc(msg) + "\"}";
+  };
+  // 1 主模型（原有通道）
+  {
+    LlmClient probe;
+    String reply;
+    bool ok = probe.ping(reply);
+    add("主模型", ok, ok ? (String(cfg.s.llmModel) + " 回复: " + reply.substring(0, 40))
+                          : String(probe.lastError));
+  }
+  // 2 视觉（手机桥不探测；直连按它实际用的 base/key/model 发文本探针）
+  if (cfg.s.visionBase[0]) {
+    add("视觉", true, String("手机桥模式（") + cfg.s.visionBase + "，请直接说“看看…”实测）");
+  } else if (cfg.s.visionLlmBase[0] || cfg.s.visionModel[0]) {
+    String url(cfg.s.visionLlmBase[0] ? cfg.s.visionLlmBase : "https://openrouter.ai/api/v1/chat/completions");
+    String model(cfg.s.visionModel[0] ? cfg.s.visionModel : "google/gemini-flash-1.5");
+    String key(cfg.s.visionKey[0] ? cfg.s.visionKey : cfg.s.llmKey);
+    String d;
+    bool ok = probeChat(url, key, model, d);
+    add("视觉直连", ok, ok ? (model + " 通") : d);
+  } else {
+    add("视觉", true, "未配置（跳过）");
+  }
+  // 3 语义向量（laapEmbed 内部就是实际的解析与调用，测它最真实）
+  {
+    bool ok = false;
+    String bin = laapEmbed("连通测试", ok);
+    add("语义向量", ok, ok ? ("bge-m3 通（返回 " + String(bin.length() / 4) + " 维）")
+                            : "调用失败（查语音卡的向量地址/Key，或它复用的 ASR 配置）");
+  }
+  // 4/5 ASR 主备（合成短音真发一次 multipart）
+  {
+    String err = asr.probe(0);
+    add("ASR 主", err.length() == 0,
+        err.length() == 0 ? (String(cfg.s.asrModel) + " 通（HTTP 200）") : err);
+  }
+  if (cfg.s.asr2Base[0]) {
+    String err = asr.probe(1);
+    add("ASR 备用", err.length() == 0,
+        err.length() == 0 ? (String(cfg.s.asr2Model) + " 通（HTTP 200）") : err);
+  } else {
+    add("ASR 备用", true, "未配置（跳过）");
+  }
+  server.send(200, "application/json", j + "]}");
 }
 
 void LaapWeb::handleMemoryPage() {

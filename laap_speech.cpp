@@ -270,6 +270,29 @@ String AsrClient::transcribe(const int16_t* pcm16k, size_t bytes, String& err) {
   return text;
 }
 
+String AsrClient::probe(int which) {
+  const char* baseC = which ? cfg.s.asr2Base : cfg.s.asrBase;
+  const char* keyC  = which ? cfg.s.asr2Key  : cfg.s.asrKey;
+  const char* mdlC  = which ? cfg.s.asr2Model : cfg.s.asrModel;
+  if (!String(baseC).length() || !String(keyC).length()) return "未配置";
+  // 0.3s 440Hz 合成音：真发一次完整 multipart，连 200 响应都验到（空音频转不出字属正常）
+  const size_t samples = 4800;
+  int16_t* pcm = (int16_t*)malloc(samples * 2);
+  if (!pcm) return "内存不足";
+  for (size_t i = 0; i < samples; i++)
+    pcm[i] = (int16_t)(6000.0f * sinf(i * 2.0f * PI * 440.0f / 16000.0f));
+  size_t wavCap = samples * 2 + 64;
+  uint8_t* wav = (uint8_t*)malloc(wavCap);
+  if (!wav) { free(pcm); return "内存不足"; }
+  size_t wavLen = wavWrap(pcm, samples * 2, wav, wavCap);
+  free(pcm);
+  String text, err;
+  int code = transcribeOnce(baseC, keyC, mdlC, wav, wavLen, text, err, nullptr);
+  free(wav);
+  if (code == 200 || code == -3) return "";   // -3=响应无 text：端点/鉴权已确认，空音频属正常
+  return err;
+}
+
 bool VolcTts::speak(const String& text, String& err) {
   if (String(cfg.s.volcAppid).length() == 0 || String(cfg.s.volcToken).length() == 0) {
     err = "火山 TTS 未配置";
