@@ -5,6 +5,7 @@
 #include "laap_speech.h"
 #include "laap_display.h"
 #include "laap_web.h"
+#include "laap_metrics.h"
 
 LaapVoice voice;
 
@@ -51,6 +52,7 @@ void LaapVoice::speak(const String& text, const char* expr) {
   } else {
     if (expr) display.drawFace(expr, false);
   }
+  if (audio.interrupted()) metrics.interruptedPlay();   // 播放被人声/按键打断（barge-in）
   // 播报冷却：等回声消散，避免 VAD 自触发
   _cooldownMs = millis() + 1200;
   _busy = false;
@@ -74,10 +76,11 @@ bool LaapVoice::listenAndTranscribe(String& heard) {
   }
   size_t got = audio.recordBytes();
   audio.recordStop();
-  if (!spoke || got < 8000) { lastError = "没听清"; return false; }
+  if (!spoke || got < 8000) { metrics.noSpeechHeard(); lastError = "没听清"; return false; }
 
   String err;
   heard = asr.transcribe(audio.recordData(), got, err);
+  metrics.asr(heard.length() > 0);   // ASR 空识别率：排障与自调优的核心 fitness
   if (!heard.length()) { lastError = "ASR: " + err; return false; }
   Serial.printf("[VOICE] 听到: %s\n", heard.c_str());
   return true;
@@ -92,9 +95,11 @@ String LaapVoice::converse() {
   // 麦克风增益调到 37.5dB 后，它自己的回声足以被判成"有人在说话"，紧接着按一下 BOOT
   // 就会让它对着自己的尾音再答一次 —— 症状同样是"回答了两次"。
   if ((int32_t)(millis() - _cooldownMs) < 0) {
+    metrics.cooldownDrop();   // 冷却期丢弃：37.5dB 高增益下回声自触发的量（/micgain 调参参考）
     Serial.println("[VOICE] 刚播报完还在冷却期，忽略这次触发（防自听见）");
     return "";
   }
+  metrics.vadTrigger();       // 一轮真实对话（含"没听清"和唤醒词拒绝）
   String heard;
   if (!listenAndTranscribe(heard)) {
     if (lastError == "没听清") voice.speak("嗯？刚才没听清。", "curious");
@@ -107,6 +112,7 @@ String LaapVoice::converse() {
   if (wakeWord.length() && !g_manualOnce && heard.indexOf(wakeWord) < 0) {
     Serial.printf("[VOICE] 未含唤醒词「%s」，忽略\n", wakeWord.c_str());
     lastError = "无唤醒词";
+    metrics.wakeReject();
     _cooldownMs = millis() + 3000;              // 3 秒冷却防连环误触发
     return "";
   }

@@ -106,7 +106,8 @@ python -m esptool --chip esp32s3 --port COM5 --baud 921600 write_flash ^
   `/nothink 0|1` 开关"关闭模型思考"、`/look` 看图、`/weather 城市` 查天气、
   `/touch` 摇晃检测、`/touchpad` 触摸、`/screen N` 静默息屏秒数、`/redraw` 重绘、`/i2cscan` 扫 I2C、
   `/beep` 喇叭回环自检、`/micgain 37.5` 麦克风增益、`/asrsend` ASR 请求自检、`/asrloop 话` 自听回环、`/asrtest` 真实录音识别、
-  `/voicetest 文本` 走"按键对讲"的应答段（不起麦克风，用来数"这句话被念了几次"））
+  `/voicetest 文本` 走"按键对讲"的应答段（不起麦克风，用来数"这句话被念了几次"）、
+  `/metrics` 评估埋点一览、`/snap` 快照列表、`/snaptake` 强制拍快照、`/snap restore 名 版本` 回滚）
 - **BOOT 键**：短按 = 让它现在就说一句；按住 4s = 重开配置热点；按住 10s = 恢复出厂
 - **屏幕**：眼睛形状 = 情绪（眯眼=开心，下垂=孤独，眉毛=焦虑…会眨眼）；
   两列色条 = 需求（橙=能量 青=好奇 粉=社交 蓝=安全 绿=表达，越长越强烈）
@@ -208,6 +209,30 @@ fmt 块长字段，整份文件非法，服务端一律回 HTTP 500 —— 表�
 - 用途：换板子搬家、改分区表前后迁移、刷机前留一手、清空记忆前存档
 - 命令行也有：`GET /api/memexport` 下载，`POST /api/memimport`（multipart `file`）导入
 
+## 七·八、评估埋点 + 快照回滚（v3.19，自进化的地基）
+
+RSI（递归自我改进）闭环 = 生成 → **评估** → 迭代，瓶颈在评估端。v3.19 把"它做得好不好"变成可测量的：
+
+**评估埋点（`laap_metrics`）**——本次开机的计数器，RAM 常驻、写入成本≈0：
+
+- **语音链**：对话轮数、没听清、ASR 空识别率（`空识别率 = asr_fail/asr_try`）、唤醒词拒绝、播报冷却期丢弃（高增益下回声自触发的量，`/micgain` 调参参考）、播放被打断次数
+- **能力链**：本地直答次数与耗时、视觉 ✓/✗、搜索 ✓/✗、LLM ✓/✗、提问→回复端到端毫秒（含排队）
+- **反馈**：网页 👍/👎（见下）
+- 查看：状态页"自检指标"一行、`GET /api/metrics`（脚本友好）、串口 `/metrics`
+
+**网页 👍/👎 反馈**——聊天里每条它的回复下面有两个按钮，点一下就：
+
+1. 追加一行 JSONL 到 `/mem/feedback.jsonl`（含当轮问答原文，封顶自动裁到最近 80 条）——这是将来"夜间反思拿被踩的回复当素材"的原料
+2. 联动认知：👍 信任上升，👎 失望 + 信任下降（它对被踩的回答会表现出警觉/低落）
+
+**快照回滚（`laap_snap`）**——「自我」三件套（自我认知 `/mem/semantic.txt`、情景记忆 `/mem/episodes.jsonl`、性格进化 `/evolution.json`）的后悔药，防自进化跑偏：
+
+- 每个文件轮换保留 3 版（`/snap/<名>.1` 最新 … `.3` 最旧）
+- **自动档**：自我认知/情景/性格被覆盖前拍，同一文件 12h 节流（心跳级的 evolution.json 写入≈零成本）
+- **强制档**：清空记忆 / 导入记忆前全量拍
+- **恢复**：记忆页「⏪ 快照回滚」卡片按版本一键恢复（现状先存 `.pre`，恢复后自动重启）；串口 `/snap restore 名 版本`、`/snaptake` 手动拍
+- 接口：`GET /api/snapshots` 列表，`POST /api/snapshot/restore {"name":"semantic","ver":2}`
+
 ## 八、常见问题
 
 | 现象 | 处理 |
@@ -266,6 +291,8 @@ laap-esp32/
 ├── laap_speech.*       v2: ASR multipart + 火山 TTS 备选
 ├── laap_voice.*        v2: 语音编排（通道回退/打断/模式）
 ├── laap_search.*       v2.1: DuckDuckGo 免 Key 联网搜索（先搜后答 + 独白查证）
+├── laap_metrics.*      v3.19: 评估埋点（RSI 闭环的评估端）+ 网页 👍/👎 反馈落盘
+├── laap_snap.*         v3.19: 「自我」文件快照回滚（轮换 3 版 + 12h 节流 + .pre 安全副本）
 ├── laap_vision.*       v3.1: GC0308 摄像头（RGB565 → 端侧编码成合法 PNG），双模式（手机桥 / 直连多模态）
 ├── partitions.csv      16MB 分区表（双 OTA 槽 2MB×2 + 11.9MB LittleFS；OTA 必需）
 ├── build_opt.h         编译开关（环任务栈 20KB：TTS 的 TLS 握手峰值要 6-8KB，默认 8KB 会栈溢出重启）

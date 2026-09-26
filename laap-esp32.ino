@@ -42,6 +42,8 @@
 #include "laap_vision.h"
 #include "laap_tools.h"
 #include "laap_touch.h"
+#include "laap_metrics.h"   // 评估埋点（RSI 闭环的评估端）
+#include "laap_snap.h"      // "自我"文件快照回滚
 
 // ---------- 全局（定义在各模块 .cpp，头文件已 extern） ----------
 
@@ -70,6 +72,12 @@ uint32_t laapChatSeq() { return g_chatSeq; }
 String laapChatReply() { return g_chatReply; }
 bool laapChatPending() { return g_chatPending; }
 bool laapReplySpoken() { return g_replySpoken; }
+
+// 最近一轮主人原话（网页 👍/👎 反馈落盘用，让反馈行知道当时问了什么）
+static String g_lastUserText;
+String laapLastUserText() { return g_lastUserText; }
+// LK_CHAT 提交时刻（llmHarvest 里算"提问→成品"端到端毫秒）
+static uint32_t g_chatStartMs = 0;
 
 // 静默息屏 / 累计运行时长
 static uint32_t g_lastActivityMs = 0;      // 最近一次"值得亮屏"的活动
@@ -340,6 +348,8 @@ static String searchQueryOf(const String& text) {
 
 String laapInteractSearch(const String& userText) {
   laapActivity();                      // 有人跟它说话 = 活动（息屏则唤醒）
+  uint32_t t0 = millis();              // 直答路径耗时（对照 LLM 端到端用）
+  g_lastUserText = userText;           // 反馈落盘要知道"当时问了什么"
   g_chatPending = false;
   g_replySpoken = false;               // 本次交互还没念过（本地直答分支会置位）
   // 注意：本次提问的 logEvent 故意放到"历史快照之后"再记。
@@ -352,6 +362,7 @@ String laapInteractSearch(const String& userText) {
   // 本地意图工具表先行（小智 MCP 思想端侧版）：音量/亮度等指令不走 LLM
   String toolReply = laapToolsDispatch(userText);
   if (toolReply.length()) {
+    metrics.tool(); metrics.rspDir(millis() - t0);
     g_lastSay = toolReply; g_lastExpr = "calm";
     g_chatReply = toolReply; g_chatSeq++;        // 本地工具直答=已成品（网页可直接显示）
     memory.logEvent("user", userText);
@@ -373,6 +384,7 @@ String laapInteractSearch(const String& userText) {
       display.drawFace("curious", true);
       String d = vision.look(userText);
       if (d.length()) {
+        metrics.vision(true); metrics.rspDir(millis() - t0);
         vision.logSight(d);
         g_lastSay = d; g_lastExpr = "curious";
         g_chatReply = d; g_chatSeq++;              // 直接成品，网页可立即显示
@@ -386,6 +398,7 @@ String laapInteractSearch(const String& userText) {
         return d;
       }
       Serial.printf("[LAAP] 视觉失败（%s），交给搜索/大模型兜底\n", vision.lastError.c_str());
+      metrics.vision(false);
     } else if (wantLook) {
       Serial.println("[LAAP] 视觉未就绪（/api/status 的 vision_ready）");
     }
@@ -396,6 +409,7 @@ String laapInteractSearch(const String& userText) {
     display.drawFace("curious");
     String q = searchQueryOf(userText);
     knowledge = laapSearch.search(q, 3, 500);
+    metrics.search(knowledge.length() > 0);   // 搜索命中率：内容空洞时答案差的前置原因
     Serial.printf("[LAAP] 搜索「%s」: %s\n", q.c_str(),
                   knowledge.length() ? "有收获" : laapSearch.lastError.c_str());
   }
@@ -434,6 +448,7 @@ String laapInteractSearch(const String& userText) {
   // F4: 丢给后台 LLM 任务，立即返回"思考中"；loop 里 llmHarvest() 收割
   if (llmSubmit(msgs, nm, cfg.s.llmMaxTokens, 0.85f, userText)) {
     g_pendingUserText = userText;
+    g_chatStartMs = millis();                     // 端到端延迟计时起点（llmHarvest 里收割）
     g_chatPending = true;                         // 网页据此改为轮询 /api/chat/reply
     display.drawFace("curious", true);            // 思考中表情
     return "……";                                   // 受理回执（真回复异步产出）
@@ -448,6 +463,7 @@ void llmHarvest() {
   g_llmHasNew = false;
   LlmReply r = g_llmResult;
   uint8_t kind = g_resultKind;
+  metrics.llm(r.ok);   // 后台 LLM 成败（含独白/反思/压缩：服务商健康度的总信号）
   g_llmFailStreak = r.ok ? 0 : (uint8_t)(g_llmFailStreak + 1);   // 退避计数（独白据此让路）
   if (kind == LK_CONSOLIDATE) {                        // 记忆压缩：只更新自我认知，不说话
     if (r.ok && r.say.length() > 10) {
@@ -516,7 +532,10 @@ void llmHarvest() {
   }
   g_lastSay = say;
   g_lastExpr = r.ok ? r.expr : mind.moodKey();
-  if (kind == LK_CHAT) { g_chatReply = say; g_chatSeq++; }   // 聊天成品：网页轮询取件
+  if (kind == LK_CHAT) {
+    g_chatReply = say; g_chatSeq++;   // 聊天成品：网页轮询取件
+    metrics.rspLlm(millis() - g_chatStartMs);   // 提问→成品端到端（含排队）
+  }
   laapActivity();                                            // 它开口说话=活动
   memory.logEvent("aris", say);
   Serial.printf(kind == LK_EXPRESS ? "[Aris·自发] %s\n" : "[Aris] %s\n", say.c_str());
@@ -904,7 +923,7 @@ void serialCli() {
     if (!line.length()) continue;
     laapActivity();     // 串口打字也是交互
     if (line == "/help") {
-      Serial.println("命令: /status /look(视觉识图) /search 词 /weather 城市 /touch(摇晃) /touchpad(触摸) /screen N /redraw /i2cscan /portal /mem /reflect(立刻反思) /mono(立刻独白) /nothink 0|1 /beep(回环测声) /tick /lcd /pa /imu /micgain(麦克风增益) /voicetest 文本(应答路径) /asrsend(不录音测请求) /asrloop 话(自听回环) /asrtest(录音识别) /reset");
+      Serial.println("命令: /status /look(视觉识图) /search 词 /weather 城市 /touch(摇晃) /touchpad(触摸) /screen N /redraw /i2cscan /portal /mem /reflect(立刻反思) /mono(立刻独白) /nothink 0|1 /beep(回环测声) /tick /lcd /pa /imu /micgain(麦克风增益) /voicetest 文本(应答路径) /asrsend(不录音测请求) /asrloop 话(自听回环) /asrtest(录音识别) /metrics(评估埋点) /snap(快照列表) /snap restore 名 版本 /snaptake(强制快照) /reset");
       Serial.println("      直接打字回车 = 跟它说话（走完整对话链路）");
     } else if (line == "/touch") {
       // 触觉实测：5 秒采样，摇晃/扣翻板子看峰值与判定
@@ -1262,6 +1281,38 @@ void serialCli() {
                     cfg.s.llmNoThink ? "开" : "关", cfg.s.llmNoThink ? "" : "不");
     } else if (line == "/reflect") {
       nightlyReflect(true);          // 立刻做一次夜间反思（不等 0-5 点窗口）
+    } else if (line == "/metrics") {
+      // 评估埋点（本次开机累计）：自我进化的 fitness 端
+      Serial.printf("[METRICS] 对话轮 %lu（没听清 %lu / ASR失败 %lu / 唤醒词拒 %lu / 冷却丢弃 %lu）\n",
+                    (unsigned long)metrics.vadTriggers, (unsigned long)metrics.noSpeech,
+                    (unsigned long)metrics.asrFail, (unsigned long)metrics.wakeMiss,
+                    (unsigned long)metrics.cooldownSkip);
+      Serial.printf("[METRICS] ASR 尝试 %lu（空 %lu，空识别率 %lu%%）｜打断 %lu｜直答 %lu（%lu ms均值）｜视觉 ✓%lu ✗%lu｜搜索 ✓%lu ✗%lu\n",
+                    (unsigned long)metrics.asrTry, (unsigned long)metrics.asrFail,
+                    (unsigned long)(metrics.asrTry ? metrics.asrFail * 100 / metrics.asrTry : 0),
+                    (unsigned long)metrics.interrupts, (unsigned long)metrics.toolDirect,
+                    (unsigned long)metrics.rspDirMs(), (unsigned long)metrics.visionOk,
+                    (unsigned long)metrics.visionFail, (unsigned long)metrics.searchOk,
+                    (unsigned long)metrics.searchFail);
+      Serial.printf("[METRICS] LLM ✓%lu ✗%lu｜端到端均值 %lu ms｜反馈 👍%lu 👎%lu\n",
+                    (unsigned long)metrics.llmOk, (unsigned long)metrics.llmFail,
+                    (unsigned long)metrics.rspLlmMs(), (unsigned long)metrics.fbUp,
+                    (unsigned long)metrics.fbDown);
+    } else if (line == "/snap") {
+      Serial.print(laapSnapListText());
+    } else if (line.startsWith("/snap restore ")) {
+      // /snap restore semantic 2  → 把 semantic 的第 2 版拷回原位（现状先存 .pre），然后重启生效
+      String rest = line.substring(14); rest.trim();
+      int sp = rest.indexOf(' ');
+      if (sp > 0) {
+        String name = rest.substring(0, sp), vStr = rest.substring(sp + 1); vStr.trim();
+        if (laapSnapRestore(name.c_str(), vStr.toInt())) {
+          Serial.println("[SNAP] 已恢复，3 秒后重启生效…");
+          delay(3000); ESP.restart();
+        } else Serial.println("[SNAP] 恢复失败（没有这个文件/版本；先 /snap 看列表）");
+      } else Serial.println("用法: /snap restore <semantic|episodes|evolution> <1-3>");
+    } else if (line == "/snaptake") {
+      laapSnapAll(true);   // 手动强制拍一份（改配置/折腾前留个还原点）
     } else if (line.startsWith("/vol")) {
       // 必须区分"查询"和"设置"：旧代码对空参数 `"".toInt()`=0 也放行，
       // 于是打一句 /vol 查询就把音量写成 0 并落盘 → 整机静音（且重启也不恢复）

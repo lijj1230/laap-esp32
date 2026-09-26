@@ -39,6 +39,10 @@ private:
   void handleVoiceTest();
   void handleSpeak();
   void handleListenToggle();
+  void handleMetrics();       // 评估埋点（RSI 闭环的评估端）
+  void handleFeedback();      // 网页 👍/👎 反馈
+  void handleSnapshots();     // "自我"文件快照列表
+  void handleSnapRestore();   // 快照恢复（恢复后重启）
   void handleNotFound();
 
   WebServer server{80};
@@ -59,4 +63,5 @@ uint32_t laapChatSeq();       // 每次有新的聊天成品回复 +1
 String laapChatReply();       // 最近一条聊天成品回复
 bool laapChatPending();       // 上一次 laapInteractSearch 是否丢给了后台 LLM
 bool laapReplySpoken();       // 上一次是否已自己念过（本地直答：工具指令 / 看东西）
+String laapLastUserText();    // 最近一轮主人原话（反馈落盘用）
 String laapIdleInfo();        // 独白计时诊断（"还差多久冒泡"）

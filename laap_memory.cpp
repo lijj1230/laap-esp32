@@ -1,5 +1,6 @@
 #include "laap_memory.h"
 #include "laap_llm.h"   // utf8Cut
+#include "laap_snap.h"  // 覆盖"自我"文件前拍快照（RSI 安全网）
 #include <LittleFS.h>
 #include <time.h>
 #include <vector>
@@ -106,6 +107,7 @@ void MemorySystem::rewriteEpisodicByScore() {
     lines[worst].line = "";
   }
   // 原子重写：先写临时文件再 rename，掉电不会丢整个记忆文件
+  laapSnapMake("episodes", false);   // 重写会整份替换：覆盖前拍一份（12h 自动节流）
   File out = LittleFS.open("/mem/episodes.tmp", "w");
   if (!out) return;
   for (auto& r : lines) if (r.line.length()) out.println(r.line);
@@ -379,6 +381,7 @@ String MemorySystem::semantic() const {
 }
 
 void MemorySystem::setSemantic(const String& s) {
+  laapSnapMake("semantic", false);   // 自我认知被压缩/反思覆盖前拍一份（自动档 12h 节流）
   File f = LittleFS.open("/mem/semantic.txt", "w");
   if (!f) return;
   f.print(s);
@@ -406,6 +409,7 @@ String MemorySystem::episodicTail(int n) {
 }
 
 void MemorySystem::clearAll() {
+  laapSnapAll(true);   // 清空前强制全量快照：格式化/误触还有得救（.pre 之外再留 3 版）
   LittleFS.remove(EP_PATH);
   LittleFS.remove("/mem/semantic.txt");
   LittleFS.remove("/evolution.json");
@@ -495,6 +499,7 @@ bool MemorySystem::applyImport(String& msg) {
     return false;
   }
   // 分段可缺：只有情景段才替换情景记忆（否则"只恢复性格"的导入会把记忆清空）
+  laapSnapAll(true);   // 导入=整份覆盖"自我"：先把现状强制快照
   if (nEps) {
     LittleFS.remove(EP_PATH);
     LittleFS.rename("/mem/episodes.imp", EP_PATH);

@@ -10,6 +10,8 @@
 #include "laap_voice.h"
 #include "laap_vision.h"
 #include "laap_audio.h"
+#include "laap_metrics.h"
+#include "laap_snap.h"
 #include <WiFi.h>
 #include <ESPmDNS.h>
 
@@ -97,6 +99,8 @@ async function refresh(){
   document.getElementById('upt').textContent=Math.floor(tot/60)+' 小时 '+(tot%60)+' 分（本次开机 '+cur+' 分，累计跨重启）';
   document.getElementById('net').textContent=s.ap?'配置热点 '+s.ap_ssid:(s.wifi_ok?'WiFi 已连接 '+s.ip:'WiFi 断开');
   document.getElementById('model').textContent=s.llm_model+' @ '+s.llm_base;
+  const m=s.metrics||{};
+  document.getElementById('metrics').textContent='对话 '+m.vad_triggers+' 轮 · ASR空识别 '+m.asr_fail+'/'+m.asr_try+' · 打断 '+m.interrupts+' · LLM失败 '+m.llm_fail+' · 回复均 '+(m.rsp_llm_ms||0)+'ms · 👍'+(m.fb_up||0)+' 👎'+(m.fb_down||0);
   const vc=document.getElementById('voicecard');
   if(vc){if(s.voice_ready&&s.voice_mode==2){vc.style.display='block';
     document.getElementById('listenstate').textContent=s.vad_paused?'已暂停':'聆听中…';
@@ -109,6 +113,17 @@ async function refresh(){
  }catch(e){}
 }
 setInterval(refresh,5000);refresh();
+// 回复下挂 👍/👎：反馈是自进化的核心评估信号（落盘 /mem/feedback.jsonl，也联动信任/失望）
+function addRate(tip){
+ const rt=document.createElement('div');rt.className='sys';
+ rt.innerHTML='<a href="#" onclick="rate(event,1)">👍</a> <a href="#" onclick="rate(event,-1)">👎</a>';
+ tip.after(rt);
+}
+async function rate(e,v){
+ e.preventDefault();const box=e.target.parentNode;box.textContent='记下了…';
+ try{const r=await (await fetch('/api/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({v})})).json();
+  box.textContent=r.ok?'（反馈已记下，谢谢）':'（反馈失败）';}catch(err){box.textContent='（反馈失败）';}
+}
 async function sendChat(){
  const t=document.getElementById('chatin').value.trim();if(!t)return;
  document.getElementById('chatin').value='';
@@ -126,8 +141,9 @@ async function sendChat(){
     const q=await (await fetch('/api/chat/reply')).json();
     if(q.seq>r.seq){got=true;tip.className='aris';tip.textContent='Aris: '+(q.reply||'（它想了半天，没说出来）');break;}
    }
-   if(!got)tip.textContent='（还在想，稍后看上面"它最近说"）';
-  }else{tip.className='aris';tip.textContent='Aris: '+r.reply;}
+   if(got)addRate(tip);
+   else tip.textContent='（还在想，稍后看上面"它最近说"）';
+  }else{tip.className='aris';tip.textContent='Aris: '+r.reply;addRate(tip);}
  }catch(e){tip.textContent='请求失败';}
  log.scrollTop=1e9;refresh();
 }
@@ -211,6 +227,10 @@ void LaapWeb::registerRoutes() {
   server.on("/api/voice/test", HTTP_POST, [this]() { handleVoiceTest(); });
   server.on("/api/speak", HTTP_POST, [this]() { handleSpeak(); });
   server.on("/api/listen", HTTP_POST, [this]() { handleListenToggle(); });
+  server.on("/api/metrics", HTTP_GET, [this]() { handleMetrics(); });
+  server.on("/api/feedback", HTTP_POST, [this]() { handleFeedback(); });
+  server.on("/api/snapshots", HTTP_GET, [this]() { handleSnapshots(); });
+  server.on("/api/snapshot/restore", HTTP_POST, [this]() { handleSnapRestore(); });
   server.onNotFound([this]() { handleNotFound(); });
   otaPending = false;
 }
@@ -280,7 +300,8 @@ void LaapWeb::handleRoot() {
       "<div class='card'><div class='k' style='color:#8b95a8;font-size:12px'>它最近说</div><div class='v' id='last' style='margin-top:6px'>…</div>"
       "<div class='k' style='color:#8b95a8;font-size:12px;margin-top:8px'>运行时长</div><div class='v' id='upt'>…</div>"
     "<div class='k' style='color:#8b95a8;font-size:12px;margin-top:8px'>网络</div><div class='v' id='net'>…</div>"
-      "<div class='k' style='color:#8b95a8;font-size:12px;margin-top:8px'>大模型</div><div class='v' id='model'>…</div></div>"
+      "<div class='k' style='color:#8b95a8;font-size:12px;margin-top:8px'>大模型</div><div class='v' id='model'>…</div>"
+      "<div class='k' style='color:#8b95a8;font-size:12px;margin-top:8px'>自检指标（本次开机）</div><div class='v' id='metrics' style='font-size:13px'>…</div></div>"
       "<div class='card' id='voicecard' style='display:none'><div class='row' style='align-items:center'>"
       "<div style='flex:1'><span class='k' style='color:#8b95a8;font-size:12px'>语音聆听</span><div class='v' id='listenstate'>…</div></div>"
       "<button class='ghost' id='listenbtn' onclick='toggleListen(event)' style='margin-top:0'>暂停聆听</button></div></div>"
@@ -598,6 +619,8 @@ void LaapWeb::handleStatus() {
     // 主动表达的"闸门状态"：dominance 越过 threshold 就会说话，冷却 3 分钟内不再说
     ",\"dominance\":" + String(mind.dominance(), 2) +
     ",\"idle\":\"" + laapIdleInfo() + "\"" +
+    // 评估埋点（本次开机）：RSI 闭环的 fitness 端，网页/脚本都从这里读
+    ",\"metrics\":{" + metrics.json() + "}" +
     "}";
   server.send(200, "application/json", j);
 }
@@ -650,13 +673,26 @@ void LaapWeb::handleMemoryPage() {
     "<button class='ghost' onclick='clearmem(event)'>清空全部记忆</button></div>"
     "<input type='file' id='memfile' accept='.txt' style='margin-top:8px;width:100%'>"
     "<div class='hint'>导出的 txt 含情景记忆+自我认知+性格进化；导入会覆盖当前记忆（先备份再导入更稳）</div></div>"
+    "<div class='card'><b>⏪ 快照回滚</b>"
+    "<div class='hint'>「自我」三件套（自我认知 / 情景记忆 / 性格进化）的自动快照，各留 3 版：自动档 12 小时一拍，清空记忆 / 导入记忆前会强制拍一份。恢复 = 把选中的版本拷回原位（现状先存成 .pre），然后设备自动重启。这是它「自我进化跑偏」时的后悔药。</div>"
+    "<div id='snaps' style='margin-top:6px;font-size:13px;line-height:2.2'></div></div>"
     "<script>"
     "async function load(){const s=await (await fetch('/api/memory')).json();"
     "sem.textContent=s.semantic||'（还没有形成自我认知）';"
     "let h='';for(const e of s.events.slice(-40).reverse()){"
     "const c=e.r=='user'?'#9ae6b4':(e.r=='aris'?'#6fd3ff':'#8b95a8');"
     "h+='<div style=\"color:'+c+'\">['+e.r+'] '+e.x.replace(/</g,'&lt;')+'</div>';}"
-    "eps.innerHTML=h||'（空）';}"
+    "eps.innerHTML=h||'（空）';loadSnaps();}"
+    "async function loadSnaps(){try{const a=await (await fetch('/api/snapshots')).json();let h='';"
+    "for(const s of a){h+='<div><b>'+s.name+'</b> <span style=\"color:#8b95a8;font-size:12px\">'+s.path+'</span> ';"
+    "if(!s.v.length)h+='（还没有快照，写入一次后就会出现）';"
+    "for(const v of s.v)h+='<button class=\"ghost\" style=\"padding:4px 10px;margin:2px\" onclick=\"snapres(event,\\''+s.name+'\\','+v.n+')\">v'+v.n+' · '+v.kb+'KB · '+v.age_h+'小时前</button>';"
+    "h+='</div>';}"
+    "document.getElementById('snaps').innerHTML=h;}catch(e){}}"
+    "async function snapres(e,n,v){e.preventDefault();"
+    "if(!confirm('把 '+n+' 恢复到第 '+v+' 版？现状会先存成 .pre，恢复后设备重启。'))return;"
+    "try{const r=await (await fetch('/api/snapshot/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n,ver:v})})).json();"
+    "alert((r.ok?'✅ ':'❌ ')+r.msg);}catch(err){alert('恢复失败: '+err);}}"
     "async function clearmem(e){e.preventDefault();if(!confirm('清空全部记忆?（建议先导出备份）'))return;"
     "await fetch('/api/clear',{method:'POST'});load();}"
     "async function memimp(e){e.preventDefault();const f=document.getElementById('memfile').files[0];"
@@ -747,4 +783,46 @@ void LaapWeb::handleSpeak() {
   if (!text.length()) { server.send(400, "application/json", "{\"ok\":false}"); return; }
   voice.speak(text, "calm");
   server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// ---- 评估埋点 / 反馈 / 快照（RSI 闭环：评估端 + 回滚安全网） ----
+void LaapWeb::handleMetrics() {
+  server.send(200, "application/json",
+              String("{\"ok\":true,\"boot_ms\":") + millis() + ",\"metrics\":{" + metrics.json() + "}}");
+}
+
+void LaapWeb::handleFeedback() {
+  String b = server.arg("plain");
+  int v = (int)jsonField(b, "v").toInt();
+  if (v != 1 && v != -1) { server.send(400, "application/json", "{\"ok\":false,\"msg\":\"v 须为 1 或 -1\"}"); return; }
+  // 反馈直接进认知：👍=信任+，👎=失望+信任-（它会对"被踩的回答"表现出警觉/低落）
+  if (v > 0) mind.trustUpdate(2, 0);
+  else { mind.trustUpdate(0, 1); mind.onLetdown(0.5f); }
+  bool ok = metrics.feedback(v, laapLastUserText(), laapChatReply());
+  server.send(ok ? 200 : 500, "application/json",
+              String("{\"ok\":") + (ok ? "true" : "false") + "}");
+}
+
+void LaapWeb::handleSnapshots() {
+  server.send(200, "application/json", laapSnapListJson());
+}
+
+void LaapWeb::handleSnapRestore() {
+  String b = server.arg("plain");
+  String name = jsonField(b, "name");
+  int ver = (int)jsonField(b, "ver").toInt();
+  if (!name.length() || ver < 1 || ver > 3) {
+    server.send(400, "application/json", "{\"ok\":false,\"msg\":\"name/ver 缺失或非法\"}");
+    return;
+  }
+  if (!laapSnapRestore(name.c_str(), ver)) {
+    server.send(500, "application/json",
+                String("{\"ok\":false,\"msg\":\"恢复失败：") + name + " 没有第 " + ver + " 版快照\"}");
+    return;
+  }
+  // 恢复后必须重启：工作记忆环、语义向量缓存都与盘上文件绑死，热切换必错位
+  server.send(200, "application/json", "{\"ok\":true,\"msg\":\"已恢复，重启后生效\"}");
+  laapUptimePersist();
+  delay(600);
+  ESP.restart();
 }

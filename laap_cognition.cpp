@@ -1,5 +1,6 @@
 #include "laap_cognition.h"
 #include "laap_memory.h"
+#include "laap_snap.h"   // evolution.json 每次心跳都可能重写：快照走自动档节流
 #include <LittleFS.h>
 #include <time.h>
 
@@ -23,6 +24,7 @@ bool Cognition::loadEvolution() {
 }
 
 void Cognition::saveEvolution() {
+  laapSnapMake("evolution", false);   // 心跳级写入×12h 节流 ≈ 每半天留一版性格
   File f = LittleFS.open("/evolution.json", "w");
   if (!f) return;
   f.printf("{\"gen\":%lu,\"cycles\":%lu,\"chats\":%lu,\"open\":%.3f,\"soc\":%.3f,\"sens\":%.3f}",
