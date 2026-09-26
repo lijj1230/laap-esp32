@@ -374,6 +374,11 @@ void LaapWeb::handleSettingsPage() {
     "<div style='flex:1'><label>备用 Key</label><input id='asr2key' type='password'></div></div>"
     "<div class='row'><div style='flex:1'><label>备用模型</label><input id='asr2model' placeholder='paraformer-v2'></div></div>"
     "<div class='hint'>Base 含 dashscope 自动走百炼原生路径；其余按 OpenAI 兼容 /audio/transcriptions</div>"
+    "<label>语义向量（识海召回；留空=复用 ASR 的地址与 Key）</label>"
+    "<div class='row'><div style='flex:2'><label>Base URL</label><input id='embbase' placeholder='https://api.siliconflow.cn/v1'></div>"
+    "<div style='flex:1'><label>API Key</label><input id='embkey' type='password'></div></div>"
+    "<div class='row'><div style='flex:1'><label>模型</label><input id='embmodel' placeholder='BAAI/bge-m3'></div></div>"
+    "<div class='hint' id='embstate'></div>"
     "<div class='row'><div style='flex:1'><label>唤醒词（留空=VAD即应答）</label><input id='wakeword' placeholder='例如：小立'></div>"
     "<div style='flex:1'><label>视觉手机桥 URL（可留空）</label><input id='visionbase' placeholder='http://192.168.x.x:11548/vision'></div></div>"
     "<div class='row'><div style='flex:2'><label>视觉直连 Base（留空=OpenRouter）</label><input id='vlbase' placeholder='https://openrouter.ai/api/v1/chat/completions'></div>"
@@ -402,6 +407,9 @@ void LaapWeb::handleSettingsPage() {
     "volcappid.value=s.volc_appid;volctoken.value=s.volc_token_masked?'':'';volctoken.placeholder=s.volc_token_masked?'已配置，留空保持不变':'未配置';"
     "volcvoice.value=s.volc_voice;asrbase.value=s.asr_base;asrkey.value='';asrkey.placeholder=s.asr_key_masked?'已配置，留空保持不变':'未配置';"
     "asrmodel.value=s.asr_model;asr2base.value=s.asr2_base||'';asr2key.value='';asr2key.placeholder=s.asr2_key_masked?'已配置，留空保持不变':'未配置';asr2model.value=s.asr2_model||'';wakeword.value=s.wake_word||'';visionbase.value=s.vision_base||'';"
+    "embbase.value=s.emb_base||'';embkey.value='';embkey.placeholder=s.emb_key_masked?'已配置，留空保持不变':'留空复用 ASR Key';"
+    "embmodel.value=s.emb_model||'';"
+    "embstate.textContent='语义向量通道：'+(s.embed_ok?'正常（已嵌入 '+s.embed_count+' 条）':'⚠ 已熔断（连败3次，退关键词召回）——查上面的地址与 Key');"
     "vlbase.value=s.vision_llm_base||'';vkey.value='';"
     "vkey.placeholder=s.vision_key_masked?'已配置，留空保持不变':'留空复用大模型 Key';"
     "vmodel.value=s.vision_model||'';}"
@@ -413,6 +421,7 @@ void LaapWeb::handleSettingsPage() {
     "vmode:vmode.value,ttsch:ttsch.value,ttsvoice:ttsvoice.value,ttsrate:ttsrate.value,"
     "volcappid:volcappid.value,volctoken:volctoken.value,volctoken_set:1,volcvoice:volcvoice.value,"
     "asrbase:asrbase.value,asrkey:asrkey.value,asrkey_set:1,asrmodel:asrmodel.value,asr2base:asr2base.value,asr2key:asr2key.value,asr2key_set:1,asr2model:asr2model.value,asr2_set:1,"
+    "embbase:embbase.value,embbase_set:1,embkey:embkey.value,embkey_set:1,embmodel:embmodel.value,embmodel_set:1,"
     "wakeword:wakeword.value,visionbase:visionbase.value,vlbase:vlbase.value,vkey:vkey.value,vkey_set:1,vmodel:vmodel.value,"
     "wakeword_set:1,visionbase_set:1,vlbase_set:1,vmodel_set:1})});"
     "const r=await b.json();alert(r.msg);}"
@@ -492,6 +501,11 @@ void LaapWeb::handleSave() {
     strlcpy(cfg.s.asr2Model, asr2model.c_str(), sizeof(cfg.s.asr2Model));
   }
   if (flag("asr2key_set")) setSecret(asr2key, cfg.s.asr2Key, sizeof(cfg.s.asr2Key), "备用 ASR Key");
+  // 语义向量：独立配置（空=复用 ASR 的 base/key）；Key 留空=保持
+  String embbase = get("embbase"), embkey = get("embkey"), embmodel = get("embmodel");
+  if (flag("embbase_set")) strlcpy(cfg.s.embBase, embbase.c_str(), sizeof(cfg.s.embBase));
+  if (flag("embkey_set")) setSecret(embkey, cfg.s.embKey, sizeof(cfg.s.embKey), "向量 Key");
+  if (flag("embmodel_set")) strlcpy(cfg.s.embModel, embmodel.c_str(), sizeof(cfg.s.embModel));
   if (ssid.length()) strlcpy(cfg.s.wifiSsid, ssid.c_str(), sizeof(cfg.s.wifiSsid));
   if (pass.length()) strlcpy(cfg.s.wifiPass, pass.c_str(), sizeof(cfg.s.wifiPass));
   if (base.length()) strlcpy(cfg.s.llmBase, base.c_str(), sizeof(cfg.s.llmBase));
@@ -596,7 +610,12 @@ void LaapWeb::handleStatus() {
     "\",\"asr2_base\":\"" + jsonEsc(cfg.s.asr2Base) +
     "\",\"asr2_key_masked\":\"" + (String(cfg.s.asr2Key).length() ? "已配置" : "") +
     "\",\"asr2_model\":\"" + jsonEsc(cfg.s.asr2Model) +
-    "\",\"wake_word\":\"" + jsonEsc(cfg.s.wakeWord) +
+    "\",\"emb_base\":\"" + jsonEsc(cfg.s.embBase) +
+    "\",\"emb_model\":\"" + jsonEsc(cfg.s.embModel) +
+    "\",\"emb_key_masked\":\"" + (String(cfg.s.embKey).length() ? "已配置" : "") +
+    "\",\"embed_ok\":" + (memory.embedFused() ? "false" : "true") +
+    ",\"embed_count\":" + memory.embedCount() +
+    ",\"wake_word\":\"" + jsonEsc(cfg.s.wakeWord) +
     "\",\"vision_base\":\"" + jsonEsc(cfg.s.visionBase) +
     "\",\"vision_llm_base\":\"" + jsonEsc(cfg.s.visionLlmBase) +
     "\",\"vision_key_masked\":\"" + (String(cfg.s.visionKey).length() ? "已配置" : "") +
@@ -707,7 +726,7 @@ void LaapWeb::handleMemoryPage() {
     "async function loadSnaps(){try{const a=await (await fetch('/api/snapshots')).json();let h='';"
     "for(const s of a){h+='<div><b>'+s.name+'</b> <span style=\"color:#8b95a8;font-size:12px\">'+s.path+'</span> ';"
     "if(!s.v.length)h+='（还没有快照，写入一次后就会出现）';"
-    "for(const v of s.v)h+='<button class=\"ghost\" style=\"padding:4px 10px;margin:2px\" onclick=\"snapres(event,\\''+s.name+'\\','+v.n+')\">v'+v.n+' · '+v.kb+'KB · '+v.age_h+'小时前</button>';"
+    "for(const v of s.v)h+='<button class=\"ghost\" style=\"padding:4px 10px;margin:2px\" onclick=\"snapres(event,\\''+s.name+'\\','+v.n+')\">v'+v.n+' · '+v.kb+'KB · '+(v.age_h<0?'时间未知':v.age_h+'小时前')+'</button>';"
     "h+='</div>';}"
     "document.getElementById('snaps').innerHTML=h;}catch(e){}}"
     "async function snapres(e,n,v){e.preventDefault();"

@@ -259,6 +259,27 @@ static float cosineOf(const float* a, const float* b, int n) {
   return dot / (sqrtf(na) * sqrtf(nb));
 }
 
+// 行内抽 w 与时间戳 → (w, 新鲜度 0..1)。t=0（无时钟期写入）按中性 0.5。
+// 召回排序必须用它：w 被 rememberBoost 累加且永不衰减（上限 5），
+// 不归一化的话老记忆能纯靠权重压过语义相似度（"很久之后突然想起来"的根因）。
+static void parseWt(const String& l, float& w, float& fresh) {
+  w = 1.0f; fresh = 0.5f;
+  int wp = l.indexOf("\"w\":");
+  if (wp >= 0) w = l.substring(wp + 4, l.indexOf(',', wp)).toFloat();
+  time_t nowT = time(nullptr);
+  uint32_t now = (nowT > 1700000000) ? (uint32_t)nowT : 0;
+  int tp = l.indexOf("\"t\":");
+  if (tp >= 0) {
+    int te = l.indexOf(',', tp);
+    uint32_t t = l.substring(tp + 4, te > 0 ? te : l.indexOf('}', tp)).toFloat();
+    if (now > 0 && t > 0) {
+      float ageDay = (now - t) / 86400.0f;
+      if (ageDay < 0) ageDay = 0;
+      fresh = 1.0f / (1.0f + ageDay);           // 当天≈1，一周≈0.13
+    }
+  }
+}
+
 // 智能回忆：主=语义 Top-K（w 加权），退=关键词
 String MemorySystem::recallSmart(const String& query, int maxChars) {
   struct Hit { String line; float score; };
@@ -281,11 +302,13 @@ String MemorySystem::recallSmart(const String& query, int maxChars) {
             String l = "";
             while (lf.available()) { l = lf.readStringUntil('\n'); if (l.length()) break; }
             if (!l.length()) break;
-            float w = 1.0f;
-            int wp = l.indexOf("\"w\":");
-            if (wp >= 0) w = l.substring(wp + 4, l.indexOf(',', wp)).toFloat();
+            // 语义为主(0.75) + 强化权重归一(0.15, 封顶3) + 新鲜度(0.10)：
+            // 老记忆只有语义上真的相关才会浮上来，不再靠被强化过的权重霸榜
+            float fw, fr;
+            parseWt(l, fw, fr);
+            float wn = (fw > 3 ? 3 : fw) / 3.0f;
             float sim = cosineOf(qv, rv, EMB_DIM);
-            hits.push_back({l, sim * 0.8f + w * 0.2f});   // 语义为主，权重为辅
+            hits.push_back({l, sim * 0.75f + wn * 0.15f + fr * 0.10f});
             idx++;
             if (hits.size() > 40) {                        // 控内存：留 Top40
               size_t worst = 0;
@@ -304,17 +327,17 @@ String MemorySystem::recallSmart(const String& query, int maxChars) {
     }
   }
 
-  // —— 退通道：关键词（原逻辑 + w 加权排序） ——
+  // —— 退通道：关键词（无语义可用：权重与新鲜度各半，老记忆不再无条件霸榜） ——
   if (hits.empty()) {
     File f = LittleFS.open(EP_PATH, "r");
     if (!f) return "";
     while (f.available()) {
       String l = f.readStringUntil('\n');
       if (l.length() && query.length() >= 2 && l.indexOf(query) >= 0) {
-        float w = 1.0f;
-        int wp = l.indexOf("\"w\":");
-        if (wp >= 0) w = l.substring(wp + 4, l.indexOf(',', wp)).toFloat();
-        hits.push_back({l, w});
+        float fw, fr;
+        parseWt(l, fw, fr);
+        float wn = (fw > 3 ? 3 : fw) / 3.0f;
+        hits.push_back({l, wn * 0.5f + fr * 0.5f});
       }
     }
     f.close();

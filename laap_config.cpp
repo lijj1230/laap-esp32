@@ -71,6 +71,9 @@ void LaapConfig::load() {
   prefs.getString("asr2base", s.asr2Base, sizeof(s.asr2Base));
   prefs.getString("asr2key", s.asr2Key, sizeof(s.asr2Key));
   prefs.getString("asr2model", s.asr2Model, sizeof(s.asr2Model));
+  prefs.getString("embbase", s.embBase, sizeof(s.embBase));
+  prefs.getString("embkey", s.embKey, sizeof(s.embKey));
+  prefs.getString("embmodel", s.embModel, sizeof(s.embModel));
   prefs.getString("wakeword", s.wakeWord, sizeof(s.wakeWord));
   prefs.getString("visionbase", s.visionBase, sizeof(s.visionBase));
   prefs.getString("vlbase", s.visionLlmBase, sizeof(s.visionLlmBase));
@@ -115,6 +118,9 @@ bool LaapConfig::save() {
   prefs.putString("asr2base", s.asr2Base);
   prefs.putString("asr2key", s.asr2Key);
   prefs.putString("asr2model", s.asr2Model);
+  prefs.putString("embbase", s.embBase);
+  prefs.putString("embkey", s.embKey);
+  prefs.putString("embmodel", s.embModel);
   prefs.putString("wakeword", s.wakeWord);
   prefs.putString("visionbase", s.visionBase);
   prefs.putString("vlbase", s.visionLlmBase);

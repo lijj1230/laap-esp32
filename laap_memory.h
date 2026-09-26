@@ -23,6 +23,8 @@ public:
   // 语义向量（bge-m3 经硅基流动；异步缓存，无向量时 recallSmart 自动退关键词）
   void   embedTick();                              // loop 调用：给未嵌入的记忆补向量（限速）
   bool   embedOk() const { return _embFail < 3; }  // 连败3次后本轮停用（退关键词）
+  bool   embedFused() const { return _embFail >= 3; } // 语义通道熔断中（/api/status 暴露）
+  uint32_t embedCount() const { return _embCount; }   // 已有向量的记忆条数（与 emb.bin 行数一致）
   String semantic() const;
   void setSemantic(const String& s);
   uint32_t eventCount() const { return _count; }

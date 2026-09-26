@@ -55,8 +55,11 @@ bool laapSnapMake(const char* name, bool force) {
   String newest = snapPath(name, 1);
   if (!force && LittleFS.exists(newest)) {
     File f = LittleFS.open(newest, "r");
-    // getLastWrite 是墙钟 epoch；时钟未同步时（time 很小）差值为负→强转后是巨数→当作该拍
-    uint32_t ageS = f ? (uint32_t)((long)time(nullptr) - (long)f.getLastWrite()) : SNAP_MIN_INTERVAL_MS / 1000;
+    time_t lw = f ? f.getLastWrite() : 0;
+    // getLastWrite 是墙钟 epoch。<1.7e9 说明写它时 NTP 还没同步（time() 从 1970 起算=开机秒数），
+    // 时间戳不可信：当作"刚写过"跳过自动档，否则假年龄(几十万小时)会让节流失守、每次心跳都重拍
+    if (f && lw < 1700000000) { f.close(); return false; }
+    uint32_t ageS = f ? (uint32_t)((long)time(nullptr) - (long)lw) : SNAP_MIN_INTERVAL_MS / 1000;
     if (f) f.close();
     if (ageS < SNAP_MIN_INTERVAL_MS / 1000) return false;  // 自动档：12h 内拍过了
   }
@@ -101,7 +104,9 @@ String laapSnapListJson() {
       if (!LittleFS.exists(p)) continue;
       File f = LittleFS.open(p, "r");
       if (!f) continue;
-      uint32_t ageH = (uint32_t)((long)time(nullptr) - (long)f.getLastWrite()) / 3600UL;
+      time_t lw = f.getLastWrite();
+      // ts<1.7e9（NTP 同步前写的）：年龄没有意义，报 -1 让前端显示"时间未知"
+      int32_t ageH = (lw < 1700000000) ? -1 : (int32_t)(((long)time(nullptr) - (long)lw) / 3600L);
       if (any) j += ",";
       j += String("{\"n\":") + v + ",\"kb\":" + (f.size() / 1024) + ",\"age_h\":" + ageH + "}";
       f.close();
@@ -122,8 +127,9 @@ String laapSnapListText() {
       if (!LittleFS.exists(p)) continue;
       File f = LittleFS.open(p, "r");
       if (!f) continue;
+      time_t lw = f.getLastWrite();
       t += String(" v") + v + "=" + (f.size() / 1024) + "KB/" +
-           ((uint32_t)((long)time(nullptr) - (long)f.getLastWrite()) / 3600UL) + "h前";
+           (lw < 1700000000 ? String("时间未知") : String((uint32_t)((long)time(nullptr) - (long)lw) / 3600UL) + "h前");
       f.close();
       any = true;
     }

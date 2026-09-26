@@ -334,9 +334,13 @@ static const int EMB_DIM_L = 1024;
 // bin：EMB_DIM_L 个 float 的原始字节；ok=false 时内容无意义。失败静默（记忆层自动退关键词通道）。
 String laapEmbed(const String& text, bool& ok) {
   ok = false;
-  if (String(cfg.s.asrKey).length() == 0 || WiFi.status() != WL_CONNECTED) return "";
-  // 硅基流动 embeddings 端点与 ASR 同域同 key
-  String base(cfg.s.asrBase);
+  if (WiFi.status() != WL_CONNECTED) return "";
+  // 向量通道配置：独立配置（embBase/embKey/embModel）优先，留空则复用 ASR 的 base/key。
+  // 这样 ASR 换服务商不会把识海召回悄悄带死（bge-m3 只有硅基流动等家有）。
+  String base(cfg.s.embBase[0] ? cfg.s.embBase : cfg.s.asrBase);
+  String key(cfg.s.embKey[0] ? cfg.s.embKey : cfg.s.asrKey);
+  String model(cfg.s.embModel[0] ? cfg.s.embModel : "BAAI/bge-m3");
+  if (!key.length()) return "";
   int dm = base.indexOf("/v1");
   String ep = (dm > 8 ? base.substring(0, dm) : base) + "/v1/embeddings";
 
@@ -347,7 +351,7 @@ String laapEmbed(const String& text, bool& ok) {
   int port = 443;
   if (host.indexOf(':') >= 0) { port = host.substring(host.indexOf(':') + 1).toInt(); host = host.substring(0, host.indexOf(':')); }
 
-  String body = String("{\"model\":\"BAAI/bge-m3\",\"input\":[\"") + LlmClient::jsonEscape(text) + "\"]}";
+  String body = String("{\"model\":\"") + model + "\",\"input\":[\"" + LlmClient::jsonEscape(text) + "\"]}";
   WiFiClientSecure cli; cli.setInsecure(); cli.setTimeout(12000);
   if (!cli.connect(host.c_str(), port)) return "";
   String req = String("POST ") + path + " HTTP/1.1\r\nHost: " + host +

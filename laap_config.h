@@ -41,6 +41,9 @@ struct LaapSettings {
   char asr2Base[129]  = "";                        // 备用 ASR（空=不启用；base 含 dashscope 走百炼原生路径）
   char asr2Key[129]   = "";
   char asr2Model[49]  = "";
+  char embBase[129]   = "";                        // 语义向量（识海召回）：空=复用 ASR 的 base/key
+  char embKey[129]    = "";                        // （bge-m3 只有硅基流动等家有，ASR 换服务商时在此单配）
+  char embModel[49]   = "";                        // 空=BAAI/bge-m3
   char wakeWord[25]   = "";                        // F8: 唤醒词（空=关门，VAD 即应答）
   char visionBase[129] = "";                       // F9: 视觉手机桥 URL（空=不走桥）
   char visionLlmBase[129] = "";                    // F9: 直连视觉 base（空=OpenRouter）
