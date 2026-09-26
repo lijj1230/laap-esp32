@@ -53,15 +53,17 @@ void LaapVoice::speak(const String& text, const char* expr) {
     if (expr) display.drawFace(expr, false);
   }
   if (audio.interrupted()) metrics.interruptedPlay();   // 播放被人声/按键打断（barge-in）
-  // 播报冷却：等回声消散，避免 VAD 自触发（时长由自调优旋钮 A 控制）
+  // 播报冷却：等回声消散，避免 VAD 自触发（时长由自调优旋钮 A 控制）。
+  // 同时清预滚——自家 TTS 尾音绝不能留在预滚里，否则下一轮录音会把"自己说的话"交给 ASR
   _cooldownMs = millis() + _cooldownDur;
+  audio.prerollFlush();
   _busy = false;
 }
 
 bool LaapVoice::listenAndTranscribe(String& heard) {
   heard = "";
   if (!audio.micOk) { lastError = "无麦克风"; return false; }
-  Serial.println("[VOICE] 请说…（静音 0.45s 结束，最多 12s）");
+  Serial.println("[VOICE] 请说…（静音 0.8s 结束，最多 12s）");
   display.drawFace("curious", true);
 
   audio.recordStart(12);
@@ -159,6 +161,8 @@ void LaapVoice::loopTick() {
     s_lastDrawn = wantListening;
   }
   if (_busy) return;
+  // 音频泵所有模式常转：预滚缓冲靠它持续喂数（按键/暂停/冷却期也要滚，只是不触发）
+  audio.recordTick();
   // ASR 预热：仅"上次对话后 5 分钟内"的空闲期进行，且已有活连接就跳过——
   // 防止长期无人时高频握手（服务商 WAF 可能盯上陌生 TLS 风暴）
   static uint32_t s_warmMs = 0;
@@ -178,9 +182,8 @@ void LaapVoice::loopTick() {
     }
   }
   if (!vadMode) return;
-  if (_vadPaused) { audio.recordTick(); return; }   // 暂停：只排水不触发
-  if ((int32_t)(millis() - _cooldownMs) < 0) { audio.recordTick(); return; }  // 回绕安全
-  audio.recordTick();
+  if (_vadPaused) return;                               // 暂停：只排水（上面已泵）不触发
+  if ((int32_t)(millis() - _cooldownMs) < 0) return;    // 回绕安全
   // 检测持续人声（>600ms 才开麦，避免误触发）
   if (audio.vadSpeaking()) {
     if (!_vadHold) { _vadHold = true; _vadHoldStart = millis(); }
@@ -226,9 +229,10 @@ void LaapVoice::tuneTick() {
     }
   } else s_cleanA = 0;
 
-  // 旋钮 B：VAD 触发了却没听到有效内容（环境噪声/回声误触发）→ 抬阈值；连续 3 窗干净 → 回落
+  // 旋钮 B：VAD 触发了却没听到有效内容（环境噪声/回声误触发）→ 抬阈值；连续 3 窗干净 → 回落。
+  // 上限 1.6：曾到 2.0 时远场人声全被埋（"要凑很近才理人"），宁可偶尔误触发也不能调聋
   uint32_t miss = dNs + dWm;
-  if (miss >= 3 && _vadMul < 2.0f) {
+  if (miss >= 3 && _vadMul < 1.6f) {
     _vadMul += 0.15f;
     audio.setVadThresholdMul(_vadMul);
     Serial.printf("[TUNE] VAD 阈值 ×%.2f（本窗口 %lu 次『触发但没听清』）\n", _vadMul, (unsigned long)miss);

@@ -25,6 +25,8 @@ public:
   bool spkOk = false, micOk = false;
 
   // ---- 录音（16kHz 16bit 单声道，PSRAM 缓冲） ----
+  // 录音头自动回填预滚缓冲（触发前 ~1.5s）：VAD 要先听到 600ms 持续人声才开录，
+  // 不回填的话句首必丢——唤醒词/前几个字永远不在录音里，实测只剩四五个字
   bool recordStart(size_t maxSeconds = 20);
   void recordTick();                 // 非阻塞，需在 loop 高频调用
   size_t recordBytes() const { return _recLen; }
@@ -42,9 +44,13 @@ public:
   void vadCalibrate(uint32_t ms);    // 静默环境校准
   bool vadSpeaking() const { return _vadSpeech; }
   float micRms() const { return _fastRms; }
-  // 触发阈值乘数（自调优旋钮，RSI⑥）：1.0=默认灵敏度，>1 更不敏感（防环境噪声/回声误触发）
-  void setVadThresholdMul(float m) { _vadThMul = (m < 1.0f ? 1.0f : (m > 2.0f ? 2.0f : m)); }
+  // 触发阈值乘数（自调优旋钮，RSI⑥）：1.0=默认灵敏度，>1 更不敏感（防环境噪声/回声误触发）。
+  // 上限 1.6：乘数只升不降的历史曾把它顶到 2.0 → 远场人声全部埋掉（"要凑很近才理人"）
+  void setVadThresholdMul(float m) { _vadThMul = (m < 1.0f ? 1.0f : (m > 1.6f ? 1.6f : m)); }
   float vadThresholdMul() const { return _vadThMul; }
+  // 预滚缓冲：播放完立即清空（自家 TTS 尾音不能进预滚，否则下一轮 ASR 听见自己说话）
+  static constexpr size_t kPreRollBytes = 48000;   // 1.5s @ 16kHz 16bit 单声道
+  void prerollFlush() { _preLen = 0; }
 
   // ---- PA（读-改-写 PCA9557，不动 LCD_CS 位） ----
   void paSet(bool on);
@@ -72,6 +78,8 @@ private:
   int16_t* _recBuf = nullptr;
   size_t _recCap = 0, _recLen = 0;
   int32_t _dsAcc = 0; int8_t _dsCnt = 0;      // 3:1 降采样累加器
+  int16_t* _preBuf = nullptr;                  // 预滚线性缓冲（新音频始终追加在尾部）
+  size_t _preLen = 0;                          // 预滚有效字节数（0..kPreRollBytes）
   float _slowRms = 30, _fastRms = 30;          // 环境基线 / 瞬时
   float _vadThMul = 1.0f;                      // 触发阈值乘数（自调优，钳位 1.0~2.0）
   bool _vadSpeech = false;

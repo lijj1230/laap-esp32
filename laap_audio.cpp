@@ -50,6 +50,10 @@ bool LaapAudio::setMicGainDb(int db10) {
 
 bool LaapAudio::begin() {
   // I2S 全双工（Wire 已由 display 初始化）
+  // 预滚缓冲先于一切分配：失败也能活（recordStart 回填时判空跳过），只是没有句首保护
+  _preBuf = (int16_t*)heap_caps_malloc(kPreRollBytes, MALLOC_CAP_SPIRAM);
+  if (!_preBuf) _preBuf = (int16_t*)malloc(kPreRollBytes);
+  _preLen = 0;
   i2s.setPins(AUD_I2S_BCLK, AUD_I2S_WS, AUD_I2S_DOUT, AUD_I2S_DIN, AUD_I2S_MCLK);
   if (!i2s.begin(I2S_MODE_STD, AUD_I2S_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO)) {
     Serial.println("[AUD] I2S begin 失败");
@@ -131,6 +135,10 @@ bool LaapAudio::recordStart(size_t maxSeconds) {
   if (!_recBuf) { _recBuf = (int16_t*)malloc(cap); }
   if (!_recBuf) return false;
   _recCap = cap; _recLen = 0; _dsCnt = 0; _dsAcc = 0;
+  // 预滚回填：触发前的最近 ~1.5s 已经在滚，拷进录音头（时间序，尾部=最新）
+  size_t pre = _preLen; if (pre > cap) pre = cap;
+  if (pre) memcpy(_recBuf, _preBuf, pre);
+  _recLen = pre;
   _recording = true;
   return true;
 }
@@ -151,29 +159,42 @@ void LaapAudio::pump() {
   _fastRms = _fastRms * 0.6f + rms * 0.4f;
   _slowRms = _slowRms * 0.995f + rms * 0.005f;
 
-  // VAD 判定：快均值显著高于慢基线（乘数由自调优旋钮控制，1.0=原始灵敏度）
-  float th = (_slowRms * 2.2f + 120) * _vadThMul;
+  // VAD 判定：快均值显著高于慢基线（乘数由自调优旋钮控制，1.0=原始灵敏度）。
+  // 基础阈值 2.2/120 → 1.8/80：实测 37.5dB 满增益下远场人声(1m) 快RMS 只有 300±，
+  // 旧阈值 344+ 时好时坏，600ms 持续判经常攒不满 → "要凑很近才理人"
+  float th = (_slowRms * 1.8f + 80) * _vadThMul;
   if (_fastRms > th) {
     if (!_vadSpeech) { _vadSpeech = true; _speechStartMs = millis(); }
     _silenceMs = 0;
   } else if (_vadSpeech) {
     _silenceMs += n * 1000UL / AUD_I2S_RATE;
-    if (_silenceMs > 450) _vadSpeech = false;   // 450ms 静音判停（更快响应）
+    // 800ms 静音判停：450ms 会把句间换气当成"说完了"，长句被拦腰截断（实测只剩四五个字）
+    if (_silenceMs > 800) _vadSpeech = false;
   }
 
-  // 3:1 降采样到 16k 入录音缓冲
-  if (_recording) {
-    for (int i = 0; i < n; i++) {
-      _dsAcc += tmp[i]; _dsCnt++;
-      if (_dsCnt >= 3) {
-        if (_recLen + 2 <= _recCap) {
-          int16_t s = (int16_t)(_dsAcc / 3);
-          _recBuf[_recLen / 2] = s; _recLen += 2;
-        }
-        _dsAcc = 0; _dsCnt = 0;
+  // 3:1 降采样到 16k：录音期进录音缓冲；空闲期滚进预滚缓冲（供下次触发回填句首）。
+  // 预滚满时丢老一半——按 pump 调用粒度整批搬（每次最多 24KB，约 4.5MB/s，PSRAM 无压力），
+  // 千万别按样本搬，否则 16k 样本/s 全都要触发 memmove
+  if (!_recording && _preBuf) {
+    size_t need = (n / 3 + 1) * 2;
+    if (_preLen + need > kPreRollBytes) {
+      size_t keep = kPreRollBytes / 2;
+      memmove(_preBuf, (uint8_t*)_preBuf + (kPreRollBytes - keep), keep);
+      _preLen = keep;
+    }
+  }
+  for (int i = 0; i < n; i++) {
+    _dsAcc += tmp[i]; _dsCnt++;
+    if (_dsCnt >= 3) {
+      int16_t s = (int16_t)(_dsAcc / 3);
+      _dsAcc = 0; _dsCnt = 0;
+      if (_recording) {
+        if (_recLen + 2 <= _recCap) { _recBuf[_recLen / 2] = s; _recLen += 2; }
+      } else if (_preBuf) {
+        _preBuf[_preLen / 2] = s; _preLen += 2;
       }
     }
-  } else { _dsAcc = 0; _dsCnt = 0; }
+  }
 }
 
 void LaapAudio::recordTick() { pump(); }

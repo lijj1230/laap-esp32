@@ -144,7 +144,8 @@ static String weatherCityOf(const String& text) {
   static const char* junk[] = {"今天","明天","后天","现在","目前","最近","怎么样","怎样","如何","咋样",
                                "查一下","查查","帮我","帮忙","看看","一下","天气","气温","预报","下雨",
                                "下雪","冷不冷","热不热","的","呢","吗","呀","啊","？","?"," ",
-                               "你那边","外面","这里","这边","本地","室内","室外","屋里","家里"};
+                               "你那边","外面","这里","这边","本地","室内","室外","屋里","家里",
+                               "你们","你的","咱们","那边","那个","这个"};
   String s = text;
   for (auto j : junk) s.replace(j, "");
   s.trim();
@@ -356,6 +357,10 @@ String laapToolsDispatch(const String& text) {
   static const char* wkeys[] = {"天气", "气温", "下雨", "下雪", "冷不冷", "热不热", "weather"};
   if (containsAny(text, wkeys, 7) && text.indexOf("搜索") < 0 && !text.startsWith("搜")) {
     String city = weatherCityOf(text);
+    // 城市被问句壳吃光（"今天天气怎么样"/录音截断丢了城市）→ 用配置的城市兜底。
+    // 空城市原先直接跳过 Open-Meteo 去走 wttr 的出口 IP 定位——wttr 又不稳，
+    // 这就是"配置了城市还是老查不到"的主路之一
+    if (!city.length() && cfg.s.city[0]) city = cfg.s.city;
     Serial.printf("[TOOLS] weather: 城市「%s」\n", city.length() ? city.c_str() : "(按出口IP定位)");
     String say;
     String cond;
