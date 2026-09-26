@@ -52,6 +52,7 @@ void LaapConfig::load() {
   s.volume         = prefs.getUChar("vol", 70);
   s.brightness     = prefs.getUChar("bright", 90);
   s.screenOffSec   = prefs.getUShort("screenoff", 60);
+  s.vadStopMs      = prefs.getUShort("vadstop", 5000);
   _uptimeBaseMin   = prefs.getUInt("uptmin", 0);
   s.llmContinue    = prefs.getUChar("llmcont", 1);
   s.llmMaxTokens   = prefs.getUShort("llmtok", 500);
@@ -101,6 +102,7 @@ bool LaapConfig::save() {
   prefs.putUChar("vol", s.volume);
   prefs.putUChar("bright", s.brightness);
   prefs.putUShort("screenoff", s.screenOffSec);
+  prefs.putUShort("vadstop", s.vadStopMs);
   prefs.putUChar("llmcont", s.llmContinue);
   prefs.putUShort("llmtok", s.llmMaxTokens);
   prefs.putUChar("nothink", s.llmNoThink);

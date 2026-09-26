@@ -267,10 +267,21 @@ void LaapDisplay::repaint() {
 
 void LaapDisplay::drawListenState(bool listening) {
   int8_t want = listening ? 1 : -1;   // 不在听=不显示（原来恒画灰点，看着像一直在收声）
+  if (_recOn) { listenDot = want; return; }   // 录音标记占用右上角：只记账不画，退出时恢复
   if (want == listenDot) return;
   listenDot = want;
   fillRect(SZP_LCD_W - 18, 1, 18, 17, CLR_BG);       // 只清右上角这一小块
   if (listenDot > 0) fillCircle(SZP_LCD_W - 8, 9, 4, CLR_EXP);
+}
+
+// 录音中标记（红点）：录音收音期间右上角亮红点，说完自动熄。息屏时画了也看不见，
+// 唤醒的 repaint 会盖掉它——可接受（听到人声即刻 laapActivity 点亮，红点只在亮屏时有意义）
+void LaapDisplay::drawRecState(bool on) {
+  if (on == _recOn) return;
+  _recOn = on;
+  fillRect(SZP_LCD_W - 18, 1, 18, 17, CLR_BG);
+  if (_recOn) fillCircle(SZP_LCD_W - 8, 9, 4, CLR_REC);
+  else if (listenDot > 0) fillCircle(SZP_LCD_W - 8, 9, 4, CLR_EXP);   // 恢复聆听点（VAD 模式录音时它本来亮着）
 }
 
 void LaapDisplay::thinkingPulse() {

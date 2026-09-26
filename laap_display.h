@@ -35,6 +35,7 @@
 // 顶栏文字（低饱和莫兰迪灰：柔和但必须看得清——第一版 132,138,152 实测"太淡"）
 #define CLR_TIME  RGB565(214, 208, 192)   // 时间-暖米灰（主信息）
 #define CLR_META  RGB565(164, 170, 184)   // 状态指标-冷灰蓝（次信息）
+#define CLR_REC   RGB565(232, 96, 84)     // 录音中标记-珊瑚红（一眼可见）
 
 class LaapDisplay {
 public:
@@ -52,6 +53,7 @@ public:
   void drawBootScreen();
   void blinkTick();                       // loop 里调用，眨眼动画
   void drawListenState(bool listening);   // 屏角聆听状态点（只在真正聆听时显示）
+  void drawRecState(bool on);             // 录音中标记（红点，与聆听点同用右上角，互斥）
   void thinkingPulse();                   // “思考中”动画步进
   void setScreenOn(bool on);              // 静默息屏（关背光，屏内容保留）
   bool screenOn() const { return _screenOn; }
@@ -81,6 +83,7 @@ private:
   // 顶栏数据缓存
   uint8_t needPct[5] = {0,0,0,0,0};
   int8_t listenDot = -1;              // -1=不显示 0=灰 1=绿
+  bool _recOn = false;                // 录音标记占用右上角时，聆听点只记账不画
   float devTemp = 0; int devRssi = 0; uint32_t devHeapKb = 0, devUpMin = 0;
   float devAccel = -1;                // IMU 加速度模值(g)，<0=不显示（IMU 缺席/无效）
   String ipCache; bool ipWifiOk = false; bool ipDrawn = false;   // 底栏缓存：息屏/装死后重画用

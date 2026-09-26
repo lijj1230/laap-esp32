@@ -349,15 +349,27 @@ static LlmReply monologueGenerate() {
   query.replace(" ", "+");                 // 搜索词进 URL：空格转 +
   g_monoTopic = topic;
 
-  if (vision.available()) {                            // F9: 起意前看一眼世界
+  // 起意前看一眼世界——"看"是有成本的感知，按需求驱动（active inference）：
+  // 好奇心高（>0.6，比搜索门槛略高——视觉 LLM 比搜索更贵）才看，低就凭记忆想；
+  // 主人主动要求看（拍照 / /look）不走这里，不受此门控。
+  // mind.needs().curiosity 是 float 单字段读（32 位对齐原子读），后台任务读它不碰 String，无撕裂风险
+  if (vision.available() && mind.needs().curiosity > 0.60f) {
     g_monoSight = vision.look("");
     if (g_monoSight.length()) Serial.printf("[VISION] %s\n", g_monoSight.c_str());
   }
-  String know = laapSearch.search(query, 3, 500);
+  // 搜索也是要花成本的探索动作——需求驱动：好奇心过阈值、或意图目标在推进时才查资料；
+  // 低欲期凭已有认知琢磨（省一次搜索请求，也避免硬凑跑题资料）
+  String know;
+  bool wantSearch = (mind.needs().curiosity >= cfg.s.threshold / 100.0f) || g_monoGoal.length();
+  if (wantSearch) {
+    know = laapSearch.search(query, 3, 500);
+  } else {
+    Serial.println("[LAAP·独白] 好奇心未过阈值 → 不查资料，凭已有认知琢磨");
+  }
   // 相关性粗检：结果与查询的二字组覆盖率≈0 → 大概率跑题。重查链：去疑问脚手架的
   // 内容短语 → 问题原文；全都不中就宁可不带资料（跑题资料被当"最新资料"注入是主因）
-  float cov = know.length() ? queryBigramCoverage(know, query) : 0.0f;
-  if (cov < 0.15f) {
+  float cov = (wantSearch && know.length()) ? queryBigramCoverage(know, query) : 0.0f;
+  if (wantSearch && cov < 0.15f) {
     String refined = refineQuery(topic);
     String alts[2] = { refined, topic };
     for (int i = 0; i < 2 && cov < 0.15f; i++) {
@@ -1784,6 +1796,7 @@ void setup() {
   // 改为只提示一句，并告诉怎么恢复（"没声音"最常见的原因就是这里被写成 0）
   if (cfg.s.volume == 0) Serial.println("[LAAP] 注意：音量被设为 0（静音）。/vol 80 或后台设置可恢复");
   audio.setVolume(cfg.s.volume);  // 应用持久化音量（ES8311）
+  audio.setVadStopMs(cfg.s.vadStopMs);  // 应用持久化的说完判停窗口
   display.setBrightness(cfg.s.brightness);  // 应用持久化亮度（背光 PWM）
   mind.trust = laapTrust();        // 小凌⑥: 启动时取回持久化信任值
   laapSearch.begin();  // 联网搜索（主源可配，WiFi 就绪后可用）
@@ -1930,10 +1943,14 @@ void loop() {
     }
     s_wasTouch = nowTouch; }
 
-  // 有人对着麦克风说话 = 活动（VAD 电平沿触发，避免每帧刷屏）
+  // 有人对着麦克风说话 = 活动。须持续 ≥600ms（与触发对话的判定一致）——
+  // 瞬时 VAD 沿会被环境噪声频繁触发，v3.32 提灵敏度后曾把静默息屏永远顶住
   { static bool s_wasSpeech = false;
+    static uint32_t s_spFrom = 0;
+    static bool s_counted = false;
     bool sp = audio.vadSpeaking();
-    if (sp && !s_wasSpeech) laapActivity();
+    if (sp && !s_wasSpeech) { s_spFrom = millis(); s_counted = false; }
+    if (sp && !s_counted && millis() - s_spFrom >= 600) { laapActivity(); s_counted = true; }
     s_wasSpeech = sp; }
 
   // 静默息屏：screenOffSec 秒无活动关背光；任何交互（说话/按键/摇晃/网页对话）立即点亮
@@ -1995,8 +2012,14 @@ void loop() {
     (localtime(&nowT)->tm_hour >= 23 || localtime(&nowT)->tm_hour < 6);
   uint32_t idleGap = (g_idledOnce ? cfg.s.idleEveryMin : cfg.s.idleSilenceMin) * 60000UL;
   if (cfg.s.idleEveryMin > 0 && laapSearch.available() && !userTalking && !lateNight) {
-    if (g_lastIdleMs == 0) g_lastIdleMs = millis();
-    if (millis() - g_lastIdleMs > idleGap) {
+    // 独白也由需求驱动（active inference）：到点只是"可以想"，心里真有驱动才"去想"——
+    // 好奇（想探索）或表达（有话想说）过阈值，或心里惦记着目标。需求低就安静待着；
+    // 需求会随时间回补，过了阈值自然开讲。门槛判断放在计时器之前：不重置计时，
+    // 需求一过线马上补上（不会"永远等不满静默"）
+    float th = cfg.s.threshold / 100.0f;
+    bool needDriven = mind.intentCount() > 0 ||
+                      mind.needs().curiosity >= th || mind.needs().expression >= th;
+    if (needDriven && millis() - g_lastIdleMs > idleGap) {
       g_lastIdleMs = millis();
       if (arisIdleMonologue()) g_idledOnce = true;   // 只有真的提交出去了才算"独白过一轮"
     }

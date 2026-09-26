@@ -63,21 +63,38 @@ void LaapVoice::speak(const String& text, const char* expr) {
 bool LaapVoice::listenAndTranscribe(String& heard) {
   heard = "";
   if (!audio.micOk) { lastError = "无麦克风"; return false; }
-  Serial.println("[VOICE] 请说…（静音 0.8s 结束，最多 12s）");
+  Serial.printf("[VOICE] 请说…（说完 %u ms 无声收音，最多 12s）\n", audio.vadStopMs());
   display.drawFace("curious", true);
+  display.drawRecState(true);   // 右上角红点=录音中（说完自动熄）
 
+  // 按键模式平时不泵，预滚缓冲里是陈年旧音——录前清掉，别回填进录音头（VAD 模式才靠预滚保句首）
+  if ((VoiceMode)cfg.s.voiceMode != VoiceMode::Vad) audio.prerollFlush();
   audio.recordStart(12);
   uint32_t t0 = millis();
+  uint32_t waitCap = 8000UL + audio.vadStopMs();   // 起始静默 8s + 说完后的判停尾
   bool spoke = false;
-  while (millis() - t0 < 14000) {
+  while (millis() - t0 < waitCap) {
     audio.recordTick();
-    if (audio.vadSpeaking()) { spoke = true; t0 = millis() - 6000; } // 说话中刷新等待窗
-    else if (spoke) break;                                            // 说完静音
+    if (audio.vadSpeaking()) { spoke = true; t0 = millis() - 4000; } // 说话中刷新等待窗（判停尾要留够）
+    else if (spoke) break;                                            // 说完静音（判停窗口到）
     if (audio.recordBytes() >= 12UL * 16000 * 2 - 1024) break;
     delay(5);
   }
   size_t got = audio.recordBytes();
   audio.recordStop();
+  display.drawRecState(false);
+  // 尾部静音裁剪：判停窗口默认 5s，不裁就白传几秒静音（上传量/识别延迟/计费秒数全翻倍）
+  { const int16_t* p = audio.recordData();
+    size_t samples = got / 2;
+    const size_t win = 800;                          // 50ms @16k
+    while (samples > 10 * win) {                     // 至少留 500ms 尾（防轻收尾字"了/吗"被裁）
+      float e = 0;
+      for (size_t i = samples - win; i < samples; i += 8) e += (float)p[i] * p[i];
+      if (sqrtf(e / (win / 8)) > 260) break;         // 还有声音就住手（≈VAD 静默档阈值）
+      samples -= win;
+    }
+    got = samples * 2;
+  }
   if (!spoke || got < 8000) { metrics.noSpeechHeard(); lastError = "没听清"; return false; }
 
   String err;
@@ -161,7 +178,10 @@ void LaapVoice::loopTick() {
     s_lastDrawn = wantListening;
   }
   if (_busy) return;
-  // 音频泵所有模式常转：预滚缓冲靠它持续喂数（按键/暂停/冷却期也要滚，只是不触发）
+  // 音频泵只在 VAD 模式常转（预滚缓冲+触发判定都靠它）。
+  // 按键模式按下才录，平时不监测——v3.32 曾改成全模式常转，结果按键模式下
+  // "听到人声=活动"的息屏信号被环境噪声反复点亮，屏幕永远息不了
+  if (!vadMode) return;
   audio.recordTick();
   // ASR 预热：仅"上次对话后 5 分钟内"的空闲期进行，且已有活连接就跳过——
   // 防止长期无人时高频握手（服务商 WAF 可能盯上陌生 TLS 风暴）

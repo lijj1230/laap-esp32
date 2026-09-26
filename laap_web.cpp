@@ -384,6 +384,7 @@ void LaapWeb::handleSettingsPage() {
     "<div style='flex:1'><label>喇叭音量（0-100）</label><input id='volume' type='number' min='0' max='100'></div>"
     "<div style='flex:1'><label>屏幕亮度（0-100）</label><input id='brightness' type='number' min='5' max='100'></div>"
     "<div style='flex:1'><label>静默息屏（秒，0=常亮）</label><input id='screenoff' type='number' min='0' max='3600'></div>"
+    "<div style='flex:1'><label>说完静音收音(ms，300-15000，大=不截断但答得慢)</label><input id='vadstop' type='number' min='300' max='15000' step='100'></div>"
     "<div style='flex:1'><label>截断续写轮数（0=关）</label><input id='llmcont' type='number' min='0' max='3'></div>"
     "<div style='flex:1'><label>单次回复上限（tokens，80-1000）</label><input id='llmtok' type='number' min='80' max='1000'></div></div>"
     "<div class='row'><div style='flex:1'><label><input type='checkbox' id='nothink' style='width:auto;margin-right:6px'>关闭模型思考（思考型模型只思考不答话时勾上；"
@@ -445,7 +446,7 @@ void LaapWeb::handleSettingsPage() {
     // 保存一次就把真 Key 覆盖成 "(sk-***abcd)" → 之后 401（这正是"之前正常、后来不通"的真凶）
     "ssid.value=s.ssid;base.value=s.llm_base;key.value='';key.placeholder=s.llm_key_masked?'已配置（'+s.llm_key_masked+'），留空=保持不变':'未配置，请填写';"
     "model.value=s.llm_model;agent.value=s.agent;owner.value=s.owner;wcity.value=s.city||'';persona.value=s.persona;"   // key 见上行：只留 placeholder 提示
-    "tick.value=s.tick;thold.value=s.threshold;idlesil.value=s.idle_silence;idleevery.value=s.idle_every;volume.value=s.volume;brightness.value=s.brightness;screenoff.value=s.screen_off;llmcont.value=s.llm_continue;llmtok.value=s.llm_max_tokens;nothink.checked=!!s.nothink;srchkeys.value=s.search_keys||'';srchapi.value=s.search_api||'';"
+    "tick.value=s.tick;thold.value=s.threshold;idlesil.value=s.idle_silence;idleevery.value=s.idle_every;volume.value=s.volume;brightness.value=s.brightness;screenoff.value=s.screen_off;vadstop.value=s.vad_stop;llmcont.value=s.llm_continue;llmtok.value=s.llm_max_tokens;nothink.checked=!!s.nothink;srchkeys.value=s.search_keys||'';srchapi.value=s.search_api||'';"
     "vmode.value=s.voice_mode;ttsch.value=s.tts_channel;ttsvoice.value=s.tts_voice;ttsrate.value=s.tts_rate;"
     "volcappid.value=s.volc_appid;volctoken.value=s.volc_token_masked?'':'';volctoken.placeholder=s.volc_token_masked?'已配置，留空保持不变':'未配置';"
     "volcvoice.value=s.volc_voice;asrbase.value=s.asr_base;asrkey.value='';asrkey.placeholder=s.asr_key_masked?'已配置，留空保持不变':'未配置';"
@@ -460,7 +461,7 @@ void LaapWeb::handleSettingsPage() {
     "const b=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},"
     "body:JSON.stringify({ssid:ssid.value,pass:pass.value,base:base.value,key:key.value,key_set:1,model:model.value,"
     "agent:agent.value,owner:owner.value,wcity:wcity.value,wcity_set:1,persona:persona.value,tick:tick.value,thold:thold.value,"
-    "idlesil:idlesil.value,idleevery:idleevery.value,volume:volume.value,brightness:brightness.value,screenoff:screenoff.value,llmcont:llmcont.value,llmtok:llmtok.value,nothink:nothink.checked?1:0,srchkeys:srchkeys.value,srchkeys_set:1,srchapi:srchapi.value,srchapi_set:1,"
+    "idlesil:idlesil.value,idleevery:idleevery.value,volume:volume.value,brightness:brightness.value,screenoff:screenoff.value,vadstop:vadstop.value,llmcont:llmcont.value,llmtok:llmtok.value,nothink:nothink.checked?1:0,srchkeys:srchkeys.value,srchkeys_set:1,srchapi:srchapi.value,srchapi_set:1,"
     "vmode:vmode.value,ttsch:ttsch.value,ttsvoice:ttsvoice.value,ttsrate:ttsrate.value,"
     "volcappid:volcappid.value,volctoken:volctoken.value,volctoken_set:1,volcvoice:volcvoice.value,"
     "asrbase:asrbase.value,asrkey:asrkey.value,asrkey_set:1,asrmodel:asrmodel.value,asr2base:asr2base.value,asr2key:asr2key.value,asr2key_set:1,asr2model:asr2model.value,asr2_set:1,"
@@ -580,6 +581,12 @@ void LaapWeb::handleSave() {
   }
   String soff = get("screenoff");
   if (soff.length()) { long v = soff.toInt(); cfg.s.screenOffSec = (uint16_t)(v < 0 ? 0 : (v > 3600 ? 3600 : v)); }
+  String vstop = get("vadstop");
+  if (vstop.length()) {
+    long v = vstop.toInt();
+    cfg.s.vadStopMs = (uint16_t)(v < 300 ? 300 : (v > 15000 ? 15000 : v));
+    audio.setVadStopMs(cfg.s.vadStopMs);   // 立即生效，不等重启
+  }
   String lcont = get("llmcont");
   if (lcont.length()) { long v = lcont.toInt(); cfg.s.llmContinue = (uint8_t)(v < 0 ? 0 : (v > 3 ? 3 : v)); }
   String ltok = get("llmtok");
@@ -676,6 +683,7 @@ void LaapWeb::handleStatus() {
     ",\"fs_used_kb\":" + String(LittleFS.usedBytes() / 1024) +
     ",\"fs_total_kb\":" + String(LittleFS.totalBytes() / 1024) +
     ",\"screen_off\":" + cfg.s.screenOffSec +
+    ",\"vad_stop\":" + cfg.s.vadStopMs +
     ",\"uptime_s\":" + String(millis() / 1000) +
     ",\"uptime_total_min\":" + String(laapUptimeMin()) +
     ",\"heap_kb\":" + String(ESP.getFreeHeap() / 1024) +

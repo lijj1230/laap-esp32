@@ -20,6 +20,7 @@ struct LaapSettings {
   uint8_t volume = 70;                              // 喇叭音量(0-100, ES8311)
   uint8_t brightness = 90;                          // 屏幕亮度(0-100, 背光PWM)
   uint16_t screenOffSec = 60;                       // 静默息屏秒数(0=不息屏)
+  uint16_t vadStopMs = 5000;                        // 说完静音判停(ms)：停顿超过即收音。大=不截断但答得慢
   uint8_t llmContinue = 1;                          // 输出截断自动续写轮数(0=关, 最多3)
   uint8_t llmNoThink = 1;                           // 1=请求里带 thinking:disabled（思考型模型光想不答时用；不支持的服务商会被忽略或报错）
   uint16_t llmMaxTokens = 500;                      // 单次回复 maxTokens(80-1000, 聊天/表达/独白共用；思考型模型会先花 token 思考，过小会空回复)

@@ -168,8 +168,8 @@ void LaapAudio::pump() {
     _silenceMs = 0;
   } else if (_vadSpeech) {
     _silenceMs += n * 1000UL / AUD_I2S_RATE;
-    // 800ms 静音判停：450ms 会把句间换气当成"说完了"，长句被拦腰截断（实测只剩四五个字）
-    if (_silenceMs > 800) _vadSpeech = false;
+    // 判停窗口后台可配（默认 5s：句间斟酌/换气不截断；代价是答话前多等这么久）
+    if (_silenceMs > _vadStopMs) _vadSpeech = false;
   }
 
   // 3:1 降采样到 16k：录音期进录音缓冲；空闲期滚进预滚缓冲（供下次触发回填句首）。

@@ -376,5 +376,15 @@ String LaapVision::lookLocked(const String& question) {
 
 void LaapVision::logSight(const String& desc) {
   // utf8Cut：按字节 substring 会切半汉字，污染记忆文件（/api/memory 的 JSON 就是这么坏的）
-  if (desc.length()) memory.logEvent("world", "看见: " + utf8Cut(desc, 100));
+  if (!desc.length()) return;
+  // 独白每轮都看一眼世界，但视角基本不变（天花板/桌面）——逐条写"看见"会把后台记忆刷成
+  // 相机流水账（用户实测"很频繁出现"）。只记"新景象"：语义新颖度达标才落账；
+  // novelty 评估不了（熔断/无向量）时按 1 小时一条兜底。
+  // 注意：只挡"记忆落账"，g_monoSight 照常注入独白上下文——看照看，只是不重复记。
+  static uint32_t s_lastLog = 0;
+  float nov = memory.noveltyOf(desc);
+  bool fresh = (nov < 0) ? (millis() - s_lastLog > 3600000UL) : (nov > 0.25f);
+  if (!fresh) return;
+  s_lastLog = millis();
+  memory.logEvent("world", "看见: " + utf8Cut(desc, 100));
 }

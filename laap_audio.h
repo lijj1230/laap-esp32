@@ -48,6 +48,9 @@ public:
   // 上限 1.6：乘数只升不降的历史曾把它顶到 2.0 → 远场人声全部埋掉（"要凑很近才理人"）
   void setVadThresholdMul(float m) { _vadThMul = (m < 1.0f ? 1.0f : (m > 1.6f ? 1.6f : m)); }
   float vadThresholdMul() const { return _vadThMul; }
+  // 说完静音判停(ms)：停顿超过此时长视为说完收音。后台可配（设置页/ vadstop，300-15000）
+  void setVadStopMs(uint16_t ms) { _vadStopMs = (ms < 300 ? 300 : (ms > 15000 ? 15000 : ms)); }
+  uint16_t vadStopMs() const { return _vadStopMs; }
   // 预滚缓冲：播放完立即清空（自家 TTS 尾音不能进预滚，否则下一轮 ASR 听见自己说话）
   static constexpr size_t kPreRollBytes = 48000;   // 1.5s @ 16kHz 16bit 单声道
   void prerollFlush() { _preLen = 0; }
@@ -81,7 +84,8 @@ private:
   int16_t* _preBuf = nullptr;                  // 预滚线性缓冲（新音频始终追加在尾部）
   size_t _preLen = 0;                          // 预滚有效字节数（0..kPreRollBytes）
   float _slowRms = 30, _fastRms = 30;          // 环境基线 / 瞬时
-  float _vadThMul = 1.0f;                      // 触发阈值乘数（自调优，钳位 1.0~2.0）
+  float _vadThMul = 1.0f;                      // 触发阈值乘数（自调优，钳位 1.0~1.6）
+  uint16_t _vadStopMs = 5000;                  // 说完静音判停（v3.33 起后台可配，默认 5s 宁等勿截）
   bool _vadSpeech = false;
   uint32_t _speechStartMs = 0, _silenceMs = 0;
   bool _interrupted = false, _bargeEn = false;   // 默认关：播放期间不收麦（防回环/自触发）
