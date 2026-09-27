@@ -6,6 +6,7 @@
 #include "laap_display.h"
 #include "laap_web.h"
 #include "laap_metrics.h"
+#include <esp_heap_caps.h>   // 预热门控的堆余量判定（最大连续块）
 
 LaapVoice voice;
 
@@ -194,14 +195,18 @@ void LaapVoice::loopTick() {
   // `if (_busy) s_lastChatMs = millis();` 记录，但 loopTick 开头就 `if (_busy) return`，
   // 这行永远执行不到 → chatRecent 恒 false → 整个 ASR 预热特性从 v3.18 起就是死代码
   bool chatRecent = _lastChatMs && (millis() - _lastChatMs < 300000);
-  if (vadMode && !_vadPaused && chatRecent && (int32_t)(millis() - _cooldownMs) >= 0 &&
+  // 预热连接会占住内部堆最大的一块（TLS 缓冲）：堆不宽裕（<50KB 连续块）就不建，
+  // 否则 LLM 再要起飞时凑不出 31KB+ 连续块 → 连接失败（v3.36 修活后实测踩中）
+  bool heapRoom = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 50000;
+  if (vadMode && !_vadPaused && chatRecent && heapRoom && (int32_t)(millis() - _cooldownMs) >= 0 &&
       millis() - s_warmMs > 20000) {
     if (asr.warmAlive()) {
       s_warmMs = millis();                    // 热连接还活着：不重握手
     } else {
       s_warmMs = millis();
+      // 栈 12KB：TLS 握手峰值 6KB+，首次真实运行（v3.36 前是死代码）曾疑似栈紧崩溃
       if (xTaskCreate([](void*) { asr.warmup(); vTaskDelete(nullptr); },
-                      "asrwarm", 8192, nullptr, 1, nullptr) != pdPASS) {  // TLS 握手栈峰值 6KB+，4K 会溢出
+                      "asrwarm", 12288, nullptr, 1, nullptr) != pdPASS) {
         asr.warmup();                         // 建任务失败：退化为主线程预热
       }
     }

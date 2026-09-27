@@ -20,6 +20,8 @@ public:
   void warmup();
   // 预热连接是否还活着（活则无需重握手）
   bool warmAlive();
+  // 主动掐掉预热连接：TLS 要 ~31KB+ 连续内部内存，LLM 起飞前堆紧时请它让位
+  void warmDrop();
 };
 
 class VolcTts {

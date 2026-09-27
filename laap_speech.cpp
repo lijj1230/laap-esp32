@@ -81,6 +81,10 @@ bool AsrClient::warmAlive() {
   warmUnlock();
   return alive;
 }
+
+void AsrClient::warmDrop() {
+  warmupInvalidate();
+}
 // 通用 HTTPS POST（warm=已握手的 ASR 预热连接，用后即失效），返回 HTTP 状态与响应体
 static int httpsPost(const String& url, const String& contentType, const uint8_t* body, size_t bodyLen,
                      const char* bearer, String& respOut, WiFiClient* warm = nullptr) {

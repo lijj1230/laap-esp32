@@ -437,6 +437,10 @@ static void llmTaskFunc(void*) {
 // 受理一个 LLM 请求（立即返回 true=已入队，false=忙/队满）
 bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
                const String& userText, uint8_t kind) {
+  // TLS 握手要 ~31KB+ 连续内部内存；ASR 预热连接会占住最大的一块。
+  // 堆紧时先请它让位（实测 maxblk 30KB 时 LLM 三连"连接失败"的根因之一）
+  if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 36000)
+    asr.warmDrop();
   if (g_llmBusy || !g_llmQueue) return false;
   LlmRequest* req = new LlmRequest();
   // 容量就是 msgs[14]：必须全量保全。旧代码写 `nm<12?nm:12`，而带搜索+满历史时 nm 是 13~14，
@@ -1985,6 +1989,23 @@ void loop() {
       millis() - g_lastActivityMs > (uint32_t)cfg.s.screenOffSec * 1000UL) {
     display.setScreenOn(false);
     Serial.println("[LAAP] 静默息屏（交互即唤醒）");
+  }
+
+  // 自愈性打盹：内部堆最大连续块跌破 TLS 底线（<31KB 时 LLM 必"连接失败"，且碎片
+  // 不可自行恢复）且闲置 ≥3 分钟、无任务在飞 → 重启换一块干净的堆。
+  // 重启前落盘累计时长；开机后一切照旧。把"死到主人手动重启"变成"打个盹自己缓过来"
+  static uint32_t s_tightSince = 0;
+  { uint32_t maxblk = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (maxblk < 26000) {
+      if (!s_tightSince) s_tightSince = millis();
+      if (millis() - s_tightSince > 30000UL && millis() - g_lastActivityMs > 180000UL &&
+          !laapLlmBusy() && !laapChatPending()) {
+        Serial.println("[LAAP] 堆碎片到警戒线且闲置 → 自愈性打盹（重启换干净堆）");
+        laapUptimePersist();
+        delay(600);
+        ESP.restart();
+      }
+    } else s_tightSince = 0;
   }
 
   // 累计运行时长：每 5 分钟落盘一次（单键写入，NVS 磨损可忽略）
