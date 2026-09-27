@@ -68,7 +68,9 @@ public:
 
   // ---- 进化 ----
   void evolveAfterChat(int userBytes);   // UTF-8 字节数
-  void saveEvolution();
+  // 落盘节流（真正生效版）：仅 强制 / 性格或聊天数变化（置脏）/ 满 96 周期（48min 对齐
+  // cycles 字段）才写——原"周期数变化才写"恒真（incCycle 每心跳 +1），实际每 30s 全量写
+  void saveEvolution(bool force = false);
   // 记忆导入后把盘上的性格/代数读回内存：否则运行中的实例会在下次 saveEvolution
   // 用自己的旧值覆盖刚导入的进化数据（"导入成功"却没生效）
   void reloadEvolution() { loadEvolution(); }
@@ -92,6 +94,8 @@ private:
   float _sensitivity = 0.5f;   // 敏感度：放大安全权重
   uint32_t _gen = 0, _cycles = 0, _chats = 0;
   float _pleasure = 0.5f;      // 近期愉悦度（情绪用）
+  bool _evoDirty = false;              // 性格/聊天数真变化（saveEvolution 节流用）
+  uint32_t _lastEvoSaveCycle = 0;      // 上次落盘时的周期数
   String intents[3];           // 意图栈（PIANO goals）
   uint32_t intentBorn[3] = {0, 0, 0};
   int intentN = 0;

@@ -24,7 +24,12 @@ bool Cognition::loadEvolution() {
   return true;
 }
 
-void Cognition::saveEvolution() {
+void Cognition::saveEvolution(bool force) {
+  // 节流：无变化且不满 96 周期（48min）就跳过——原来主循环每 30s 都走到这里全量写
+  // （"周期数变化才写"恒真），~1MB/天纯白写
+  if (!force && !_evoDirty && _cycles - _lastEvoSaveCycle < 96) return;
+  _evoDirty = false;
+  _lastEvoSaveCycle = _cycles;
   laapSnapMake("evolution", false);   // 心跳级写入×12h 节流 ≈ 每半天留一版性格
   // 原子重写：心跳级高频写 + 掉电窗口，直接 open("w") 半写会让性格/代数静默回退默认值
   File f = LittleFS.open("/evolution.tmp", "w");
@@ -40,7 +45,7 @@ void Cognition::saveEvolution() {
 void Cognition::begin() {
   loadEvolution();
   _gen++;
-  saveEvolution();
+  saveEvolution(true);
   loadIntents();
   dropStaleIntents((uint32_t)time(nullptr));
   lastUserMs = millis();
@@ -169,7 +174,7 @@ void Cognition::resetEvolution() {
   _openness = _sociability = _sensitivity = 0.5f;
   _gen = 0; _cycles = 0; _chats = 0;
   _pleasure = 0.5f;
-  saveEvolution();
+  saveEvolution(true);
 }
 
 // 意图栈整栈放下（含磁盘）
@@ -356,5 +361,6 @@ void Cognition::evolveAfterChat(int userBytes) {
   _pleasure = _pleasure * 0.7f + 0.3f * 0.9f;
   auto cl = [](float& v) { if (v < 0.05f) v = 0.05f; if (v > 0.95f) v = 0.95f; };
   cl(_openness); cl(_sociability); cl(_sensitivity);
+  _evoDirty = true;                    // 性格真变化：下次落盘节拍放行
   saveEvolution();
 }

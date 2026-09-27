@@ -1280,8 +1280,9 @@ void psiTick() {
     consolidateMemory();
   }
   // 性格进化落盘降频：周期数变化时才写（原来每 30s 全量写，每天 2880 次 flash 磨损）
-  static uint32_t s_savedCycle = 0;
-  if (mind.cycles() != s_savedCycle) { s_savedCycle = mind.cycles(); mind.saveEvolution(); }
+  // 节流收进了 saveEvolution 内部（强制/置脏/满 96 周期才写）——原来的
+  // "cycles != 上次保存值"恒真（incCycle 每心跳 +1），降频从未生效
+  mind.saveEvolution();
   // 小凌⑥: 信任值变化超 ±0.05 才落 NVS（原来只在 cfg.save() 时顺带写，重启回滚）
   static float s_lastTrustSaved = -1;
   if (s_lastTrustSaved < 0 || (mind.trust - s_lastTrustSaved > 0.05f) || (s_lastTrustSaved - mind.trust > 0.05f)) {
