@@ -769,10 +769,13 @@ void llmHarvest() {
   g_lastExpr = r.ok ? r.expr : mind.moodKey();
   if (kind == LK_CHAT) {
     g_chatReply = say; g_chatSeq++;   // 聊天成品：网页轮询取件
+    g_chatPending = false;            // 成品即不再 pending——原来忘了清，网页没取件就一直
+                                      // 占着互斥门，后台体检永远报"LLM 正忙"（实测挂一整夜）
     metrics.rspLlm(millis() - g_chatStartMs);   // 提问→成品端到端（含排队）
   }
   laapActivity();                                            // 它开口说话=活动
-  memory.logEvent("aris", say);
+  // 自发表达带【自发】标记：后台记忆页要能一眼区分"它主动说的"和"对话回复"
+  memory.logEvent("aris", kind == LK_EXPRESS ? "【自发】" + say : say);
   Serial.printf(kind == LK_EXPRESS ? "[Aris·自发] %s\n" : "[Aris] %s\n", say.c_str());
   display.drawNeeds(mind.needs().energy, mind.needs().curiosity, mind.needs().social,
                     mind.needs().security, mind.needs().expression);
@@ -845,7 +848,7 @@ String timeFeelLine() {
   line += "（主人问时间/日期就用这个，不要猜。）";
   if (h >= 23 || h < 6)  line += "深夜了，说话轻一点、短一点，也别自言自语吵人。";
   else if (h >= 18)      line += "傍晚时分，适合聊聊天。";
-  else if (h < 8)        line += "刚醒不久，世界还很安静。";
+  else if (h >= 6 && h < 8) line += "刚醒不久，世界还很安静。";   // 只留早晨档：凌晨已有深夜档，0-6 点说"刚醒"是与事实打架
   return line + "\n";
 }
 
@@ -909,8 +912,16 @@ String buildSystemPrompt() {
                           "表达(有话想说/有想法冒泡)"};
   int top = 0;
   for (int i = 1; i < 5; i++) if (vals[i] > vals[top]) top = i;
-  p += String("当前最强烈的渴望是「") + names[top] + "」，让它在你的语气里自然流露"
-       "（如社交高就更黏人、好奇高就更爱问、能量低就慵懒短句）。\n";
+  // 需求只染语气、不当话题：低于 0.6 一律算平静（原来无条件点"最强烈的渴望"，
+  // 31% 的平静水位也被演成"我电量低"复读——实测几乎每句回复都挂电量）；
+  // 高时也明说边界，防止模型把状态当内容讲
+  if (vals[top] < 0.60f) {
+    p += "内心平静，没有特别强烈的渴望，语气自然就好。\n";
+  } else {
+    p += String("当前最强烈的渴望是「") + names[top] + "」。让它影响你说话的节奏和语气"
+         "（如社交高就更黏人、好奇高就更爱问、能量低就慵懒短句），"
+         "但绝不要主动把电量/体温/需求状态当话题说——主人问你的身体状态时才汇报。\n";
+  }
   p += String("你刚才的情绪是「") + mind.moodCn() + "」，回复的情绪要与之连续，不要每次都元气满满。\n";
   // 小凌⑥⑤②: 关系温度/失望/身体负荷——让它们在语气里自然流露
   int tr = (int)(mind.trust * 100);
@@ -980,6 +991,9 @@ String buildUserPrompt(const String& userText, const String& trigger) {
   } else {
     p += String("[此刻] 心跳周期。你的主导欲望是「") + mind.goalCn() + "」（强度" +
          String(mind.dominance(), 2) + "），情绪是「" + mind.moodCn() + "」。主动说一句贴合状态的话。";
+    // 复读防线：深夜/清晨同样的状态注入会让模型每次收敛到同一句话（实测"刚醒，脑子还蒙着雾"连出 3 条）
+    if (g_lastSay.length()) p += String("你最近一次开口说的是：「") + g_lastSay +
+                                "」。换个角度或换件事说，不要复读。";
   }
   (void)trigger;
   return p;
@@ -1047,7 +1061,9 @@ void consolidateMemory() {
   String recent = memory.recentContext(900);
   if (recent.length() < 60) return;
   String sys = "你是一个数字生命的记忆压缩器。把给它的近期经历压缩成不超过100字的第三人称自我认知摘要"
-               "（它是谁、经历了什么、性格如何变化）。只输出摘要本身。";
+               "（它是谁、经历了什么、性格如何变化）。注意：电量/体温/刚醒这类身体状态是暂时的，"
+               "不要写进自我认知（之前把它压成了'电量低微温、刚睡醒蒙雾'的固定人格，导致它句句喊累）——"
+               "只沉淀稳定的事：性格变化、经历、学到的偏好。只输出摘要本身。";
   String usr = "它过去的自我认知：" + memory.semantic() + "\n它最近的经历：\n" + recent;
   LlmMsg m[2] = { {"system", sys}, {"user", usr} };
   llmSubmit(m, 2, 240, 0.3f, "", LK_CONSOLIDATE); // 忙就跳过这轮（下个周期再来）
