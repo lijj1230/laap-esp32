@@ -239,7 +239,7 @@ void LaapWeb::registerRoutes() {
         laapUptimePersist();   // 重启前落盘累计时长
         metrics.persist();     // 重启前指标/失败环留底（事后排查崩溃现场）
         delay(600);
-        ESP.restart();
+        laapReboot("OTA升级");
       } else {
         String msg = otaErr.length() ? otaErr : String("未收到固件数据");
         Serial.printf("[OTA] 失败: %s\n", msg.c_str());
@@ -612,7 +612,7 @@ void LaapWeb::handleSave() {
   if (_ap) { // 配置门户里保存 → 直接重启进 STA
     server.send(200, "application/json", "{\"ok\":true,\"msg\":\"已保存，3 秒后重启生效\"}");
     delay(800);
-    ESP.restart();
+    laapReboot("配置保存");
     return;
   }
   server.send(200, "application/json", "{\"ok\":true,\"msg\":\"已保存。WiFi/网络变更需重启生效\"}");
@@ -691,6 +691,8 @@ void LaapWeb::handleStatus() {
     // 分区/文件系统：OTA 之后靠 part 确认新固件真的在跑；fs 用来核对记忆占用
     ",\"part\":\"" + String(esp_ota_get_running_partition() ? esp_ota_get_running_partition()->label : "?") + "\"" +
     ",\"ota_slot\":\"" + String(esp_ota_get_next_update_partition(nullptr) ? esp_ota_get_next_update_partition(nullptr)->label : "无（不可 OTA）") + "\"" +
+    // 本次启动原因：主动重启在 NVS 打标（laapReboot），崩溃/看门狗由 esp_reset_reason 细分
+    ",\"boot_reason\":\"" + jsonEsc(laapBootReason()) + "\"" +
     ",\"fs_used_kb\":" + String(LittleFS.usedBytes() / 1024) +
     ",\"fs_total_kb\":" + String(LittleFS.totalBytes() / 1024) +
     ",\"screen_off\":" + cfg.s.screenOffSec +
@@ -914,7 +916,7 @@ void LaapWeb::handleReset() {
   server.send(200, "application/json", "{\"ok\":true}");
   delay(300);
   cfg.reset();
-  ESP.restart();
+  laapReboot("恢复出厂");
 }
 
 void LaapWeb::handleReboot() {
@@ -922,7 +924,7 @@ void LaapWeb::handleReboot() {
   metrics.persist();     // 指标/失败环留底
   server.send(200, "application/json", "{\"ok\":true}");
   delay(300);
-  ESP.restart();
+  laapReboot("网页重启");
 }
 
 // ---- 语音 ----
@@ -994,7 +996,7 @@ void LaapWeb::handleSnapRestore() {
   server.send(200, "application/json", "{\"ok\":true,\"msg\":\"已恢复，重启后生效\"}");
   laapUptimePersist();
   delay(600);
-  ESP.restart();
+  laapReboot("快照恢复");
 }
 
 // ---- 学到的东西（规则 / 技能）----（记忆页展示 + 归纳按钮）

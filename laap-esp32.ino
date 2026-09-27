@@ -1715,7 +1715,7 @@ void serialCli() {
         String name = rest.substring(0, sp), vStr = rest.substring(sp + 1); vStr.trim();
         if (laapSnapRestore(name.c_str(), vStr.toInt())) {
           Serial.println("[SNAP] 已恢复，3 秒后重启生效…");
-          delay(3000); ESP.restart();
+          delay(3000); laapReboot("快照恢复");
         } else Serial.println("[SNAP] 恢复失败（没有这个文件/版本；先 /snap 看列表）");
       } else Serial.println("用法: /snap restore <semantic|episodes|evolution> <1-3>");
     } else if (line == "/snaptake") {
@@ -1766,7 +1766,7 @@ void serialCli() {
         Serial.printf("[LAAP] 当前亮度 %d%%（用法: /bright 5-100，下限5防全黑）\n", display.getBrightness());
       }
     } else if (line == "/reset") {
-      cfg.reset(); ESP.restart();
+      cfg.reset(); laapReboot("恢复出厂");
     } else {
       laapInteractSearch(line);
     }
@@ -1782,6 +1782,7 @@ void setup() {
   Serial.println("\n[LAAP] Living Agent Application Protocol - 端侧生命体启动中…");
   // 构建时间戳：判断"板子里跑的到底是哪一版"的唯一可靠依据（烧录后必看这一行）
   Serial.printf("[LAAP] 固件构建 %s %s\n", __DATE__, __TIME__);
+  Serial.printf("[LAAP] 启动原因: %s\n", laapBootReason().c_str());   // 崩溃/打盹/OTA 一眼可辨（v3.41）
   {   // 运行槽位：OTA 后靠这行确认"新固件真的生效了"（还是老固件在跑）
     const esp_partition_t* rp = esp_ota_get_running_partition();
     Serial.printf("[LAAP] 运行分区 %s (0x%06x) | OTA 可升级: %s\n",
@@ -2010,7 +2011,7 @@ void loop() {
         metrics.persist();     // 打盹前的失败证据必须留底
         laapUptimePersist();
         delay(600);
-        ESP.restart();
+        laapReboot("自愈打盹");
       }
     } else s_tightSince = 0;
   }
@@ -2025,7 +2026,7 @@ void loop() {
   if (!pressed && g_btnDown > 0) {
     uint32_t held = millis() - g_btnDown;
     g_btnDown = 0;
-    if (held > 10000) { Serial.println("[LAAP] 恢复出厂"); display.clear(0); cfg.reset(); ESP.restart(); }
+    if (held > 10000) { Serial.println("[LAAP] 恢复出厂"); display.clear(0); cfg.reset(); laapReboot("恢复出厂"); }
     else if (held > 4000) { if (!webui.inAP()) webui.beginAP(); }
     else if (held > 60) {
       laapActivity();                 // 按键=活动（息屏先点亮）

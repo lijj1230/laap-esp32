@@ -73,3 +73,10 @@ private:
 };
 
 extern LaapMetrics metrics;
+
+// ---- 重启原因可观测性 ----
+// esp_reset_reason() 只能分大类；"软件重启"下的自愈打盹/OTA/网页重启/恢复出厂
+// 靠重启前在 NVS 打标细分，开机 laapBootReason() 读回（/api/status 的 boot_reason 字段）。
+// 主动重启一律走 laapReboot(原因)，别直接 ESP.restart()——否则下次"为什么重启"只能靠失败环反推。
+void laapReboot(const char* why);
+String laapBootReason();

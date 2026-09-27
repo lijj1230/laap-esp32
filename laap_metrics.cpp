@@ -219,3 +219,30 @@ void LaapMetrics::failSticky() {
   if (_lastPersistMs && millis() - _lastPersistMs < 60000) return;   // 失败写限速 60s
   persist();
 }
+
+// ---- 重启原因（v3.41）：主动重启前打标，开机读回 ----
+void laapReboot(const char* why) {
+  Preferences p;
+  if (p.begin("laapmtr", false)) { p.putString("why", String(why)); p.end(); }
+  Serial.printf("[LAAP] 主动重启 → %s\n", why);
+  ESP.restart();
+}
+
+String laapBootReason() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  return "上电启动";
+    case ESP_RST_SW: {
+      Preferences p;
+      String why = p.begin("laapmtr", true) ? p.getString("why", "") : String();
+      p.end();
+      return why.length() ? String("软件重启·") + why : String("软件重启");
+    }
+    case ESP_RST_PANIC:    return "程序崩溃(panic)";
+    case ESP_RST_INT_WDT:  return "中断看门狗";
+    case ESP_RST_TASK_WDT: return "任务看门狗";
+    case ESP_RST_WDT:      return "硬件看门狗";
+    case ESP_RST_BROWNOUT: return "电压跌落（供电不稳）";
+    case ESP_RST_DEEPSLEEP:return "深睡唤醒";
+    default:               return "复位码" + String((int)esp_reset_reason());
+  }
+}
