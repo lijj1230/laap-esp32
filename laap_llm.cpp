@@ -289,9 +289,12 @@ bool LlmClient::ping(String& reply) {
 // 独立成全局（而不是各模块私有）是因为"独白流水线"会连续用搜索+视觉，
 // 而主线程的聊天可能同时用它们；共用一把锁才能把两个任务真正隔开。
 static SemaphoreHandle_t s_netMtx = nullptr;
+void laapNetInit() {                            // setup 里显式建锁：懒创建的 check-then-create
+  if (!s_netMtx) s_netMtx = xSemaphoreCreateMutex();   // 若两任务同时首进会各建一把=互斥失效+泄漏
+}
 bool laapNetLock(uint32_t ms) {
   if (!s_netMtx) {
-    s_netMtx = xSemaphoreCreateMutex();          // 懒创建（首次调用必在主线程 setup 之后）
+    s_netMtx = xSemaphoreCreateMutex();          // 兜底懒创建（正常路径已被 laapNetInit 覆盖）
     if (!s_netMtx) return true;                  // 创建失败：不阻塞功能（退回原行为）
   }
   return xSemaphoreTake(s_netMtx, pdMS_TO_TICKS(ms)) == pdTRUE;

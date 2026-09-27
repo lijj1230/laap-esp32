@@ -28,11 +28,15 @@ void LaapSkills::ensureLoaded() {
 }
 
 void LaapSkills::save() {
-  File f = LittleFS.open(SKILLS_PATH, "w");
+  // 原子写：掉电落在 open("w") 截断之后 = 技能库全丢（v3.31 不变量补齐）
+  String tmpPath = String(SKILLS_PATH) + ".tmp";
+  File f = LittleFS.open(tmpPath, "w");
   if (!f) { Serial.println("[SKILLS] 技能落盘失败"); return; }
   for (int i = 0; i < _n; i++)
     f.printf("%s|%s|%u\n", _s[i].trig.c_str(), _s[i].instr.c_str(), _s[i].hits);
   f.close();
+  LittleFS.remove(SKILLS_PATH);
+  LittleFS.rename(tmpPath, SKILLS_PATH);
 }
 
 int LaapSkills::find(const String& trigger) const {

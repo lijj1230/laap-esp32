@@ -39,6 +39,8 @@ public:
   bool addIntent(const String& text, uint32_t ts);  // 去重/≤60B/满3淘汰最老
   void dropIntent(int i);
   void dropStaleIntents(uint32_t nowTs);            // 7 天未完成自动放下
+  void clearAllIntents();                           // 清空记忆时连意图栈一起清（只删盘不清 RAM 会被写回）
+  void resetEvolution();                            // 性格/代数/计数归零并落盘（配合 clearAll 的"整个人重来"）
   String intentsLine() const;                       // "心里惦记的事：「X」「Y」"（无则空）
   const String& intent(int i) const { return intents[i]; }
   int intentCount() const { return intentN; }

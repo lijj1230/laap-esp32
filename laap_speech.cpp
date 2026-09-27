@@ -323,20 +323,28 @@ bool VolcTts::speak(const String& text, String& err) {
   size_t decLen = 0;
   mbedtls_base64_decode(nullptr, 0, &decLen, (const uint8_t*)b64.c_str(), b64.length());
   uint8_t* wav = (uint8_t*)malloc(decLen + 8);
+  if (!wav) { err = "解码缓冲分配失败"; return false; }
   size_t olen = 0;
   mbedtls_base64_decode(wav, decLen, &olen, (const uint8_t*)b64.c_str(), b64.length());
-  // 解 WAV：找 fmt 采样率与 data 块
+  // 解 WAV：找 fmt 采样率与 data 块。逐字节拼 32 位读——Xtensa 上 *(uint32_t*) 非对齐
+  // 直接 LoadStoreAlignment panic（fmt 块带 cbSize=18 字节时后续块错位 2 字节就踩中）；
+  // 块声明长按实际收口，防止 playPcm 越界读
   uint32_t rate = 24000; const uint8_t* dp = nullptr; uint32_t dlen = 0;
   for (size_t i = 12; i + 8 <= olen;) {
-    uint32_t cid2 = *(uint32_t*)(wav + i);
-    uint32_t sz = *(uint32_t*)(wav + i + 4);
-    if (cid2 == 0x20746d66) { rate = *(uint32_t*)(wav + i + 12); }
-    else if (cid2 == 0x61746164) { dp = wav + i + 8; dlen = sz; break; }
+    uint32_t cid2 = (uint32_t)wav[i] | ((uint32_t)wav[i+1] << 8) | ((uint32_t)wav[i+2] << 16) | ((uint32_t)wav[i+3] << 24);
+    uint32_t sz   = (uint32_t)wav[i+4] | ((uint32_t)wav[i+5] << 8) | ((uint32_t)wav[i+6] << 16) | ((uint32_t)wav[i+7] << 24);
+    if (i + 8 + sz > olen) break;                       // 块声明长超过实际数据：残包，到此为止
+    if (cid2 == 0x20746d66) {                           // "fmt "
+      rate = (uint32_t)wav[i+12] | ((uint32_t)wav[i+13] << 8) | ((uint32_t)wav[i+14] << 16) | ((uint32_t)wav[i+15] << 24);
+    } else if (cid2 == 0x61746164) {                    // "data"
+      dp = wav + i + 8; dlen = sz; break;
+    }
     i += 8 + sz + (sz & 1);
   }
   bool ok = false;
   if (dp && dlen > 44) {
-    audio.bargeInEnable(true);
+    // 不开 barge-in：37.5dB 麦克风增益下能量门会被自身漏音误触发砍播（Edge 通道同款教训），
+    // 且开关残留会影响后续所有播放（诊断命令也遭殃）
     ok = audio.playPcm((const int16_t*)dp, dlen / 2, rate);
   }
   free(wav);

@@ -246,11 +246,17 @@ void MemorySystem::embedTick() {
     s_probeMs = millis();
   }
   if (millis() - _embLastMs < 15000) return;              // 限速：15s 一条
-  // 有未对齐的新行才干活
+  // 有未对齐的新行才干活。口径必须与 begin() 一致：数"非空行"（原来数 '\n'，
+  // 混进空行时 total 恒大于 _embCount → 每 15s 删一次向量缓存重建，永不收敛）
   File f = LittleFS.open(EP_PATH, "r");
   if (!f) return;
-  int total = 0;
-  while (f.available()) { if (f.read() == '\n') total++; }
+  int total = 0; bool lineHas = false;
+  while (f.available()) {
+    char ch = (char)f.read();
+    if (ch == '\n') { if (lineHas) total++; lineHas = false; }
+    else if (ch != '\r' && ch != ' ' && ch != '\t') lineHas = true;
+  }
+  if (lineHas) total++;
   f.close();
   if (total <= (int)_embCount) return;                    // 全部已嵌入
 
@@ -398,9 +404,10 @@ String MemorySystem::recallSmart(const String& query, int maxChars) {
       if (xe > 0) x = x.substring(0, xe);
       x = sanitizeUtf8(x);
     }
-    // 去重 + 排除"就是这次问的这句"：连着问同一句话时，召回会把当前提问原样重复三遍，
-    // 既没信息量又把模型带回原话（实测造成复读与答非所问）
-    if (x.length() && out.indexOf(x) < 0 && !(query.length() >= 2 && x.indexOf(query) >= 0))
+    // 去重 + 排除"就是这次问的这句"：连着问同一句话时，召回会把当前提问原样重复三遍。
+    // 排除只能精确到整行或长前缀——子串级匹配（"我们"俩字）会把几乎所有候选滤光，召回静默为空
+    if (x.length() && out.indexOf(x) < 0 &&
+        !(x == query || (query.length() >= 8 && x.indexOf(query) >= 0)))
       out = out.length() ? out + "\n" + x : x;
     hits[best] = hits.back(); hits.pop_back();
     if ((int)out.length() >= maxChars) break;
@@ -414,6 +421,7 @@ void MemorySystem::rememberBoost(const String& fragment) {
   File in = LittleFS.open(EP_PATH, "r");
   if (!in) return;
   String all; all.reserve(60 * 1024);
+  bool changed = false;
   while (in.available()) {
     String l = in.readStringUntil('\n');
     if (!l.length()) continue;
@@ -423,11 +431,14 @@ void MemorySystem::rememberBoost(const String& fragment) {
         float w = l.substring(wp + 4, l.indexOf(',', wp)).toFloat() + 0.5f;
         if (w > 5) w = 5;
         l = l.substring(0, wp + 4) + String(w, 2) + l.substring(l.indexOf(',', wp));
+        changed = true;
       }
     }
     all += l; all += "\n";
   }
   in.close();
+  // 零命中/权重没动就不重写：原来每次召回都全量重写 60KB 级文件（flash 磨损+掉电暴露面）
+  if (!changed) return;
   // 原子重写（先 tmp 再 rename + 快照）：rememberBoost 每次命中回忆的用户轮都会触发，
   // 掉电落在 open("w") 截断之后 = 整份情景记忆被毁，必须与其他重写路径同规格
   laapSnapMake("episodes", false);
@@ -451,10 +462,13 @@ String MemorySystem::semantic() const {
 
 void MemorySystem::setSemantic(const String& s) {
   laapSnapMake("semantic", false);   // 自我认知被压缩/反思覆盖前拍一份（自动档 12h 节流）
-  File f = LittleFS.open("/mem/semantic.txt", "w");
+  // 原子写：语义记忆=人格自我认知，掉电落在 open("w") 截断之后 = 人格被清空
+  File f = LittleFS.open("/mem/semantic.txt.tmp", "w");
   if (!f) return;
   f.print(s);
   f.close();
+  LittleFS.remove("/mem/semantic.txt");
+  LittleFS.rename("/mem/semantic.txt.tmp", "/mem/semantic.txt");
 }
 
 String MemorySystem::episodicTail(int n) {

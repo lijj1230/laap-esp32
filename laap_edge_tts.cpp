@@ -84,7 +84,11 @@ static bool playMp3Stream();   // 前向声明：feedMp3 满时会先播腾空�
 static void feedMp3(const uint8_t* d, size_t n) {
   if (mp3StreamLen + n > MP3_BUF_SIZE) {
     playMp3Stream();                                     // 满：先播掉腾空间（原整块丢弃=成段杂音）
-    if (mp3StreamLen + n > MP3_BUF_SIZE) n = MP3_BUF_SIZE - mp3StreamLen;  // 仍放不下：截尾保帧头
+    if (mp3StreamLen + n > MP3_BUF_SIZE) {
+      Serial.printf("[TTS] 单块 %uB 仍超缓冲余量，截尾 %uB（异常大单帧，留意音质）\n",
+                    (unsigned)n, (unsigned)(n - (MP3_BUF_SIZE - mp3StreamLen)));
+      n = MP3_BUF_SIZE - mp3StreamLen;                   // 仍放不下：截尾保帧头
+    }
   }
   if (n == 0) return;
   memcpy(mp3StreamBuf + mp3StreamLen, d, n);

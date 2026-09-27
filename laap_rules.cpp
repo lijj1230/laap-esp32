@@ -74,10 +74,14 @@ bool LaapRules::apply(const String& llmOutput) {
   ensureLoaded();
   if (merged == _cache) return false;         // 无变化：不写盘（省磨损）
   laapSnapMake("rules", false);               // 覆盖前拍快照（自动档 12h 节流）
-  File f = LittleFS.open(RULES_PATH, "w");
+  // 原子写：掉电落在 open("w") 截断之后 = 行为规则全丢（v3.31 不变量补齐）
+  String tmpPath = String(RULES_PATH) + ".tmp";
+  File f = LittleFS.open(tmpPath, "w");
   if (!f) { Serial.println("[RULES] 规则落盘失败"); return false; }
   f.print(merged);
   f.close();
+  LittleFS.remove(RULES_PATH);
+  LittleFS.rename(tmpPath, RULES_PATH);
   _cache = merged;
   return true;
 }

@@ -66,8 +66,12 @@ bool LaapMetrics::feedback(int v, const String& user, const String& reply) {
         if (ln.length()) { keep += ln + "\n"; if (++lines > 80) { keep = keep.substring(keep.indexOf('\n') + 1); lines--; } }
       }
       if (r) r.close();
-      File w = LittleFS.open("/mem/feedback.jsonl", "w");
-      if (w) { w.print(keep); w.close(); }
+      // 原子写：反馈历史也是日志资产，别在 open("w") 截断后掉电丢光
+      File w = LittleFS.open("/mem/feedback.jsonl.tmp", "w");
+      if (w) { w.print(keep); w.close();
+        LittleFS.remove("/mem/feedback.jsonl");
+        LittleFS.rename("/mem/feedback.jsonl.tmp", "/mem/feedback.jsonl");
+      }
       Serial.printf("[METRICS] 反馈文件封顶重写：留 %d 条\n", lines);
     }
   }

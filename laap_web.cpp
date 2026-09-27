@@ -95,6 +95,10 @@ static String jsonEsc(const String& s) {
     if (c == '"' || c == '\\') { o += '\\'; o += c; }
     else if (c == '\n') o += "\\n";
     else if (c == '\r') o += "";
+    else if (c == '\t') o += "\\t";
+    else if (c == '\b') o += "\\b";
+    else if (c == '\f') o += "\\f";
+    else if ((unsigned char)c < 0x20) { char b[8]; snprintf(b, sizeof(b), "\\u%04X", c); o += b; }
     else o += c;
   }
   return o;
@@ -266,6 +270,12 @@ void LaapWeb::registerRoutes() {
         } else {
           otaErr = Update.errorString(); Update.abort();
         }
+      } else if (up.status == UPLOAD_FILE_ABORTED) {
+        // 浏览器取消/断线时 WebServer 会补调一次：不复位 Update 状态机的话，
+        // 下一次 Update.begin() 一直失败，重启前都无法再升级（官方 WebUpdate 例程同款处理）
+        Update.abort();
+        otaErr = "上传中断";
+        Serial.println("[OTA] 上传中断，升级状态机已复位");
       }
     });
   server.on("/api/voice/test", HTTP_POST, [this]() { handleVoiceTest(); });
@@ -707,13 +717,13 @@ void LaapWeb::handleChat() {
   String b = server.arg("plain");
   String text = jsonField(b, "text");   // 容错 "text":"…" / "text": "…"
   if (!text.length()) { server.send(400, "application/json", "{\"ok\":false,\"reply\":\"空消息\"}"); return; }
-  uint32_t seq0 = laapChatSeq();
   String reply = laapInteractSearch(text);   // 带联网搜索；LLM 阶段是异步投递
   if (laapChatPending()) {
     // 只有受理回执（"……"）：真回复由后台 LLM 任务产出，网页轮询 /api/chat/reply 取。
-    // 这样主循环不冻结（旧写法要么同步阻塞 20~60 秒，要么页面永远停在"……"）。
+    // seq 取"此刻"值而不是受理前：受理前的旧值会让上一问恰好完成的回复
+    // 被 seq>seq0 判定命中，串台显示到本问气泡下（还污染 👍/👎 反馈的配对）
     server.send(200, "application/json",
-        String("{\"ok\":true,\"pending\":true,\"seq\":") + String(seq0) + "}");
+        String("{\"ok\":true,\"pending\":true,\"seq\":") + String(laapChatSeq()) + "}");
     return;
   }
   server.send(200, "application/json",
@@ -892,6 +902,10 @@ void LaapWeb::handleMemImport() {
 
 void LaapWeb::handleClear() {
   memory.clearAll();
+  // 只删盘不清 RAM 态的话，一个心跳后 psiTick 就会用旧性格把 evolution.json 写回、
+  // 意图栈照常注入提示词——"清空"等于半失效（实测 30 秒内静默回滚）
+  mind.resetEvolution();
+  mind.clearAllIntents();
   server.send(200, "application/json", "{\"ok\":true}");
 }
 

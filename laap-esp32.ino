@@ -346,7 +346,8 @@ static LlmReply monologueGenerate() {
     rest = "";                       // 没给查询词 → 整理函数会退回问题原文
   }
   query = tidySearchQuery(rest, topic);
-  query.replace(" ", "+");                 // 搜索词进 URL：空格转 +
+  // 注意别把空格替换成 '+'：laap_search 的编码器本来就把空格编成 '+'，
+  // 预替换的 '+' 会被二次编码成 %2B（字面加号），还让 bigram 覆盖率跨词必 miss
   g_monoTopic = topic;
 
   // 起意前看一眼世界——"看"是有成本的感知，按需求驱动（active inference）：
@@ -793,6 +794,12 @@ bool arisIdleMonologue() {
     Serial.println("[LAAP·独白] LLM 连败，本轮沉默");
     return false;
   }
+  // 必须在清快照之前拦：上一轮 LK_MONO 还在后台跑时，llmTask 正在写 g_monoTopic/
+  // g_monoKnow 这批 String——先清后查会构成跨任务写写竞争（String 撕裂=堆损坏）
+  if (laapLlmBusy()) {
+    Serial.println("[LAAP·独白] LLM 忙，本轮不提交");
+    return false;
+  }
   LlmMsg m[1] = { {"user", ""} };
   // 提交侧（loopTask）清中间产物：清空这个动作必须在任务开始写之前、且只由主线程做，
   // 否则"任务重置 + 收割侧读取"同刻发生就是 String 撕裂
@@ -1153,7 +1160,7 @@ void rulesReflect(bool force) {
     Serial.println("[LAAP·规则] 跳过：无反馈/失败素材");
     return;
   }
-  if (!force) g_lastRulesDay = day;
+  // 素材门在上的 early-return 已各自消费日闸；这里不能再提前吃闸（提交失败时当晚要能重试）
   Serial.printf("[LAAP·规则] 开始归纳（反馈 %u B、失败 %u B、现有规则 %d 条）…\n",
                 (unsigned)fb.length(), (unsigned)fails.length(), rules.count());
 
@@ -1171,6 +1178,7 @@ void rulesReflect(bool force) {
   int cap = cfg.s.llmMaxTokens > 1000 ? cfg.s.llmMaxTokens : 1000;   // 同反思：预算小了思考型模型只想不答
   if (!llmSubmit(m, 2, cap, 0.4f, "", LK_RULES))                     // 规则要准，温度调低
     Serial.println("[LAAP·规则] LLM 正忙，下个心跳再试");
+  else if (!force) g_lastRulesDay = day;             // 提交成功才吃日闸（原在提交前消费，忙时当晚静默跳过）
 }
 
 // ============================================================
@@ -1210,7 +1218,8 @@ void memoryTidy(bool force) {
   if (!force) {
     if (g_lastTidyDay == day) return;
     if (t.tm_hour >= 6) { g_lastTidyDay = day; return; }
-    g_lastTidyDay = day;
+    // 日闸改到"提交成功"之后再置位：原来在这里就吃掉闸，LLM 忙时
+    // "下个心跳再试"是假话——当晚被静默跳过到明天
   }
   String mat = memory.episodicNumberedTail(60);
   if (mat.length() < 400) {                            // 少于 ~15 条不值一次调用
@@ -1228,6 +1237,7 @@ void memoryTidy(bool force) {
     {"user", mat} };
   if (!llmSubmit(m, 2, 600, 0.2f, "", LK_TIDY))
     Serial.println("[TIDY] LLM 正忙，下个心跳再试");
+  else if (!force) g_lastTidyDay = day;               // 提交成功才吃日闸
 }
 
 // ============================================================
@@ -1807,6 +1817,7 @@ void setup() {
   else if (String(cfg.s.wifiSsid).length() == 0) { webui.beginAP(); display.drawIpLine("", false); }
 
   voice.begin();   // 音频管线 + 编解码器 + VAD 校准
+  laapNetInit();   // 显式建网络互斥锁（懒创建 check-then-create 在两任务同进时有竞态）
   // 音量 0：以前"部分保存会把音量写成 0"（哨兵 bug，已修），所以开机要钳回 30；
   // 现在 0 只可能来自明确设置（网页/CLI），再改写就等于吞掉用户的静音选择——
   // 改为只提示一句，并告诉怎么恢复（"没声音"最常见的原因就是这里被写成 0）

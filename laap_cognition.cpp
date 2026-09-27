@@ -153,11 +153,29 @@ void Cognition::loadIntents() {
 }
 
 void Cognition::saveIntents() {
-  File f = LittleFS.open(INTENTS_PATH, "w");
+  // 原子写：掉电落在 open("w") 截断之后 = 意图栈整个丢（与其他重写路径同规格）
+  String tmpPath = String(INTENTS_PATH) + ".tmp";
+  File f = LittleFS.open(tmpPath, "w");
   if (!f) return;
   for (int i = 0; i < intentN; i++)
     f.printf("%lu|%s\n", (unsigned long)intentBorn[i], intents[i].c_str());
   f.close();
+  LittleFS.remove(INTENTS_PATH);
+  LittleFS.rename(tmpPath, INTENTS_PATH);
+}
+
+// 清空记忆联动：性格/代数/计数归零并立即落盘（防止 psiTick 用 RAM 旧值写回）
+void Cognition::resetEvolution() {
+  _openness = _sociability = _sensitivity = 0.5f;
+  _gen = 0; _cycles = 0; _chats = 0;
+  _pleasure = 0.5f;
+  saveEvolution();
+}
+
+// 意图栈整栈放下（含磁盘）
+void Cognition::clearAllIntents() {
+  intentN = 0;
+  LittleFS.remove(INTENTS_PATH);
 }
 
 bool Cognition::addIntent(const String& text, uint32_t ts) {

@@ -56,5 +56,6 @@ String sanitizeUtf8(const String& s);
 // 两任务并发写 = String 撕裂 → 堆损坏/莫名重启。拿不到就优雅降级，绝不长阻塞。
 bool laapNetLock(uint32_t ms = 400);
 void laapNetUnlock();
+void laapNetInit();                 // setup 里显式建锁（懒创建的 check-then-create 有竞态）
 
 extern LlmClient llm;

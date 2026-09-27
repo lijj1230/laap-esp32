@@ -151,6 +151,13 @@ static String weatherCityOf(const String& text) {
   s.trim();
   if (s.endsWith("市")) s = s.substring(0, s.length() - 3);   // "苏州市"→"苏州"
   s.trim();
+  // 剥完还剩"形容词壳"（"今天天气真不错"→"真不错"）：这是陈述句不是点名城市，
+  // 当成城市名去查必然查无此地——按无城市处理（走配置城市兜底）。
+  // 黑名单只能挑无城市名冲突的词："太"不能进（太原/太仓是城市）
+  if (s.length()) {
+    static const char* notCity[] = {"不错","很","挺","真","热","冷","好","舒服","干燥","闷","凉快"};
+    if (containsAny(s, notCity, sizeof(notCity) / sizeof(notCity[0]))) return String("");
+  }
   if (s.length() > 12) s = utf8Cut(s, 12);
   return s;
 }

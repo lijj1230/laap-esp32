@@ -69,7 +69,7 @@ bool LaapVoice::listenAndTranscribe(String& heard) {
 
   // 按键模式平时不泵，预滚缓冲里是陈年旧音——录前清掉，别回填进录音头（VAD 模式才靠预滚保句首）
   if ((VoiceMode)cfg.s.voiceMode != VoiceMode::Vad) audio.prerollFlush();
-  audio.recordStart(12);
+  if (!audio.recordStart(12)) { lastError = "录音缓冲分配失败"; return false; }
   uint32_t t0 = millis();
   uint32_t waitCap = 8000UL + audio.vadStopMs();   // 起始静默 8s + 说完后的判停尾
   bool spoke = false;
@@ -99,6 +99,7 @@ bool LaapVoice::listenAndTranscribe(String& heard) {
 
   String err;
   heard = asr.transcribe(audio.recordData(), got, err);
+  _lastChatMs = millis();            // ASR 预热门控的时间基准（原来写在 loopTick 的 _busy 分支里=死代码）
   metrics.asr(heard.length() > 0);   // ASR 空识别率：排障与自调优的核心 fitness
   if (!heard.length()) {
     metrics.failNote(String("ASR: ") + err);   // 规则归纳的失败素材
@@ -123,6 +124,10 @@ String LaapVoice::converse() {
     return "";
   }
   metrics.vadTrigger();       // 一轮真实对话（含"没听清"和唤醒词拒绝）
+  // 手动按键授权一次性消费：提到最前，"没听清/ASR 失败"路径也不残留——
+  // 否则残留的授权会让下一次环境噪声自动触发绕过唤醒词门
+  bool manualOnce = g_manualOnce;
+  g_manualOnce = false;
   String heard;
   if (!listenAndTranscribe(heard)) {
     if (lastError == "没听清") voice.speak("嗯？刚才没听清。", "curious");
@@ -132,14 +137,13 @@ String LaapVoice::converse() {
   // F8 唤醒词门（软件级）：配置了唤醒词且非手动按键模式时，
   // 说出的话必须含唤醒词才应答，否则当没听见（VAD 误触发率大幅下降）
   String wakeWord(cfg.s.wakeWord);
-  if (wakeWord.length() && !g_manualOnce && heard.indexOf(wakeWord) < 0) {
+  if (wakeWord.length() && !manualOnce && heard.indexOf(wakeWord) < 0) {
     Serial.printf("[VOICE] 未含唤醒词「%s」，忽略\n", wakeWord.c_str());
     lastError = "无唤醒词";
     metrics.wakeReject();
     _cooldownMs = millis() + 3000;              // 3 秒冷却防连环误触发
     return "";
   }
-  g_manualOnce = false;
   return respond(heard);
 }
 
@@ -186,9 +190,10 @@ void LaapVoice::loopTick() {
   // ASR 预热：仅"上次对话后 5 分钟内"的空闲期进行，且已有活连接就跳过——
   // 防止长期无人时高频握手（服务商 WAF 可能盯上陌生 TLS 风暴）
   static uint32_t s_warmMs = 0;
-  static uint32_t s_lastChatMs = 0;
-  if (_busy) s_lastChatMs = millis();
-  bool chatRecent = (s_lastChatMs != 0) && (millis() - s_lastChatMs < 300000);
+  // "上次聊天"时间戳由 listenAndTranscribe 成功后写入 _lastChatMs——原来用
+  // `if (_busy) s_lastChatMs = millis();` 记录，但 loopTick 开头就 `if (_busy) return`，
+  // 这行永远执行不到 → chatRecent 恒 false → 整个 ASR 预热特性从 v3.18 起就是死代码
+  bool chatRecent = _lastChatMs && (millis() - _lastChatMs < 300000);
   if (vadMode && !_vadPaused && chatRecent && (int32_t)(millis() - _cooldownMs) >= 0 &&
       millis() - s_warmMs > 20000) {
     if (asr.warmAlive()) {

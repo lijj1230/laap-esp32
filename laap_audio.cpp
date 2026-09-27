@@ -130,11 +130,15 @@ void LaapAudio::setVolume(uint8_t v) {
 
 bool LaapAudio::recordStart(size_t maxSeconds) {
   size_t cap = maxSeconds * 16000 * 2;   // 16kHz 16bit
+  // 先清账再分配：失败也不能让上一次的 _recCap/_recLen 残留——调用方按旧长度误判
+  // 会拿空缓冲去裁剪/转写（PSRAM 大块被相机/LLM 挤占时可发生）
+  _recCap = 0; _recLen = 0; _dsCnt = 0; _dsAcc = 0;
   if (_recBuf) free(_recBuf);
+  _recBuf = nullptr;
   _recBuf = (int16_t*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
   if (!_recBuf) { _recBuf = (int16_t*)malloc(cap); }
   if (!_recBuf) return false;
-  _recCap = cap; _recLen = 0; _dsCnt = 0; _dsAcc = 0;
+  _recCap = cap;
   // 预滚回填：触发前的最近 ~1.5s 已经在滚，拷进录音头（时间序，尾部=最新）
   size_t pre = _preLen; if (pre > cap) pre = cap;
   if (pre) memcpy(_recBuf, _preBuf, pre);

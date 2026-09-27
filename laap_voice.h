@@ -56,6 +56,7 @@ private:
   bool _vadHold = false;
   uint32_t _vadHoldStart = 0;
   bool _vadPaused = false;
+  uint32_t _lastChatMs = 0;   // 最近一次真实对话（ASR 预热门控用；loopTick 里写=死代码已废
 };
 
 extern LaapVoice voice;
