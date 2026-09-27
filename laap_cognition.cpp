@@ -12,7 +12,7 @@ bool Cognition::loadEvolution() {
   File f = LittleFS.open("/evolution.json", "r");
   if (!f) return false;
   String s = f.readString(); f.close();
-  // 极简解析 {"gen":n,"cycles":n,"chats":n,"open":f,"soc":f,"sens":f}
+  // 极简解析 {"gen":n,"cycles":n,"chats":n,"open":f,"soc":f,"sens":f,"nE":f,"nC":f,"nSo":f,"nSe":f,"nEx":f,"pl":f}
   auto grab = [&](const char* k, float def) -> float {
     String pat = String("\"") + k + "\":";
     int i = s.indexOf(pat);
@@ -21,6 +21,15 @@ bool Cognition::loadEvolution() {
   };
   _gen = grab("gen", 0); _cycles = grab("cycles", 0); _chats = grab("chats", 0);
   _openness = grab("open", 0.5f); _sociability = grab("soc", 0.5f); _sensitivity = grab("sens", 0.5f);
+  // 需求五维+愉悦度跟性格同文件续跑（v3.42）：打盹/OTA/断电重启后情绪不"睡一觉归零"。
+  // 老文件没有这些键 → grab 回退默认值，天然向后兼容
+  _n.energy     = grab("nE",  0.30f);
+  _n.curiosity  = grab("nC",  0.40f);
+  _n.social     = grab("nSo", 0.45f);
+  _n.security   = grab("nSe", 0.20f);
+  _n.expression = grab("nEx", 0.35f);
+  _pleasure     = grab("pl",  0.5f);
+  _savedN = _n; _savedPl = _pleasure;
   return true;
 }
 
@@ -34,12 +43,15 @@ void Cognition::saveEvolution(bool force) {
   // 原子重写：心跳级高频写 + 掉电窗口，直接 open("w") 半写会让性格/代数静默回退默认值
   File f = LittleFS.open("/evolution.tmp", "w");
   if (!f) return;
-  f.printf("{\"gen\":%lu,\"cycles\":%lu,\"chats\":%lu,\"open\":%.3f,\"soc\":%.3f,\"sens\":%.3f}",
+  f.printf("{\"gen\":%lu,\"cycles\":%lu,\"chats\":%lu,\"open\":%.3f,\"soc\":%.3f,\"sens\":%.3f,"
+           "\"nE\":%.3f,\"nC\":%.3f,\"nSo\":%.3f,\"nSe\":%.3f,\"nEx\":%.3f,\"pl\":%.3f}",
            (unsigned long)_gen, (unsigned long)_cycles, (unsigned long)_chats,
-           _openness, _sociability, _sensitivity);
+           _openness, _sociability, _sensitivity,
+           _n.energy, _n.curiosity, _n.social, _n.security, _n.expression, _pleasure);
   f.close();
   LittleFS.remove("/evolution.json");
   LittleFS.rename("/evolution.tmp", "/evolution.json");
+  _savedN = _n; _savedPl = _pleasure;   // 快照对齐：下次从"写入时的值"起算漂移
 }
 
 void Cognition::begin() {
@@ -101,6 +113,13 @@ void Cognition::tick(float dtMin) {
   // （实测连聊几轮后 social/curiosity/expression 全掉到 0.02，整机进入无欲无求的瘫平态）
   auto cl = [](float& v) { if (v < 0.05f) v = 0.05f; if (v > 1) v = 1; };
   cl(_n.energy); cl(_n.curiosity); cl(_n.social); cl(_n.security); cl(_n.expression);
+
+  // 需求漂移标脏（v3.42）：任一维/愉悦度偏离上次落盘快照 >0.05 就置脏，
+  // 真实写盘节奏仍由 saveEvolution 的节流决定——任何重启前的值最多差 0.05
+  if (fabsf(_n.energy - _savedN.energy) > 0.05f || fabsf(_n.curiosity - _savedN.curiosity) > 0.05f ||
+      fabsf(_n.social - _savedN.social) > 0.05f || fabsf(_n.security - _savedN.security) > 0.05f ||
+      fabsf(_n.expression - _savedN.expression) > 0.05f || fabsf(_pleasure - _savedPl) > 0.05f)
+    _evoDirty = true;
 }
 
 void Cognition::onUserInteraction() {
@@ -173,6 +192,7 @@ void Cognition::saveIntents() {
 void Cognition::resetEvolution() {
   _openness = _sociability = _sensitivity = 0.5f;
   _gen = 0; _cycles = 0; _chats = 0;
+  _n = Needs();                        // "整个人重来"连需求/情绪一起归零（否则旧值会被写回盘）
   _pleasure = 0.5f;
   saveEvolution(true);
 }

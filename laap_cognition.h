@@ -88,13 +88,15 @@ public:
 
 private:
   Needs _n;
+  Needs _savedN;                       // 上次落盘的需求快照（任一维漂移 >0.05 触发补写，v3.42）
+  float _savedPl = 0.5f;
   // 性格参数（进化对象）
   float _openness = 0.5f;      // 开放性：放大好奇权重
   float _sociability = 0.5f;   // 外向性：放大社交权重
   float _sensitivity = 0.5f;   // 敏感度：放大安全权重
   uint32_t _gen = 0, _cycles = 0, _chats = 0;
   float _pleasure = 0.5f;      // 近期愉悦度（情绪用）
-  bool _evoDirty = false;              // 性格/聊天数真变化（saveEvolution 节流用）
+  bool _evoDirty = false;              // 性格/聊天数/需求漂移真变化（saveEvolution 节流用）
   uint32_t _lastEvoSaveCycle = 0;      // 上次落盘时的周期数
   String intents[3];           // 意图栈（PIANO goals）
   uint32_t intentBorn[3] = {0, 0, 0};

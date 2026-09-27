@@ -238,6 +238,7 @@ void LaapWeb::registerRoutes() {
           "{\"ok\":true,\"msg\":\"固件已写入，重启中，约 20 秒后回来\"}");
         laapUptimePersist();   // 重启前落盘累计时长
         metrics.persist();     // 重启前指标/失败环留底（事后排查崩溃现场）
+        mind.saveEvolution(true);   // 需求/情绪留底：升级醒来状态续跑（v3.42）
         delay(600);
         laapReboot("OTA升级");
       } else {
@@ -922,6 +923,7 @@ void LaapWeb::handleReset() {
 void LaapWeb::handleReboot() {
   laapUptimePersist();   // 重启前把累计运行时长落盘（否则这一截时长白丢）
   metrics.persist();     // 指标/失败环留底
+  mind.saveEvolution(true);   // 需求/情绪留底：重启醒来状态续跑（v3.42）
   server.send(200, "application/json", "{\"ok\":true}");
   delay(300);
   laapReboot("网页重启");

@@ -2009,6 +2009,7 @@ void loop() {
           !laapLlmBusy() && !laapChatPending()) {
         Serial.println("[LAAP] 堆碎片到警戒线且闲置 → 自愈性打盹（重启换干净堆）");
         metrics.persist();     // 打盹前的失败证据必须留底
+        mind.saveEvolution(true);   // 需求/情绪也留底：醒来接着睡前的状态，不"睡一觉归零"（v3.42）
         laapUptimePersist();
         delay(600);
         laapReboot("自愈打盹");
