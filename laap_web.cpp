@@ -237,6 +237,7 @@ void LaapWeb::registerRoutes() {
         server.send(200, "application/json",
           "{\"ok\":true,\"msg\":\"固件已写入，重启中，约 20 秒后回来\"}");
         laapUptimePersist();   // 重启前落盘累计时长
+        metrics.persist();     // 重启前指标/失败环留底（事后排查崩溃现场）
         delay(600);
         ESP.restart();
       } else {
@@ -918,6 +919,7 @@ void LaapWeb::handleReset() {
 
 void LaapWeb::handleReboot() {
   laapUptimePersist();   // 重启前把累计运行时长落盘（否则这一截时长白丢）
+  metrics.persist();     // 指标/失败环留底
   server.send(200, "application/json", "{\"ok\":true}");
   delay(300);
   ESP.restart();
@@ -945,11 +947,18 @@ void LaapWeb::handleSpeak() {
 
 // ---- 评估埋点 / 反馈 / 快照（RSI 闭环：评估端 + 回滚安全网） ----
 void LaapWeb::handleMetrics() {
+  // prev = 上一段会话快照（NVS）：崩溃/自愈重启后仍能查到重启前的失败计数与原因
+  String prev;
+  if (metrics.hasPrev()) {
+    const LaapMetrics* pv = metrics.prev();
+    prev = String(",\"prev\":{\"metrics\":{") + pv->json() +
+           "},\"fail_notes\":\"" + jsonEsc(pv->failDigest()) + "\"}";
+  }
   server.send(200, "application/json",
               String("{\"ok\":true,\"boot_ms\":") + millis() +
               ",\"tune\":{\"cooldown_ms\":" + voice.cooldownDur() +
               ",\"vad_mul\":" + String(voice.vadMul(), 2) + "}" +
-              ",\"metrics\":{" + metrics.json() + "}}");
+              ",\"metrics\":{" + metrics.json() + "}" + prev + "}");
 }
 
 void LaapWeb::handleFeedback() {

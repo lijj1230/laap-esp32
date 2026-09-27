@@ -1,6 +1,7 @@
 #include "laap_metrics.h"
 #include "laap_llm.h"   // utf8Cut（按字符边界截，substring 会把汉字拦腰切断→请求体非法 UTF-8）
 #include <LittleFS.h>
+#include <Preferences.h>
 #include <time.h>
 
 LaapMetrics metrics;
@@ -145,4 +146,76 @@ String LaapMetrics::feedbackDigest(int maxLines) {
     out += ln;
   }
   return out;
+}
+
+// ---- 上一段会话快照（NVS blob：计数器 + 失败环）----
+// 两档写入（磨损账：~700B/次 × 288 次/天，与 uptime 同量级，可忽略）：
+//   ① 5 分钟批量（与累计运行时长同节拍）；② 失败计数 +1 时限速 60s 即时写——
+// 崩溃/自愈重启前的失败原因几乎必留底，事后排查的命根子。
+void LaapMetrics::persist() {
+  _lastPersistMs = millis();
+  static const size_t CAP = 4 + 20 * 4 + 6 * (1 + 96);
+  uint8_t buf[CAP];
+  size_t n = 0;
+  memcpy(buf, "LMS1", 4); n = 4;
+  const uint32_t c[20] = { vadTriggers, noSpeech, asrTry, asrFail, wakeMiss, cooldownSkip,
+    interrupts, toolDirect, visionOk, visionFail, searchOk, searchFail,
+    llmOk, llmFail, fbUp, fbDown, rspLlmMsSum, rspLlmN, rspDirMsSum, rspDirN };
+  memcpy(buf + n, c, sizeof(c)); n += sizeof(c);
+  for (int i = 0; i < 6; i++) {                       // 失败环按"最老→最新"存
+    uint8_t len = 0;
+    const char* s = nullptr;
+    if (_failCnt) {
+      const String& r = _failRing[(_failIdx + 6 - _failCnt + i) % 6];
+      len = (uint8_t)min(r.length(), (unsigned int)96);
+      s = r.c_str();
+    }
+    buf[n++] = len;
+    if (len) { memcpy(buf + n, s, len); n += len; }
+  }
+  Preferences p;
+  if (!p.begin("laapmtr", false)) return;
+  p.putBytes("snap", buf, n);
+  p.end();
+}
+
+void LaapMetrics::loadPrev() {
+  Preferences p;
+  if (!p.begin("laapmtr", true)) return;
+  size_t n = p.getBytesLength("snap");
+  static const size_t CAP = 4 + 20 * 4 + 6 * (1 + 96);
+  uint8_t buf[CAP];
+  if (n < 8 + 20 * 4 || n > sizeof(buf) || p.getBytes("snap", buf, sizeof(buf)) != n) { p.end(); return; }
+  if (memcmp(buf, "LMS1", 4) != 0) { p.end(); return; }
+  size_t o = 4;
+  uint32_t c[20];
+  memcpy(c, buf + o, sizeof(c)); o += sizeof(c);
+  LaapMetrics* m = new LaapMetrics();                 // 上一段会话（含失败环）整体还原
+  m->vadTriggers = c[0];  m->noSpeech = c[1];  m->asrTry = c[2];  m->asrFail = c[3];
+  m->wakeMiss = c[4];     m->cooldownSkip = c[5];
+  m->interrupts = c[6];   m->toolDirect = c[7];
+  m->visionOk = c[8];     m->visionFail = c[9];
+  m->searchOk = c[10];    m->searchFail = c[11];
+  m->llmOk = c[12];       m->llmFail = c[13];
+  m->fbUp = c[14];        m->fbDown = c[15];
+  m->rspLlmMsSum = c[16]; m->rspLlmN = c[17];
+  m->rspDirMsSum = c[18]; m->rspDirN = c[19];
+  for (int i = 0; i < 6 && o < n; i++) {
+    uint8_t len = buf[o++];
+    if (!len) continue;
+    if (o + len > n) break;
+    String s;
+    s.concat((const char*)(buf + o), len);
+    o += len;
+    m->_failRing[i] = cleanUtf8(s);
+    m->_failIdx = (i + 1) % 6;
+    m->_failCnt = i + 1;
+  }
+  delete _prev;
+  _prev = m;
+}
+
+void LaapMetrics::failSticky() {
+  if (_lastPersistMs && millis() - _lastPersistMs < 60000) return;   // 失败写限速 60s
+  persist();
 }

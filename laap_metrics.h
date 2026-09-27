@@ -4,10 +4,13 @@
 // ============================================================
 // LAAP-lite 评估埋点（RSI 闭环的"评估端"）
 //   自我进化 = 生成→评估→迭代，瓶颈在评估器：先让"它做得好不好"可测量。
-//   计数器 RAM 常驻（重启清零——调参信号本来就按"本次开机"看，写入成本≈0）；
-//   网页 👍/👎 反馈是唯一落盘的（/mem/feedback.jsonl，长期留证据，
-//   以后夜间反思可以直接把"被踩的回复"当反思素材）。
-//   查看：/api/metrics、/api/status 的 metrics 字段、串口 /metrics
+//   计数器 RAM 常驻 + 双份可见：本次醒来（实时）+ 上一段会话（NVS 快照）。
+//   落盘策略两档，保 Flash 寿命：
+//     ① 5 分钟批量快照（与累计运行时长同一节拍，~700B/次，磨损可忽略）；
+//     ② 失败计数器（llm/asr/vision/search）增加时限速 60s 即时写——
+//        事故（崩溃/自愈重启）前的失败原因几乎必留底，事后排查的命根子。
+//   网页 👍/👎 反馈是另一路持久化（/mem/feedback.jsonl，长期留证据）。
+//   查看：/api/metrics（含 prev 块）、/api/status 的 metrics 字段、串口 /metrics
 // ============================================================
 struct LaapMetrics {
   uint32_t vadTriggers = 0;   // 真正发起的对话轮（过冷却门后）
@@ -27,14 +30,14 @@ struct LaapMetrics {
 
   void vadTrigger()            { vadTriggers++; }
   void noSpeechHeard()         { noSpeech++; }
-  void asr(bool ok)            { asrTry++; if (!ok) asrFail++; }
+  void asr(bool ok)            { asrTry++; if (!ok) { asrFail++; failSticky(); } }
   void wakeReject()            { wakeMiss++; }
   void cooldownDrop()          { cooldownSkip++; }
   void interruptedPlay()       { interrupts++; }
   void tool()                  { toolDirect++; }
-  void vision(bool ok)         { ok ? visionOk++ : visionFail++; }
-  void search(bool ok)         { ok ? searchOk++ : searchFail++; }
-  void llm(bool ok)            { ok ? llmOk++ : llmFail++; }
+  void vision(bool ok)         { if (ok) visionOk++; else { visionFail++; failSticky(); } }
+  void search(bool ok)         { if (ok) searchOk++; else { searchFail++; failSticky(); } }
+  void llm(bool ok)            { if (ok) llmOk++; else { llmFail++; failSticky(); } }
   void rspLlm(uint32_t ms)     { rspLlmMsSum += ms; rspLlmN++; }
   void rspDir(uint32_t ms)     { rspDirMsSum += ms; rspDirN++; }
   float rspLlmMs() const       { return rspLlmN ? (float)rspLlmMsSum / rspLlmN : 0; }
@@ -44,6 +47,14 @@ struct LaapMetrics {
   bool feedback(int v, const String& user, const String& reply);
   // "asr_try":N,... 形式（不带花括号），/api/metrics 与 /api/status 共用
   String json() const;
+
+  // ---- 上一段会话快照（NVS，重启不清零的"跨会话历史"） ----
+  // persist()：当前计数器+失败环 → NVS blob（5 分钟节拍/失败限速 60s/主动重启前）；
+  // loadPrev()：开机读回为 _prev。prev() 即"上一段醒来"的完整指标（同结构同口径）
+  void persist();
+  void loadPrev();
+  const LaapMetrics* prev() const { return _prev; }   // 无上一段会话时为 null
+  bool hasPrev() const { return _prev != nullptr; }
 
   // ---- 失败记录环（规则自进化的"素材端"）----
   // 记最近 6 条有文本的失败（ASR/视觉/搜索/LLM 的报错原文），RAM 环不落盘：
@@ -56,6 +67,9 @@ struct LaapMetrics {
 private:
   String _failRing[6];
   uint8_t _failIdx = 0, _failCnt = 0;
+  uint32_t _lastPersistMs = 0;        // 失败限速节流（60s）
+  LaapMetrics* _prev = nullptr;       // 上一段会话快照（loadPrev 填充；指针防自嵌套）
+  void failSticky();                  // 失败计数+1 后的节流即时落盘
 };
 
 extern LaapMetrics metrics;
