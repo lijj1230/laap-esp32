@@ -1283,6 +1283,10 @@ void psiTick() {
   // 节流收进了 saveEvolution 内部（强制/置脏/满 96 周期才写）——原来的
   // "cycles != 上次保存值"恒真（incCycle 每心跳 +1），降频从未生效
   mind.saveEvolution();
+  // 小凌⑥: 信任向中性回归（homeostasis，与需求稳态化同思路）：无衰减的信任会被
+  // "每次成功对话 +0.02"棘轮顶满 1.0（v3.39 加读数后实测恒满），"非常亲近"失去
+  // 信息量、点踩也看不见波动。0.01/min：1.0→0.65 约 3 小时；点踩的凹陷数小时自愈
+  mind.trust += (0.60f - mind.trust) * 0.01f * dtMin;
   // 小凌⑥: 信任值变化超 ±0.05 才落 NVS（原来只在 cfg.save() 时顺带写，重启回滚）
   static float s_lastTrustSaved = -1;
   if (s_lastTrustSaved < 0 || (mind.trust - s_lastTrustSaved > 0.05f) || (s_lastTrustSaved - mind.trust > 0.05f)) {

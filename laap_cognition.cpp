@@ -345,7 +345,8 @@ String Cognition::worldJson() const {
          ",\"social\":" + String(_n.social, 2) +
          ",\"security\":" + String(_n.security, 2) +
          ",\"expression\":" + String(_n.expression, 2) +
-         "},\"mood\":\"" + moodKey() + "\",\"goal\":\"" + goalCn() + "\"}";
+         "},\"trust\":" + String(trust, 2) +
+         ",\"mood\":\"" + moodKey() + "\",\"goal\":\"" + goalCn() + "\"}";
 }
 
 String Cognition::traitsLine() const {
