@@ -27,6 +27,9 @@ public:
   String relationsFor(const String& query, const String& goal, int maxLines = 2); // 相关条目并入召回
   int  relationsApply(const String& llmText);     // 夜间抽取结果落盘（去重/封顶40），返回新增条数
   String relationsText() const;                   // 全部关系事实（/api/relations、串口 /relations）
+  // 情绪精标注（v3.46，手稿"情绪权重"精确版）："行号|情绪" → 改写记忆行的 m 字段。
+  // 行号=episodicNumberedTail 绝对行号（按非空行计）；重写保持行数不变（不破 emb.bin 行序对齐）
+  int  moodApply(const String& llmText);
   // 语义向量（bge-m3 经硅基流动；异步缓存，无向量时 recallSmart 自动退关键词）
   void   embedTick();                              // loop 调用：给未嵌入的记忆补向量（限速）
   bool   embedOk() const { return _embFail < 3; }  // 连败3次后本轮停用（退关键词）

@@ -110,7 +110,7 @@ static String g_recentTopics;          // 最近自问话题（防重复，滚�
 static uint32_t g_btnDown = 0;
 
 // LLM 请求种类（F4 后台任务的收割分流）：聊天/主动表达/独白/记忆压缩/夜间反思/规则归纳/技能提取/意图生成/记忆整理
-enum LlmKind : uint8_t { LK_CHAT = 0, LK_EXPRESS, LK_MONO, LK_CONSOLIDATE, LK_REFLECT, LK_RULES, LK_RELATION, LK_SKILL, LK_INTENT, LK_TIDY };
+enum LlmKind : uint8_t { LK_CHAT = 0, LK_EXPRESS, LK_MONO, LK_CONSOLIDATE, LK_REFLECT, LK_RULES, LK_RELATION, LK_MOOD, LK_SKILL, LK_INTENT, LK_TIDY };
 
 // ---------- 函数声明 ----------
 void psiTick();
@@ -696,6 +696,16 @@ void llmHarvest() {
     else Serial.println("[LAAP·关系] 没有新的关系事实");
     return;
   }
+  if (kind == LK_MOOD) {                              // 情绪精标注：修正最近记忆的 m 字段
+    if (!r.ok) {
+      Serial.printf("[LAAP·情绪] 标注失败: %s\n", llm.lastError.c_str());
+      return;
+    }
+    int n = memory.moodApply(r.say);
+    if (n) Serial.printf("[LAAP·情绪] 已精标注 %d 条记忆\n", n);
+    else Serial.println("[LAAP·情绪] 无有效标注（保留原标签）");
+    return;
+  }
   if (kind == LK_SKILL) {                              // 技能提取：解析 触发词|指令
     String s = r.say; s.trim();
     int bar = (!r.ok || s.startsWith("NO")) ? -1 : s.indexOf('|');
@@ -1246,6 +1256,43 @@ void relationsReflect(bool force) {
 }
 
 // ============================================================
+//  记忆情绪精标注（v3.46，手稿"情绪权重"精确版）：写入时的 m 是"那一刻
+//  系统情绪"的临时初值；夜里一次 LLM 批量把最近 60 条改标为"经历内容本身
+//  的情感色彩"。与其它睡眠期任务同窗口（0-6 点）同节奏（每天一次）。
+// ============================================================
+static int g_lastMoodDay = -1;
+
+void moodRelabel(bool force) {
+  time_t now = time(nullptr);
+  if (now < 1700000000) {
+    if (!force) return;
+  }
+  struct tm t; localtime_r(&now, &t);
+  int day = t.tm_yday;
+  if (!force) {
+    if (g_lastMoodDay == day) return;
+    if (t.tm_hour >= 6) { g_lastMoodDay = day; return; }   // 白天不跑，等今晚
+  }
+  String mat = memory.episodicNumberedTail(60);
+  if (mat.length() < 300) {
+    if (!force) g_lastMoodDay = day;
+    Serial.println("[LAAP·情绪] 跳过：记忆太少");
+    return;
+  }
+  String sys = String("你是数字生命") + cfg.s.agentName + "的记忆情绪标注器。"
+               "为下面每一条带行号的记忆标注这段经历本身的情感色彩，"
+               "情绪只能从 calm/happy/curious/excited/lonely/anxious/tired 里选一个："
+               "明显开心/满足=happy，好奇/想弄明白=curious，激动/兴奋=excited，"
+               "孤单/想念=lonely，担心/不安/难受=anxious，疲惫/低落=tired，平淡无波=calm。"
+               "每行一条，格式「行号|情绪」，只输出清单，禁止任何解释。";
+  LlmMsg m[2] = { {"system", sys}, {"user", "记忆条目：\n" + mat} };
+  int cap = cfg.s.llmMaxTokens > 1000 ? cfg.s.llmMaxTokens : 1000;   // 同其它夜间任务：预算小了思考型模型只想不答
+  if (!llmSubmit(m, 2, cap, 0.2f, "", LK_MOOD))                      // 分类任务，温度压最低
+    Serial.println("[LAAP·情绪] LLM 正忙，下个心跳再试");
+  else if (!force) g_lastMoodDay = day;               // 提交成功才吃日闸（同规则归纳）
+}
+
+// ============================================================
 //  意图栈（PIANO goals）：好奇度高且目标不满 3 个时，让 LLM 从最近经历里
 //  提一个"此刻最想弄明白的小目标"→ 存 /mem/intents.txt，独白隔轮推进它。
 //  心跳节流：2 小时最多起一次意。
@@ -1316,6 +1363,7 @@ void psiTick() {
   rulesReflect(false);     // RSI: 深夜规则归纳（反馈+失败→行为规则集；LLM 忙则下个心跳再试）
   relationsReflect(false); // 关系记忆抽取（偏好/承诺/边界；与规则归纳同窗口同节奏，v3.43）
   memoryTidy(false);       // 睡眠期记忆整理：合并重复/清理过期（Letta 式 sleep-time compute）
+  moodRelabel(false);      // 情绪精标注：夜里 LLM 批量修正最近记忆的情绪标签（v3.46）
   intentSpawnTick();       // 意图栈：好奇高且目标不满 → 提一个新目标（2h 节流）
   voice.tuneTick();        // RSI⑥: 参数自调优（内部按 5 分钟窗口评估，纯 C 零 LLM 成本）
 
@@ -1793,6 +1841,9 @@ void serialCli() {
     } else if (line == "/relationsreflect") {
       relationsReflect(true);   // 立刻从最近经历抽一轮关系事实（不等深夜窗口）
       Serial.println("[REL] 已提交抽取，LLM 出结果后落盘（约 10~30 秒）");
+    } else if (line == "/moodrelabel") {
+      moodRelabel(true);        // 立刻精标注一轮最近记忆的情绪（不等深夜窗口）
+      Serial.println("[MOOD] 已提交标注，LLM 出结果后落盘（约 10~30 秒）");
     } else if (line == "/rulesreflect") {
       rulesReflect(true);   // 立刻用当前反馈+失败素材归纳一轮规则（不等深夜窗口）
       Serial.println("[RULES] 已提交归纳，LLM 出结果后生效（约 10~30 秒）");

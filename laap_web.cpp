@@ -292,6 +292,7 @@ void LaapWeb::registerRoutes() {
   server.on("/api/rulesreflect", HTTP_POST, [this]() { handleRulesReflect(); });
   server.on("/api/relations", HTTP_GET, [this]() { handleRelationsApi(); });
   server.on("/api/relationsreflect", HTTP_POST, [this]() { handleRelationsReflect(); });
+  server.on("/api/moodrelabel", HTTP_POST, [this]() { handleMoodRelabel(); });
   server.onNotFound([this]() { handleNotFound(); });
   otaPending = false;
 }
@@ -1026,6 +1027,12 @@ void LaapWeb::handleRelationsReflect() {
   relationsReflect(true);
   server.send(200, "application/json",
               "{\"ok\":true,\"msg\":\"已提交抽取，约 10~30 秒后生效，稍后刷新查看\"}");
+}
+
+void LaapWeb::handleMoodRelabel() {
+  moodRelabel(true);   // 异步提交；结果在 /api/memory 的记忆行 "m" 字段可见
+  server.send(200, "application/json",
+              "{\"ok\":true,\"msg\":\"已提交情绪标注，约 10~30 秒后生效\"}");
 }
 
 void LaapWeb::handleSkillsApi() {

@@ -613,6 +613,82 @@ String MemorySystem::relationsText() const {
   return out;
 }
 
+// ============================================================
+//  记忆情绪精标注（v3.46，手稿"情绪权重"的精确版）：写入时的 m 是"那一刻
+//  系统情绪"的临时初值；夜里 LLM 批量把最近 60 条改标为"经历内容本身的
+//  情感色彩"。召回端的同色调加权逻辑不变，只是标签从近似变成精读。
+// ============================================================
+static const char* kMoodVocab[] = { "calm", "happy", "curious", "excited", "lonely", "anxious", "tired" };
+
+// 把行的 m 字段改为 mood（无则插在 "w":值, 之后，保持 t,r,w,m,x 键序）
+static bool setLineMood(String& l, const String& mood) {
+  int mp = l.indexOf("\"m\":\"");
+  if (mp >= 0) {
+    int vs = mp + 5;                              // strlen("\"m\":\"")=5
+    int ve = l.indexOf('"', vs);
+    if (ve < 0) return false;
+    l = l.substring(0, vs) + mood + l.substring(ve);
+    return true;
+  }
+  int wp = l.indexOf("\"w\":");
+  if (wp < 0) return false;                       // 没有 w 键的异常行不动
+  int comma = l.indexOf(',', wp);
+  if (comma < 0) return false;
+  l = l.substring(0, comma + 1) + "\"m\":\"" + mood + "\"," + l.substring(comma + 1);
+  return true;
+}
+
+// llmText 形如 "12|happy\n13|calm"；行号 = episodicNumberedTail 的绝对行号
+// （1 起、按非空行计，与 applyTidyOps 同口径）。整文件重写但**行数不变**——
+// emb.bin 按行序与 episodes 对齐，删行/加行都会让向量缓存整体作废重建。
+// 已知竞态：提交与收割之间 tidy 恰好删行会令行号偏移——后果是标错一条的
+// 情绪（无数据损失，次日滚动窗口重标），与 tidy 自身的行号竞态同级，接受。
+int MemorySystem::moodApply(const String& llmText) {
+  int ln[80];
+  String mo[80];
+  int nMap = 0, start = 0;
+  while (start < (int)llmText.length() && nMap < 80) {
+    int e = llmText.indexOf('\n', start);
+    String line = (e < 0) ? llmText.substring(start) : llmText.substring(start, e);
+    start = (e < 0) ? (int)llmText.length() : e + 1;
+    line.trim();
+    if (line.length() > 1 && line[0] == '-') { line = line.substring(1); line.trim(); }
+    int bar = line.indexOf('|');
+    if (bar <= 0) continue;
+    String numStr = line.substring(0, bar); numStr.trim();
+    long no = numStr.toInt();
+    String mood = line.substring(bar + 1); mood.trim();
+    bool okMood = false;
+    for (auto k : kMoodVocab) if (mood == k) { okMood = true; break; }
+    if (no < 1 || !okMood) continue;
+    ln[nMap] = (int)no; mo[nMap] = mood; nMap++;
+  }
+  if (!nMap) return 0;
+  File in = LittleFS.open(EP_PATH, "r");
+  if (!in) return 0;
+  std::vector<String> lines;
+  while (in.available()) {
+    String l = in.readStringUntil('\n');
+    if (l.length()) lines.push_back(l);           // 与编号口径一致：只数非空行
+  }
+  in.close();
+  int applied = 0;
+  for (int i = 0; i < nMap; i++) {
+    int idx = ln[i] - 1;
+    if (idx < 0 || idx >= (int)lines.size()) continue;
+    if (setLineMood(lines[idx], mo[i])) applied++;
+  }
+  if (!applied) return 0;
+  String tmpPath = String(EP_PATH) + ".tmp";
+  File w = LittleFS.open(tmpPath, "w");
+  if (!w) return 0;
+  for (auto& l : lines) { w.print(l); w.print('\n'); }
+  w.close();
+  LittleFS.remove(EP_PATH);
+  LittleFS.rename(tmpPath.c_str(), EP_PATH);
+  return applied;
+}
+
 // 用户问起该记忆 → 权重升级（Mem0 的"被召回即强化"）
 void MemorySystem::rememberBoost(const String& fragment) {
   if (fragment.length() < 2) return;
