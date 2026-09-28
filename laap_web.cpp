@@ -290,6 +290,8 @@ void LaapWeb::registerRoutes() {
   server.on("/api/rules", HTTP_GET, [this]() { handleRulesApi(); });
   server.on("/api/skills", HTTP_GET, [this]() { handleSkillsApi(); });
   server.on("/api/rulesreflect", HTTP_POST, [this]() { handleRulesReflect(); });
+  server.on("/api/relations", HTTP_GET, [this]() { handleRelationsApi(); });
+  server.on("/api/relationsreflect", HTTP_POST, [this]() { handleRelationsReflect(); });
   server.onNotFound([this]() { handleNotFound(); });
   otaPending = false;
 }
@@ -1005,6 +1007,18 @@ void LaapWeb::handleSnapRestore() {
 void LaapWeb::handleRulesApi() {
   server.send(200, "application/json",
               String("{\"rules\":\"") + jsonEsc(rules.text()) + "\"}");
+}
+
+void LaapWeb::handleRelationsApi() {
+  server.send(200, "application/json",
+              String("{\"relations\":\"") + jsonEsc(memory.relationsText()) + "\"}");
+}
+
+void LaapWeb::handleRelationsReflect() {
+  // 与 /api/rulesreflect 同一条路：异步提交，10~30 秒后刷新 /api/relations 看结果
+  relationsReflect(true);
+  server.send(200, "application/json",
+              "{\"ok\":true,\"msg\":\"已提交抽取，约 10~30 秒后生效，稍后刷新查看\"}");
 }
 
 void LaapWeb::handleSkillsApi() {

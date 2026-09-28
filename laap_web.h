@@ -46,6 +46,8 @@ private:
   void handleRulesApi();      // 行为规则文本（记忆页展示）
   void handleSkillsApi();     // 口令技能列表（记忆页展示）
   void handleRulesReflect();  // 立刻归纳一轮规则
+  void handleRelationsApi();     // 关系记忆文本（偏好/承诺/边界）
+  void handleRelationsReflect(); // 立刻抽一轮关系事实
   void handleNotFound();
 
   WebServer server{80};
@@ -69,4 +71,5 @@ bool laapReplySpoken();       // 上一次是否已自己念过（本地直答�
 String laapLastUserText();    // 最近一轮主人原话（反馈落盘用）
 String laapIdleInfo();        // 独白计时诊断（"还差多久冒泡"）
 void rulesReflect(bool force);// 立刻归纳一轮行为规则（记忆页"立刻归纳"按钮用）
+void relationsReflect(bool force); // 立刻从最近经历抽一轮关系事实（偏好/承诺/边界）
 bool laapLlmBusy();           // 后台 LLM 任务在飞（含独白/反思/整理的多步流水线）

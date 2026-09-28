@@ -1,6 +1,7 @@
 #include "laap_memory.h"
 #include "laap_llm.h"   // utf8Cut
 #include "laap_snap.h"  // 覆盖"自我"文件前拍快照（RSI 安全网）
+#include "laap_cognition.h"  // mind：意图加权（intent）与资源深度（bodyStrain）
 #include <LittleFS.h>
 #include <time.h>
 #include <vector>
@@ -9,6 +10,9 @@ MemorySystem memory;
 
 static const char* EP_PATH = "/mem/episodes.jsonl";
 static const int  EP_MAX   = 300;
+// 关系记忆层（v3.43）：偏好/承诺/边界——夜间从经历抽取，召回时按相关性并入
+static const char* REL_PATH = "/mem/relations.jsonl";
+static const int  REL_MAX  = 40;
 // 语义向量缓存（B: bge-m3 双通道召回）
 static const char* EMB_PATH = "/mem/emb.bin";
 static const int   EMB_DIM  = 1024;
@@ -328,12 +332,53 @@ static void parseWt(const String& l, float& w, float& fresh) {
 }
 
 // 智能回忆：主=语义 Top-K（w 加权），退=关键词
+// a 的相邻字符对（bigram）有多少出现在 b 里（中文相关性既定做法，同独白搜索词 v3.26）。
+// ≥30% 且至少 3 个 bigram 才算相关——短词/英文/高频虚词（"的""了"）凑不起比例
+static bool bigramMostlyIn(const String& a, const String& b) {
+  if (a.length() < 6 || b.length() < 4) return false;
+  int total = 0, hit = 0;
+  for (unsigned int i = 0; i < a.length(); ) {
+    int l1 = 1;
+    unsigned char c = (unsigned char)a[i];
+    if (c >= 0xF0) l1 = 4; else if (c >= 0xE0) l1 = 3; else if (c >= 0xC0) l1 = 2;
+    int j = i + l1;
+    if (j >= (int)a.length()) break;
+    int l2 = 1;
+    c = (unsigned char)a[j];
+    if (c >= 0xF0) l2 = 4; else if (c >= 0xE0) l2 = 3; else if (c >= 0xC0) l2 = 2;
+    if (j + l2 > (int)a.length()) break;
+    total++;
+    if (b.indexOf(a.substring(i, j + l2)) >= 0) hit++;
+    i = j;
+  }
+  return total >= 3 && hit * 10 >= total * 3;
+}
+
 String MemorySystem::recallSmart(const String& query, int maxChars) {
   struct Hit { String line; float score; };
   std::vector<Hit> hits;
 
+  // 资源适配度（v3.43，借鉴"心光竞争"）：资源状态调制"做多深"，而不只是门控行为发生——
+  // 堆紧时省下 embedding 的两次 4KB 向量缓冲（退关键词通道）；堆紧/身体负荷高时少带回忆
+  bool allowEmb = (_embFail < 3);
+  int effChars = maxChars;
+  {
+    uint32_t maxblk = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (maxblk < 40000) allowEmb = false;
+    float depth = 1.0f;
+    if (maxblk < 45000) depth -= 0.3f;
+    if (mind.bodyStrain >= 0.30f) depth -= 0.3f;   // 体温/信号/醒太久的身体负荷
+    if (depth < 0.4f) depth = 0.4f;
+    effChars = (int)(maxChars * depth);
+    if (effChars < 120) effChars = 120;
+  }
+  // 意图加权（v3.43）：心里惦记的事（意图栈第一号）让相关旧事更容易浮上来
+  String it0 = mind.intent(0);
+  // 关系事实独立成路：与提问/目标相关的承诺/偏好/边界，没有情景命中也能单独想起
+  String rel = relationsFor(query, it0, 2);
+
   // —— 主通道：语义 ——
-  if (_embFail < 3) {
+  if (allowEmb) {
     float* qv = (float*)malloc(EMB_DIM * 4);
     if (qv) {
       _embLastMs = millis();
@@ -355,7 +400,8 @@ String MemorySystem::recallSmart(const String& query, int maxChars) {
             parseWt(l, fw, fr);
             float wn = (fw > 3 ? 3 : fw) / 3.0f;
             float sim = cosineOf(qv, rv, EMB_DIM);
-            hits.push_back({l, sim * 0.75f + wn * 0.15f + fr * 0.10f});
+            float ib = bigramMostlyIn(it0, l) ? 0.10f : 0.0f;   // 与心里目标相关的记忆加分
+            hits.push_back({l, sim * 0.75f + wn * 0.15f + fr * 0.10f + ib});
             idx++;
             if (hits.size() > 40) {                        // 控内存：留 Top40
               size_t worst = 0;
@@ -377,19 +423,20 @@ String MemorySystem::recallSmart(const String& query, int maxChars) {
   // —— 退通道：关键词（无语义可用：权重与新鲜度各半，老记忆不再无条件霸榜） ——
   if (hits.empty()) {
     File f = LittleFS.open(EP_PATH, "r");
-    if (!f) return "";
+    if (!f) return rel;
     while (f.available()) {
       String l = f.readStringUntil('\n');
       if (l.length() && query.length() >= 2 && l.indexOf(query) >= 0) {
         float fw, fr;
         parseWt(l, fw, fr);
         float wn = (fw > 3 ? 3 : fw) / 3.0f;
-        hits.push_back({l, wn * 0.5f + fr * 0.5f});
+        float ib = bigramMostlyIn(it0, l) ? 0.10f : 0.0f;      // 与心里目标相关的记忆加分
+        hits.push_back({l, wn * 0.5f + fr * 0.5f + ib});
       }
     }
     f.close();
   }
-  if (hits.empty()) return "";
+  if (hits.empty()) return rel;   // 没有情景命中时，相关的承诺/偏好仍可单独浮上来
 
   String out;
   for (int round = 0; round < 3 && !hits.empty(); round++) {   // 取 Top3
@@ -410,8 +457,143 @@ String MemorySystem::recallSmart(const String& query, int maxChars) {
         !(x == query || (query.length() >= 8 && x.indexOf(query) >= 0)))
       out = out.length() ? out + "\n" + x : x;
     hits[best] = hits.back(); hits.pop_back();
-    if ((int)out.length() >= maxChars) break;
+    if ((int)out.length() >= effChars) break;
   }
+  if (rel.length()) out = out.length() ? out + "\n" + rel : rel;
+  return out;
+}
+
+// ============================================================
+//  关系记忆层（v3.43，借鉴"识海手稿"）：主人的偏好/答应主人的事/要守住的边界。
+//  夜间从最近经历抽取（ino relationsReflect → LK_RELATION → relationsApply），
+//  召回时与提问/心里目标相关的条目一并浮上来——"答应过的事"不用等主人翻旧账。
+// ============================================================
+static String relJsonEsc(const String& s) {
+  String o; o.reserve(s.length() + 8);
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '"' || c == '\\') { o += '\\'; o += c; }
+    else if (c == '\n') o += "\\n";
+    else if (c == '\r') continue;
+    else if (c == '\t') o += ' ';
+    else o += c;
+  }
+  return o;
+}
+
+// 轻量解析自己写的关系行 {"t":..,"k":"..","x":".."}（indexOf 足够，不必上 JSON 库）
+static bool relParseLine(const String& l, String& k, String& x) {
+  int xp = l.indexOf("\"x\":\"");
+  if (xp < 0) return false;
+  x = l.substring(xp + 5);
+  int xe = x.lastIndexOf('"');
+  if (xe <= 0) return false;
+  x = x.substring(0, xe);
+  int kp = l.indexOf("\"k\":\"");
+  if (kp >= 0) {
+    int ke = l.indexOf('"', kp + 5);
+    if (ke > kp + 5) k = l.substring(kp + 5, ke);
+  }
+  return true;
+}
+
+// 召回用：与提问/目标相关的关系事实（文件按时间序，环形留最新 maxLines 条）
+String MemorySystem::relationsFor(const String& query, const String& goal, int maxLines) {
+  if (maxLines < 1) maxLines = 1;
+  if (maxLines > 4) maxLines = 4;
+  File f = LittleFS.open(REL_PATH, "r");
+  if (!f) return "";
+  String picked[4];
+  int n = 0;
+  while (f.available()) {
+    String l = f.readStringUntil('\n');
+    String k, x;
+    if (!relParseLine(l, k, x)) continue;
+    if (k.length() == 0) k = "记着";
+    bool hit = (query.length() >= 6 && bigramMostlyIn(query, x)) ||
+               (goal.length() >= 6 && bigramMostlyIn(goal, x));
+    if (!hit) continue;
+    picked[n % maxLines] = String("【") + k + "】" + x;
+    n++;
+  }
+  f.close();
+  String out;
+  for (int i = (n > maxLines ? n - maxLines : 0); i < n; i++) {
+    if (out.length()) out += "\n";
+    out += picked[i % maxLines];
+  }
+  return out;
+}
+
+// 夜间抽取结果落盘：解析「类型|内容」行，去重、封顶 REL_MAX（超限原子重写保最近）
+int MemorySystem::relationsApply(const String& llmText) {
+  String existing;
+  int lines = 0;
+  {
+    File f = LittleFS.open(REL_PATH, "r");
+    if (f) {
+      while (f.available()) { existing += f.readStringUntil('\n'); lines++; }
+      f.close();
+    }
+  }
+  File f = LittleFS.open(REL_PATH, "a");
+  if (!f) return 0;
+  int added = 0, start = 0;
+  while (start < (int)llmText.length()) {
+    int e = llmText.indexOf('\n', start);
+    String ln = (e < 0) ? llmText.substring(start) : llmText.substring(start, e);
+    start = (e < 0) ? (int)llmText.length() : e + 1;
+    ln.trim();
+    if (ln.length() > 1 && ln[0] == '-') { ln = ln.substring(1); ln.trim(); }  // 容忍 "- " 列表符
+    int bar = ln.indexOf('|');
+    if (bar <= 0) continue;
+    String k = ln.substring(0, bar); k.trim();
+    String x = sanitizeUtf8(ln.substring(bar + 1));
+    x.trim();
+    x = utf8Cut(x, 80);
+    // 类型宽容匹配（模型可能输出 "1.偏好" / "-偏好" 这类前缀）
+    if (k.indexOf("偏好") < 0 && k.indexOf("承诺") < 0 && k.indexOf("边界") < 0) continue;
+    if (x.length() < 6 || existing.indexOf(x) >= 0) continue;   // 太短/已知的不记
+    time_t now = time(nullptr);
+    f.printf("{\"t\":%lu,\"k\":\"%s\",\"x\":\"%s\"}\n",
+             (unsigned long)(now > 1700000000 ? (uint32_t)now : 0), k.c_str(), relJsonEsc(x).c_str());
+    existing += x + "\n";    // 本轮后面的行也照常去重
+    lines++; added++;
+  }
+  f.close();
+  if (lines > REL_MAX) {     // 封顶：只留最近 REL_MAX 条（tmp+rename 原子替换）
+    File in = LittleFS.open(REL_PATH, "r");
+    String keep; int n2 = 0;
+    while (in && in.available()) {
+      String l = in.readStringUntil('\n');
+      if (l.length()) { keep += l + "\n"; if (++n2 > REL_MAX) { keep = keep.substring(keep.indexOf('\n') + 1); n2--; } }
+    }
+    if (in) in.close();
+    String tmpPath = String(REL_PATH) + ".tmp";
+    File w = LittleFS.open(tmpPath, "w");
+    if (w) {
+      w.print(keep); w.close();
+      LittleFS.remove(REL_PATH);
+      LittleFS.rename(tmpPath.c_str(), REL_PATH);
+    }
+  }
+  return added;
+}
+
+// 全部关系事实（/api/relations、串口 /relations）
+String MemorySystem::relationsText() const {
+  File f = LittleFS.open(REL_PATH, "r");
+  if (!f) return "";
+  String out;
+  while (f.available()) {
+    String l = f.readStringUntil('\n');
+    String k, x;
+    if (!relParseLine(l, k, x)) continue;
+    if (k.length() == 0) k = "记着";
+    if (out.length()) out += "\n";
+    out += String("【") + k + "】" + x;
+  }
+  f.close();
   return out;
 }
 

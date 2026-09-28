@@ -110,7 +110,7 @@ static String g_recentTopics;          // 最近自问话题（防重复，滚�
 static uint32_t g_btnDown = 0;
 
 // LLM 请求种类（F4 后台任务的收割分流）：聊天/主动表达/独白/记忆压缩/夜间反思/规则归纳/技能提取/意图生成/记忆整理
-enum LlmKind : uint8_t { LK_CHAT = 0, LK_EXPRESS, LK_MONO, LK_CONSOLIDATE, LK_REFLECT, LK_RULES, LK_SKILL, LK_INTENT, LK_TIDY };
+enum LlmKind : uint8_t { LK_CHAT = 0, LK_EXPRESS, LK_MONO, LK_CONSOLIDATE, LK_REFLECT, LK_RULES, LK_RELATION, LK_SKILL, LK_INTENT, LK_TIDY };
 
 // ---------- 函数声明 ----------
 void psiTick();
@@ -672,6 +672,16 @@ void llmHarvest() {
       Serial.println("[LAAP·规则] 无产出/无变化，规则保留");
     return;
   }
+  if (kind == LK_RELATION) {                           // 关系归纳：偏好/承诺/边界 → relations.jsonl
+    if (!r.ok) {
+      Serial.printf("[LAAP·关系] 抽取失败: %s\n", llm.lastError.c_str());
+      return;
+    }
+    int n = memory.relationsApply(r.say);
+    if (n) Serial.printf("[LAAP·关系] 记下 %d 条关系事实（/api/relations 查看）\n", n);
+    else Serial.println("[LAAP·关系] 没有新的关系事实");
+    return;
+  }
   if (kind == LK_SKILL) {                              // 技能提取：解析 触发词|指令
     String s = r.say; s.trim();
     int bar = (!r.ok || s.startsWith("NO")) ? -1 : s.indexOf('|');
@@ -1186,6 +1196,42 @@ void rulesReflect(bool force) {
 }
 
 // ============================================================
+//  关系记忆抽取（v3.43，借鉴"识海手稿"关系记忆层）：与规则归纳同窗口同节奏
+//  （0-6 点第一次心跳，每天一次；没素材不出门）。产出 /mem/relations.jsonl：
+//  主人的偏好 / 答应主人的事 / 要守住的边界——召回时按相关性浮现。
+// ============================================================
+static int g_lastRelDay = -1;
+
+void relationsReflect(bool force) {
+  time_t now = time(nullptr);
+  if (now < 1700000000) {
+    if (!force) return;
+  }
+  struct tm t; localtime_r(&now, &t);
+  int day = t.tm_yday;
+  if (!force) {
+    if (g_lastRelDay == day) return;
+    if (t.tm_hour >= 6) { g_lastRelDay = day; return; }   // 白天不跑，等今晚
+  }
+  String mat = memory.episodicNumberedTail(40);
+  if (mat.length() < 300) {
+    if (!force) g_lastRelDay = day;
+    Serial.println("[LAAP·关系] 跳过：经历素材太少");
+    return;
+  }
+  String sys = String("你是数字生命") + cfg.s.agentName + "的关系记忆维护器。"
+               "从最近经历里找出值得长期记住的关系事实：主人的偏好（喜欢/讨厌/习惯）、"
+               "你答应过主人的还没兑现的事、要守住的边界（主人明确不喜欢被做的事）。"
+               "每行一条，格式「类型|内容」，类型只能是 偏好/承诺/边界，内容≤30字，最多4条；"
+               "没有值得记的就只输出 NO。只输出清单，禁止任何解释。";
+  LlmMsg m[2] = { {"system", sys}, {"user", "最近经历：\n" + mat} };
+  int cap = cfg.s.llmMaxTokens > 1000 ? cfg.s.llmMaxTokens : 1000;   // 同规则归纳：预算小了思考型模型只想不答
+  if (!llmSubmit(m, 2, cap, 0.4f, "", LK_RELATION))
+    Serial.println("[LAAP·关系] LLM 正忙，下个心跳再试");
+  else if (!force) g_lastRelDay = day;               // 提交成功才吃日闸（同规则归纳）
+}
+
+// ============================================================
 //  意图栈（PIANO goals）：好奇度高且目标不满 3 个时，让 LLM 从最近经历里
 //  提一个"此刻最想弄明白的小目标"→ 存 /mem/intents.txt，独白隔轮推进它。
 //  心跳节流：2 小时最多起一次意。
@@ -1254,6 +1300,7 @@ void psiTick() {
   mind.incCycle();
   nightlyReflect(false);   // F7: 深夜复盘（内部自带每天一次节流）
   rulesReflect(false);     // RSI: 深夜规则归纳（反馈+失败→行为规则集；LLM 忙则下个心跳再试）
+  relationsReflect(false); // 关系记忆抽取（偏好/承诺/边界；与规则归纳同窗口同节奏，v3.43）
   memoryTidy(false);       // 睡眠期记忆整理：合并重复/清理过期（Letta 式 sleep-time compute）
   intentSpawnTick();       // 意图栈：好奇高且目标不满 → 提一个新目标（2h 节流）
   voice.tuneTick();        // RSI⑥: 参数自调优（内部按 5 分钟窗口评估，纯 C 零 LLM 成本）
@@ -1726,6 +1773,12 @@ void serialCli() {
     } else if (line == "/rules clear") {
       rules.clear();
       Serial.println("[RULES] 规则已清空");
+    } else if (line == "/relations") {
+      String rt = memory.relationsText();
+      Serial.println(rt.length() ? rt : String("[REL] 还没有关系记忆（/relationsreflect 现在抽一轮，或等夜里自动跑）"));
+    } else if (line == "/relationsreflect") {
+      relationsReflect(true);   // 立刻从最近经历抽一轮关系事实（不等深夜窗口）
+      Serial.println("[REL] 已提交抽取，LLM 出结果后落盘（约 10~30 秒）");
     } else if (line == "/rulesreflect") {
       rulesReflect(true);   // 立刻用当前反馈+失败素材归纳一轮规则（不等深夜窗口）
       Serial.println("[RULES] 已提交归纳，LLM 出结果后生效（约 10~30 秒）");

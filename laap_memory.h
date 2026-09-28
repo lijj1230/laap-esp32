@@ -6,6 +6,7 @@
 //   工作记忆  ← RAM，最近 12 条（当前对话上下文）
 //   情景记忆  ← LittleFS /mem/episodes.jsonl，最近 300 条
 //   语义记忆  ← /mem/semantic.txt，LLM 周期性压缩出的"自我认知"
+//   关系记忆  ← /mem/relations.jsonl，偏好/承诺/边界（夜间从经历抽取，v3.43）
 //   对应 laap-AGI: aris_episodic_memory + laap_memory_hierarchy
 // ============================================================
 class MemorySystem {
@@ -22,6 +23,10 @@ public:
   // 智能回忆（Mem0 式多信号）：优先语义向量召回（embedOk 时），退关键词+重要度加权
   String recallSmart(const String& query, int maxChars = 300);
   void   rememberBoost(const String& fragment);   // 用户问起=该记忆重要（升级权重）
+  // 关系记忆层（v3.43，借鉴"识海手稿"）：主人的偏好/答应的事/要守住的边界
+  String relationsFor(const String& query, const String& goal, int maxLines = 2); // 相关条目并入召回
+  int  relationsApply(const String& llmText);     // 夜间抽取结果落盘（去重/封顶40），返回新增条数
+  String relationsText() const;                   // 全部关系事实（/api/relations、串口 /relations）
   // 语义向量（bge-m3 经硅基流动；异步缓存，无向量时 recallSmart 自动退关键词）
   void   embedTick();                              // loop 调用：给未嵌入的记忆补向量（限速）
   bool   embedOk() const { return _embFail < 3; }  // 连败3次后本轮停用（退关键词）
