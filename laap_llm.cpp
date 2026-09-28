@@ -148,7 +148,7 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
   client->print(req);
 
   // 读响应
-  String resp; resp.reserve(4096);
+  String resp; resp.reserve(12288);   // 与 laapEmbed 同口径：聊天响应常 5-20KB，预分配免翻倍再分配链
   uint32_t t0ms = millis();
   while (client->connected() && millis() - t0ms < 30000) {  // 差值比较：49.7 天回绕安全
     while (client->available()) {

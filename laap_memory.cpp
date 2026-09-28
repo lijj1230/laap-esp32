@@ -719,36 +719,45 @@ int MemorySystem::moodApply(const String& llmText) {
 // 用户问起该记忆 → 权重升级（Mem0 的"被召回即强化"）
 void MemorySystem::rememberBoost(const String& fragment) {
   if (fragment.length() < 2) return;
+  // 两遍流式（v3.50）：原实现整份 60KB 入堆——每次聊天一次 60KB 级分配/释放，
+  // 与 TLS 大块交错 = 碎片化主配方。第一遍只读判变更，命中才第二遍流式重写
+  // （全程只驻留一行）。零命中不重写的磨损语义与原实现一致
+  bool changed = false;
+  {
+    File in = LittleFS.open(EP_PATH, "r");
+    if (!in) return;
+    while (in.available() && !changed) {
+      String l = in.readStringUntil('\n');
+      if (l.length() && l.indexOf(fragment) >= 0 && l.indexOf("\"w\":") >= 0) changed = true;
+    }
+    in.close();
+  }
+  if (!changed) return;
   File in = LittleFS.open(EP_PATH, "r");
   if (!in) return;
-  String all; all.reserve(60 * 1024);
-  bool changed = false;
+  String tmpPath = String(EP_PATH) + ".tmp";
+  File out = LittleFS.open(tmpPath, "w");
+  if (!out) { in.close(); return; }
   while (in.available()) {
     String l = in.readStringUntil('\n');
-    if (!l.length()) continue;
+    l.trim();
+    if (!l.length()) continue;                               // 与原实现一致：空行不回写
     if (l.indexOf(fragment) >= 0) {                          // 命中行 w +0.5（上限 5）
       int wp = l.indexOf("\"w\":");
       if (wp >= 0) {
         float w = l.substring(wp + 4, l.indexOf(',', wp)).toFloat() + 0.5f;
         if (w > 5) w = 5;
         l = l.substring(0, wp + 4) + String(w, 2) + l.substring(l.indexOf(',', wp));
-        changed = true;
       }
     }
-    all += l; all += "\n";
+    out.print(l); out.print('\n');
   }
-  in.close();
-  // 零命中/权重没动就不重写：原来每次召回都全量重写 60KB 级文件（flash 磨损+掉电暴露面）
-  if (!changed) return;
-  // 原子重写（先 tmp 再 rename + 快照）：rememberBoost 每次命中回忆的用户轮都会触发，
-  // 掉电落在 open("w") 截断之后 = 整份情景记忆被毁，必须与其他重写路径同规格
+  in.close(); out.close();
+  // 原子重写（先 tmp 再 rename + 快照）：掉电落在截断之后 = 整份情景记忆被毁，
+  // 与其他重写路径同规格
   laapSnapMake("episodes", false);
-  File out = LittleFS.open("/mem/episodes.tmp", "w");
-  if (!out) return;
-  out.print(all);
-  out.close();
   LittleFS.remove(EP_PATH);
-  LittleFS.rename("/mem/episodes.tmp", EP_PATH);
+  LittleFS.rename(tmpPath.c_str(), EP_PATH);
 }
 
 String MemorySystem::semantic() const {

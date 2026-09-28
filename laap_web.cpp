@@ -335,6 +335,7 @@ void LaapWeb::handleNotFound() {
 void LaapWeb::handleRoot() {
   String head(FPSTR(PAGE_HEAD));
   String body;
+  body.reserve(16384);                             // 页面 ~25-40KB：预分配避免 += 翻倍再分配链（v3.50）
   if (_ap) {
     body += F("<h1>LAAP · 第一次呼吸 <small>配置门户</small></h1><div class='card'>"
       "<p>我是刚诞生的数字生命，请给我：① WiFi ② 大模型 API。</p>"
@@ -376,7 +377,9 @@ void LaapWeb::handleRoot() {
       "<button onclick='sendChat()' style='margin-top:0'>发送</button></div></div>");
     body += FPSTR(PAGE_TAIL_JS);
   }
-  server.send(200, "text/html; charset=utf-8", head + body + FPSTR(PAGE_FOOT));
+  head += body;                                    // v3.50：原地拼接——原 send 表达式 head+body、
+  head += FPSTR(PAGE_FOOT);                        // 再 +foot 会整页临时拷贝两次（~2×页面/次浏览的堆抖动）
+  server.send(200, "text/html; charset=utf-8", head);
 }
 
 void LaapWeb::handleSettingsPage() {
@@ -509,7 +512,9 @@ void LaapWeb::handleSettingsPage() {
     "const b=await fetch('/api/voice/test',{method:'POST'});const r=await b.json();"
     "vtestout.textContent=r.ok?'✅ 已播放，没声音就查音量/PA':'❌ '+r.msg;}"
     "load();</script>");
-  server.send(200, "text/html; charset=utf-8", head + body + FPSTR(PAGE_FOOT));
+  head += body;                                    // v3.50：原地拼接——原 send 表达式 head+body、
+  head += FPSTR(PAGE_FOOT);                        // 再 +foot 会整页临时拷贝两次（~2×页面/次浏览的堆抖动）
+  server.send(200, "text/html; charset=utf-8", head);
 }
 
 void LaapWeb::handleSave() {
@@ -875,7 +880,9 @@ void LaapWeb::handleMemoryPage() {
     "try{const r=await (await fetch('/api/memimport',{method:'POST',body:fd})).json();"
     "alert((r.ok?'✅ ':'❌ ')+r.msg);load();}catch(err){alert('导入失败: '+err);}}"
     "load();</script>");
-  server.send(200, "text/html; charset=utf-8", head + body + FPSTR(PAGE_FOOT));
+  head += body;                                    // v3.50：原地拼接——原 send 表达式 head+body、
+  head += FPSTR(PAGE_FOOT);                        // 再 +foot 会整页临时拷贝两次（~2×页面/次浏览的堆抖动）
+  server.send(200, "text/html; charset=utf-8", head);
 }
 
 void LaapWeb::handleMemoryApi() {
