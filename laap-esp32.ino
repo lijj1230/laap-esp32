@@ -769,9 +769,14 @@ void llmHarvest() {
   }
   if (kind == LK_SKILL) {                              // 技能提取：解析 触发词|指令
     String s = r.say; s.trim();
-    int bar = (!r.ok || s.startsWith("NO")) ? -1 : s.indexOf('|');
+    // v3.50 审计：首行修复后模型可能带前导寒暄行——取**最后一个**含 '|' 的行解析
+    // （寒暄行不含 |，真技能行必含）；触发词/指令都取自同一行，避免跨行拼进死触发词
+    int bar = (!r.ok || s.startsWith("NO")) ? -1 : s.lastIndexOf('|');
     if (bar > 0) {
-      String trig = s.substring(0, bar), instr = s.substring(bar + 1);
+      int ls = s.lastIndexOf('\n', bar) + 1;           // 触发行行首
+      int le = s.indexOf('\n', bar);                   // 触发行行尾（无则到串尾）
+      if (le < 0) le = s.length();
+      String trig = s.substring(ls, bar), instr = s.substring(bar + 1, le);
       trig.trim(); instr.trim(); instr.replace("\n", " ");
       if (skills.teach(trig, instr))
         Serial.printf("[SKILLS] 已学会：说「%s」→ %s\n", trig.c_str(), instr.c_str());

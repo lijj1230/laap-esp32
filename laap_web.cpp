@@ -240,6 +240,7 @@ void LaapWeb::registerRoutes() {
         laapUptimePersist();   // 重启前落盘累计时长
         metrics.persist();     // 重启前指标/失败环留底（事后排查崩溃现场）
         mind.saveEvolution(true);   // 需求/情绪留底：升级醒来状态续跑（v3.42）
+        r0.saveNvs();          // 循环处理器学习进度留底（OTA 重启不清零，v3.50）
         delay(600);
         laapReboot("OTA升级");
       } else {

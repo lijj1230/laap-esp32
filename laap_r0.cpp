@@ -9,7 +9,8 @@ static const uint32_t kR0Magic = 0x52304231UL;    // "R0B1"
 void LaapR0::saveNvs() {
   if (!_run) return;                              // 没跑过的全新状态无可存
   const size_t NF = N + NI + NI + NI * OUT;       // h(8)+xPrev(2)+pred(2)+wOut(22) = 34
-  uint8_t buf[8 + NF * 4];
+  const size_t kHdr = 12;                         // magic(4)+steps(4)+roll(4)——曾误按 8 预留：
+  uint8_t buf[kHdr + NF * 4];                     //   5 分钟一次的栈越界写 4B + 恢复恒败（v3.50 审计）
   size_t o = 0;
   memcpy(buf + o, &kR0Magic, 4); o += 4;
   uint32_t st = _steps; memcpy(buf + o, &st, 4); o += 4;
@@ -29,8 +30,9 @@ bool LaapR0::loadNvs() {
   if (!p.begin("laapmtr", true)) return false;
   size_t n = p.getBytesLength("r0");
   const size_t NF = N + NI + NI + NI * OUT;
-  if (n != 8 + NF * 4) { p.end(); return false; }
-  uint8_t buf[8 + NF * 4];
+  const size_t kHdr = 12;                         // 与 saveNvs 的头部严格一致
+  if (n != kHdr + NF * 4) { p.end(); return false; }
+  uint8_t buf[kHdr + NF * 4];
   if (p.getBytes("r0", buf, sizeof(buf)) != n) { p.end(); return false; }
   p.end();
   size_t o = 0;

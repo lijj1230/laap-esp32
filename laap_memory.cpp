@@ -596,7 +596,7 @@ int MemorySystem::relationsApply(const String& llmText) {
     time_t now = time(nullptr);
     f.printf("{\"t\":%lu,\"k\":\"%s\",\"x\":\"%s\"}\n",
              (unsigned long)(now > 1700000000 ? (uint32_t)now : 0), relJsonEsc(k).c_str(), relJsonEsc(x).c_str());
-    existing += x + "\n";    // 本轮后面的行也照常去重
+    existing += relJsonEsc(x) + "\n";    // 本轮后面的行也照常去重（与比较的转义形态一致）
     lines++; added++;
   }
   f.close();
