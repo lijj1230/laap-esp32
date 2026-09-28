@@ -90,7 +90,10 @@ void MemorySystem::appendEpisodic(const char* role, const String& rawText) {
     else if (c == '\t') esc += ' ';
     else esc += c;
   }
-  f.printf("{\"t\":%lu,\"r\":\"%s\",\"w\":1.0,\"x\":\"%s\"}\n", (unsigned long)t, role, esc.c_str());
+  // m=写入那一刻的情绪（手稿"情绪权重"的落点）：当时的心情就是这段经历的色彩。
+  // 放 x 之前——正文里万一出现字面 "m":" 也不会干扰键定位；embedding 只抽 x，向量不受污染
+  f.printf("{\"t\":%lu,\"r\":\"%s\",\"w\":1.0,\"m\":\"%s\",\"x\":\"%s\"}\n",
+           (unsigned long)t, role, mind.moodKey(), esc.c_str());
   f.close();
   _count++;
 
@@ -332,6 +335,14 @@ static void parseWt(const String& l, float& w, float& fresh) {
 }
 
 // 智能回忆：主=语义 Top-K（w 加权），退=关键词
+// 抽记忆行的情绪标签（"m":"calm|happy|..."；v3.44 起写入，老行无此键返回空）
+static String parseMood(const String& l) {
+  int mp = l.indexOf("\"m\":\"");
+  if (mp < 0) return "";
+  int me = l.indexOf('"', mp + 5);
+  return (me > mp + 5) ? l.substring(mp + 5, me) : String();
+}
+
 // a 的相邻字符对（bigram）有多少出现在 b 里（中文相关性既定做法，同独白搜索词 v3.26）。
 // ≥30% 且至少 3 个 bigram 才算相关——短词/英文/高频虚词（"的""了"）凑不起比例
 static bool bigramMostlyIn(const String& a, const String& b) {
@@ -374,6 +385,9 @@ String MemorySystem::recallSmart(const String& query, int maxChars) {
   }
   // 意图加权（v3.43）：心里惦记的事（意图栈第一号）让相关旧事更容易浮上来
   String it0 = mind.intent(0);
+  // 情绪关联（v3.44，手稿"情绪权重"）：当前情绪与记忆写入时同色调才加分。
+  // calm=中性不拉偏——否则绝大多数 calm 记忆全体加分，等于没加
+  String curMood = mind.moodKey();
   // 关系事实独立成路：与提问/目标相关的承诺/偏好/边界，没有情景命中也能单独想起
   String rel = relationsFor(query, it0, 2);
 
@@ -401,7 +415,8 @@ String MemorySystem::recallSmart(const String& query, int maxChars) {
             float wn = (fw > 3 ? 3 : fw) / 3.0f;
             float sim = cosineOf(qv, rv, EMB_DIM);
             float ib = bigramMostlyIn(it0, l) ? 0.10f : 0.0f;   // 与心里目标相关的记忆加分
-            hits.push_back({l, sim * 0.75f + wn * 0.15f + fr * 0.10f + ib});
+            float mb = (curMood != "calm" && parseMood(l) == curMood) ? 0.06f : 0.0f;  // 情绪同色调
+            hits.push_back({l, sim * 0.75f + wn * 0.15f + fr * 0.10f + ib + mb});
             idx++;
             if (hits.size() > 40) {                        // 控内存：留 Top40
               size_t worst = 0;
@@ -431,7 +446,8 @@ String MemorySystem::recallSmart(const String& query, int maxChars) {
         parseWt(l, fw, fr);
         float wn = (fw > 3 ? 3 : fw) / 3.0f;
         float ib = bigramMostlyIn(it0, l) ? 0.10f : 0.0f;      // 与心里目标相关的记忆加分
-        hits.push_back({l, wn * 0.5f + fr * 0.5f + ib});
+        float mb = (curMood != "calm" && parseMood(l) == curMood) ? 0.06f : 0.0f;  // 情绪同色调
+        hits.push_back({l, wn * 0.5f + fr * 0.5f + ib + mb});
       }
     }
     f.close();
