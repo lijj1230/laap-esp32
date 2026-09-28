@@ -17,6 +17,8 @@ struct LaapSettings {
   uint8_t threshold  = 55;                          // 主动表达阈值(0-100)
   uint16_t idleSilenceMin = 10;                     // 独白起始静默(分钟)
   uint16_t idleEveryMin   = 20;                     // 独白间隔(分钟，0=关闭独白)
+  uint8_t quietStart  = 23;                         // 自发说话静音窗起(时)：主动表达+独白深夜不吵人
+  uint8_t quietEnd    = 6;                          // 静音窗止(时)；起止相同=不启用
   uint8_t volume = 70;                              // 喇叭音量(0-100, ES8311)
   uint8_t brightness = 90;                          // 屏幕亮度(0-100, 背光PWM)
   uint16_t screenOffSec = 60;                       // 静默息屏秒数(0=不息屏)

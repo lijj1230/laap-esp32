@@ -134,6 +134,17 @@ void serialCli();
 String laapLastSay() { return g_lastSay; }
 const char* laapLastExpr() { return g_lastExpr.c_str(); }
 
+// 自发说话静音窗（v3.45，后台可配）：主动表达与自发独白共用的"夜里不吵人"门。
+// 起止相同=不启用；支持跨午夜（如 23→6）。NTP 未同步时不静音（没法判断时段）。
+static bool laapInQuietWindow() {
+  time_t t = time(nullptr);
+  if (t < 1700000000) return false;
+  int h = localtime(&t)->tm_hour;
+  int qs = cfg.s.quietStart, qe = cfg.s.quietEnd;
+  if (qs == qe) return false;
+  return (qs < qe) ? (h >= qs && h < qe) : (h >= qs || h < qe);
+}
+
 // ============================================================
 //  主动表达（PSI 心跳触发）—— v3.3 起投递后台任务，主循环不冻结
 // ============================================================
@@ -148,6 +159,9 @@ void arisExpress(bool forced, const String& trigger) {
                   (unsigned long)((millis() - s_lastExpressMs) / 1000), trigger.c_str());
     return;
   }
+  // 夜间静音窗：只拦"需求自己涨上来的"（forced=主人按键/开机问候不受限）。
+  // 静默期不计冷却、不消费需求——天亮 dominance 还在阈值上就自然开口
+  if (!forced && laapInQuietWindow()) return;
   s_lastExpressMs = millis();                    // 受理即计时（失败也已占用这一轮）
   LlmMsg m[2] = {
     {"system", buildSystemPrompt()},
@@ -2117,9 +2131,7 @@ void loop() {
   // 自发独白：起始静默 idleSilenceMin 分，之后每 idleEveryMin 分一轮（0=关，后台可配）
   bool userTalking = voice.ready() &&
     ((VoiceMode)cfg.s.voiceMode == VoiceMode::Vad) && !voice.vadPaused();
-  time_t nowT = time(nullptr);                    // 深夜(23点-6点)不自发冒泡
-  bool lateNight = (nowT > 1700000000) &&
-    (localtime(&nowT)->tm_hour >= 23 || localtime(&nowT)->tm_hour < 6);
+  bool lateNight = laapInQuietWindow();           // 自发说话静音窗（后台可配，默认 23-6；v3.45 起与主动表达同门）
   uint32_t idleGap = (g_idledOnce ? cfg.s.idleEveryMin : cfg.s.idleSilenceMin) * 60000UL;
   if (cfg.s.idleEveryMin > 0 && laapSearch.available() && !userTalking && !lateNight) {
     // 独白也由需求驱动（active inference）：到点只是"可以想"，心里真有驱动才"去想"——

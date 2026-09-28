@@ -22,6 +22,8 @@ void LaapConfig::load() {
   s.threshold = 55;
   s.idleSilenceMin = 10;
   s.idleEveryMin = 20;
+  s.quietStart = 23;
+  s.quietEnd = 6;
   s.volume = 70;
   s.brightness = 90;
   s.screenOffSec = 60;
@@ -49,6 +51,8 @@ void LaapConfig::load() {
   s.threshold = prefs.getUChar("thold", 55);
   s.idleSilenceMin = prefs.getUShort("idlesil", 10);
   s.idleEveryMin   = prefs.getUShort("idleevery", 20);
+  s.quietStart     = prefs.getUChar("qstart", 23);
+  s.quietEnd       = prefs.getUChar("qend", 6);
   s.volume         = prefs.getUChar("vol", 70);
   s.brightness     = prefs.getUChar("bright", 90);
   s.screenOffSec   = prefs.getUShort("screenoff", 60);
@@ -99,6 +103,8 @@ bool LaapConfig::save() {
   prefs.putUChar("thold", s.threshold);
   prefs.putUShort("idlesil", s.idleSilenceMin);
   prefs.putUShort("idleevery", s.idleEveryMin);
+  prefs.putUChar("qstart", s.quietStart);
+  prefs.putUChar("qend", s.quietEnd);
   prefs.putUChar("vol", s.volume);
   prefs.putUChar("bright", s.brightness);
   prefs.putUShort("screenoff", s.screenOffSec);
