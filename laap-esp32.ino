@@ -2134,7 +2134,8 @@ void setup() {
   voice.begin();   // 音频管线 + 编解码器 + VAD 校准
   laapNetInit();   // 显式建网络互斥锁（懒创建 check-then-create 在两任务同进时有竞态）
   metrics.loadPrev();  // 读回上一段会话的指标快照（崩溃/自愈重启的事故现场不丢）
-  r0.begin();          // R0 微型循环处理器：储备池初始化（读出层随运行在线学）
+  r0.begin();          // R0 微型循环处理器：储备池固定重建
+  r0.loadNvs();        // 恢复读出层学习进度（打盹/断电不清零"身体直觉"，v3.50）
   // 音量 0：以前"部分保存会把音量写成 0"（哨兵 bug，已修），所以开机要钳回 30；
   // 现在 0 只可能来自明确设置（网页/CLI），再改写就等于吞掉用户的静音选择——
   // 改为只提示一句，并告诉怎么恢复（"没声音"最常见的原因就是这里被写成 0）
@@ -2316,6 +2317,7 @@ void loop() {
         Serial.println("[LAAP] 堆碎片到警戒线且闲置 → 自愈性打盹（重启换干净堆）");
         metrics.persist();     // 打盹前的失败证据必须留底
         mind.saveEvolution(true);   // 需求/情绪也留底：醒来接着睡前的状态，不"睡一觉归零"（v3.42）
+        r0.saveNvs();          // 循环处理器学习进度留底（v3.50）
         laapUptimePersist();
         delay(600);
         laapReboot("自愈打盹");
@@ -2325,7 +2327,7 @@ void loop() {
 
   // 累计运行时长：每 5 分钟落盘一次（单键写入，NVS 磨损可忽略）
   { static uint32_t s_lastUpSave = 0;
-    if (millis() - s_lastUpSave > 300000UL) { s_lastUpSave = millis(); laapUptimePersist(); metrics.persist(); } }
+    if (millis() - s_lastUpSave > 300000UL) { s_lastUpSave = millis(); laapUptimePersist(); metrics.persist(); r0.saveNvs(); } }
 
   // BOOT 键: 短按=主动表达 长按4s=配置热点 长按10s=格式化
   bool pressed = (digitalRead(BTN_PIN) == LOW);

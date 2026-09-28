@@ -1,6 +1,55 @@
 #include "laap_r0.h"
+#include <Preferences.h>
 
 LaapR0 r0;
+
+// ---- 学习进度持久化（v3.50）：magic+steps+roll+h+xPrev+pred+wOut，~148B ----
+static const uint32_t kR0Magic = 0x52304231UL;    // "R0B1"
+
+void LaapR0::saveNvs() {
+  if (!_run) return;                              // 没跑过的全新状态无可存
+  const size_t NF = N + NI + NI + NI * OUT;       // h(8)+xPrev(2)+pred(2)+wOut(22) = 34
+  uint8_t buf[8 + NF * 4];
+  size_t o = 0;
+  memcpy(buf + o, &kR0Magic, 4); o += 4;
+  uint32_t st = _steps; memcpy(buf + o, &st, 4); o += 4;
+  float ro = _roll; memcpy(buf + o, &ro, 4); o += 4;
+  for (int i = 0; i < N; i++) { float v = _h[i]; memcpy(buf + o, &v, 4); o += 4; }
+  for (int i = 0; i < NI; i++) { float v = _xPrev[i]; memcpy(buf + o, &v, 4); o += 4; }
+  for (int i = 0; i < NI; i++) { float v = _pred[i]; memcpy(buf + o, &v, 4); o += 4; }
+  for (int i = 0; i < NI; i++) for (int j = 0; j < OUT; j++) { float v = _wOut[i][j]; memcpy(buf + o, &v, 4); o += 4; }
+  Preferences p;
+  if (!p.begin("laapmtr", false)) return;
+  p.putBytes("r0", buf, o);
+  p.end();
+}
+
+bool LaapR0::loadNvs() {
+  Preferences p;
+  if (!p.begin("laapmtr", true)) return false;
+  size_t n = p.getBytesLength("r0");
+  const size_t NF = N + NI + NI + NI * OUT;
+  if (n != 8 + NF * 4) { p.end(); return false; }
+  uint8_t buf[8 + NF * 4];
+  if (p.getBytes("r0", buf, sizeof(buf)) != n) { p.end(); return false; }
+  p.end();
+  size_t o = 0;
+  uint32_t magic; memcpy(&magic, buf + o, 4); o += 4;
+  if (magic != kR0Magic) return false;
+  uint32_t st; memcpy(&st, buf + o, 4); o += 4;
+  float ro; memcpy(&ro, buf + o, 4); o += 4;
+  auto fin = [](float v) { return isfinite(v) && v > -1e3f && v < 1e3f; };
+  float h[N], xPrev[NI], pred[NI], wOut[NI][OUT];
+  for (int i = 0; i < N; i++) { float v; memcpy(&v, buf + o, 4); o += 4; if (!fin(v)) return false; h[i] = v; }
+  for (int i = 0; i < NI; i++) { float v; memcpy(&v, buf + o, 4); o += 4; if (!fin(v)) return false; xPrev[i] = v; }
+  for (int i = 0; i < NI; i++) { float v; memcpy(&v, buf + o, 4); o += 4; if (!fin(v)) return false; pred[i] = v; }
+  for (int i = 0; i < NI; i++) for (int j = 0; j < OUT; j++) { float v; memcpy(&v, buf + o, 4); o += 4; if (!fin(v)) return false; wOut[i][j] = v; }
+  for (int i = 0; i < N; i++) _h[i] = h[i];       // 全部校验通过才提交（半毒 blob 不落地）
+  for (int i = 0; i < NI; i++) { _xPrev[i] = xPrev[i]; _pred[i] = pred[i]; }
+  for (int i = 0; i < NI; i++) for (int j = 0; j < OUT; j++) _wOut[i][j] = wOut[i][j];
+  _steps = st; _roll = ro; _run = true;
+  return true;
+}
 
 void LaapR0::begin() {
   randomSeed(20260928UL);                         // 固定种子：储备池确定，行为可复现

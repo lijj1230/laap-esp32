@@ -344,10 +344,13 @@ static String parseMood(const String& l) {
 }
 
 // a 的相邻字符对（bigram）有多少出现在 b 里（中文相关性既定做法，同独白搜索词 v3.26）。
-// ≥30% 且至少 3 个 bigram 才算相关——短词/英文/高频虚词（"的""了"）凑不起比例
+// ≥30% 且至少 3 个 bigram 才算相关——短词/英文/高频虚词（"的""了"）凑不起比例。
+// 用 strstr+栈缓冲：语义召回逐行调用，每次最多 ~30 个 bigram×300 行，原 substring
+// 临时 String 会产生 ~9000 次微分配/召回（碎片化 contributors 之一）
 static bool bigramMostlyIn(const String& a, const String& b) {
   if (a.length() < 6 || b.length() < 4) return false;
   int total = 0, hit = 0;
+  const char* hay = b.c_str();
   for (unsigned int i = 0; i < a.length(); ) {
     int l1 = 1;
     unsigned char c = (unsigned char)a[i];
@@ -358,8 +361,17 @@ static bool bigramMostlyIn(const String& a, const String& b) {
     c = (unsigned char)a[j];
     if (c >= 0xF0) l2 = 4; else if (c >= 0xE0) l2 = 3; else if (c >= 0xC0) l2 = 2;
     if (j + l2 > (int)a.length()) break;
+    char buf[12];                                   // bigram 最长 8B（两个 4 字节字符），12B 富余
+    if (l1 + l2 >= (int)sizeof(buf)) { i = j; continue; }
+    bool hasNul = false;
+    for (int k = 0; k < l1 + l2; k++) {
+      buf[k] = a.c_str()[i + k];
+      if (!buf[k]) { hasNul = true; break; }        // 混进 0x00：strstr 语义会误配，跳过
+    }
+    if (hasNul) { i = j; continue; }
+    buf[l1 + l2] = 0;
     total++;
-    if (b.indexOf(a.substring(i, j + l2)) >= 0) hit++;
+    if (strstr(hay, buf) != nullptr) hit++;
     i = j;
   }
   return total >= 3 && hit * 10 >= total * 3;

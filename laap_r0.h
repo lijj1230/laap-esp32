@@ -14,6 +14,10 @@ struct LaapR0 {
   float lastErr() const { return _err; }          // 本拍归一化误差 0..1（惊讶度）
   float rollingErr() const { return _roll; }      // 滚动平均（长期惊讶水位）
   uint32_t steps() const { return _steps; }
+  // ---- 学习进度持久化（v3.50）：储备池固定种子免存，只存读出层+隐状态（~148B）。
+  // 打盹/断电不再清零"身体直觉"——醒来预测连续，惊讶只来自世界真变化（R3 语义不混入假新颖）
+  void saveNvs();                                 // "laapmtr"/"r0"（定期节拍 + 打盹前调用）
+  bool loadNvs();                                 // 开机恢复；魔数/尺寸/isfinite 校验失败=全新
 
 private:
   static const int N = 8, NI = 2, OUT = N + NI + 1;
