@@ -293,6 +293,8 @@ void LaapWeb::registerRoutes() {
   server.on("/api/relations", HTTP_GET, [this]() { handleRelationsApi(); });
   server.on("/api/relationsreflect", HTTP_POST, [this]() { handleRelationsReflect(); });
   server.on("/api/moodrelabel", HTTP_POST, [this]() { handleMoodRelabel(); });
+  server.on("/api/consc", HTTP_GET, [this]() { handleConsc(); });
+  server.on("/api/dream", HTTP_POST, [this]() { handleDream(); });
   server.onNotFound([this]() { handleNotFound(); });
   otaPending = false;
 }
@@ -1033,6 +1035,16 @@ void LaapWeb::handleMoodRelabel() {
   moodRelabel(true);   // 异步提交；结果在 /api/memory 的记忆行 "m" 字段可见
   server.send(200, "application/json",
               "{\"ok\":true,\"msg\":\"已提交情绪标注，约 10~30 秒后生效\"}");
+}
+
+void LaapWeb::handleConsc() {
+  server.send(200, "application/json", laapConscAudit());
+}
+
+void LaapWeb::handleDream() {
+  dreamReflect(true);   // 异步提交；结果在 /api/memory 以【梦】标记可见
+  server.send(200, "application/json",
+              "{\"ok\":true,\"msg\":\"已提交做梦，约 10~30 秒后写入记忆\"}");
 }
 
 void LaapWeb::handleSkillsApi() {

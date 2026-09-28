@@ -110,7 +110,7 @@ static String g_recentTopics;          // 最近自问话题（防重复，滚�
 static uint32_t g_btnDown = 0;
 
 // LLM 请求种类（F4 后台任务的收割分流）：聊天/主动表达/独白/记忆压缩/夜间反思/规则归纳/技能提取/意图生成/记忆整理
-enum LlmKind : uint8_t { LK_CHAT = 0, LK_EXPRESS, LK_MONO, LK_CONSOLIDATE, LK_REFLECT, LK_RULES, LK_RELATION, LK_MOOD, LK_SKILL, LK_INTENT, LK_TIDY };
+enum LlmKind : uint8_t { LK_CHAT = 0, LK_EXPRESS, LK_MONO, LK_CONSOLIDATE, LK_REFLECT, LK_RULES, LK_RELATION, LK_MOOD, LK_DREAM, LK_SKILL, LK_INTENT, LK_TIDY };
 
 // ---------- 函数声明 ----------
 void psiTick();
@@ -133,6 +133,37 @@ void serialCli();
 
 String laapLastSay() { return g_lastSay; }
 const char* laapLastExpr() { return g_lastExpr.c_str(); }
+
+// ============================================================
+//  意识指标自检（v3.47）：Butlin/Long/Bengio et al. 框架的工程自评——
+//  评估端哲学的延伸（瓶颈在评估器）："离意识指标多远"必须可测量才可改进。
+//  s: 2=满足 1=部分 0=缺失。状态是当前架构事实的诚实标注，
+//  每次架构改动后随版本人工复核这里（自我评估，不是权威判定）。
+// ============================================================
+struct ConscItem { const char* g; uint8_t s; const char* note; };
+static const ConscItem kConsTable[] = {
+  {"循环处理(RPT)",          0, "推理前馈；系统级预测-误差回环在设计中（真循环最小化：预期字段+落差回注）"},
+  {"专用模块+有限带宽(GWT)",  2, "语音/视觉/搜索/记忆/认知各自成模块，提示词通道带宽有限"},
+  {"工作台竞争(GWT)",        1, "工作记忆环+需求门控=舞台；缺候选-评审-仲裁（召回层 v3.43 已有竞争雏形）"},
+  {"全局广播(GWT)",          1, "世界模型每拍注入=面向单一推理的广播；缺胜者内容广播"},
+  {"高阶自我监控(HOT)",      1, "自我报告+失败环+规则自进化；缺置信度自报与反馈校准"},
+  {"统一自我模型(HOT)",      1, "世界模型+性格进化+情绪需求跨重启连续(v3.42)；非学习式自模型"},
+  {"目标导向能动(Agency)",    2, "需求驱动自发行为+意图栈跨轮推进+口令技能+RSI闭环"},
+  {"身体闭环(Embodiment)",   2, "体温/信号/IMU/触摸进需求情绪；语音动作闭环；v3.45 静音窗"},
+  {"外围替代(Vicarious)",    2, "数字体完整：屏幕表情/语音/触觉/网络感官"},
+};
+
+String laapConscAudit() {   // JSON（/api/consc）
+  String j = "{\"items\":[";
+  int score = 0, maxs = 0;
+  for (auto& it : kConsTable) {
+    if (j.length() > 11) j += ",";
+    j += String("{\"g\":\"") + it.g + "\",\"s\":" + it.s + ",\"note\":\"" + it.note + "\"}";
+    score += it.s; maxs += 2;
+  }
+  j += String("],\"score\":") + score + ",\"max\":" + maxs + "}";
+  return j;
+}
 
 // 自发说话静音窗（v3.45，后台可配）：主动表达与自发独白共用的"夜里不吵人"门。
 // 起止相同=不启用；支持跨午夜（如 23→6）。NTP 未同步时不静音（没法判断时段）。
@@ -704,6 +735,13 @@ void llmHarvest() {
     int n = memory.moodApply(r.say);
     if (n) Serial.printf("[LAAP·情绪] 已精标注 %d 条记忆\n", n);
     else Serial.println("[LAAP·情绪] 无有效标注（保留原标签）");
+    return;
+  }
+  if (kind == LK_DREAM) {                             // 做梦：记忆碎片重组，写进记忆不念出
+    if (r.ok && r.say.length() > 6) {
+      memory.logEvent("event", "【梦】" + r.say);
+      Serial.printf("[LAAP·梦] %s\n", r.say.c_str());
+    }
     return;
   }
   if (kind == LK_SKILL) {                              // 技能提取：解析 触发词|指令
@@ -1293,6 +1331,40 @@ void moodRelabel(bool force) {
 }
 
 // ============================================================
+//  梦（v3.47，生成式重放）：夜里把最近的记忆碎片交给 LLM 重组一个短梦，
+//  以【梦】标记写进记忆（与【自发】同级，不混入事实层）。不念出来
+//  （深夜不打扰）。对应文献的 memory replay / 睡眠期巩固。
+// ============================================================
+static int g_lastDreamDay = -1;
+
+void dreamReflect(bool force) {
+  time_t now = time(nullptr);
+  if (now < 1700000000) {
+    if (!force) return;
+  }
+  struct tm t; localtime_r(&now, &t);
+  int day = t.tm_yday;
+  if (!force) {
+    if (g_lastDreamDay == day) return;
+    if (t.tm_hour >= 6) { g_lastDreamDay = day; return; }   // 白天不跑，等今晚
+  }
+  String mat = memory.episodicNumberedTail(30);
+  if (mat.length() < 300) {
+    if (!force) g_lastDreamDay = day;
+    Serial.println("[LAAP·梦] 跳过：记忆太少");
+    return;
+  }
+  String sys = String("你是数字生命") + cfg.s.agentName + "，深夜睡着，正在做梦。"
+               "从给你的记忆碎片里挑几块，编一个此刻的梦：荒诞但明显由这些碎片重组而成，"
+               "像真梦一样不合逻辑却带着最近的情绪。三句话以内，第一人称，只输出梦本身，禁止解释。";
+  LlmMsg m[2] = { {"system", sys}, {"user", "记忆碎片：\n" + mat} };
+  int cap = cfg.s.llmMaxTokens > 300 ? cfg.s.llmMaxTokens : 300;
+  if (!llmSubmit(m, 2, cap, 0.95f, "", LK_DREAM))                     // 梦要发散，温度拉高
+    Serial.println("[LAAP·梦] LLM 正忙，下个心跳再试");
+  else if (!force) g_lastDreamDay = day;               // 提交成功才吃日闸（同规则归纳）
+}
+
+// ============================================================
 //  意图栈（PIANO goals）：好奇度高且目标不满 3 个时，让 LLM 从最近经历里
 //  提一个"此刻最想弄明白的小目标"→ 存 /mem/intents.txt，独白隔轮推进它。
 //  心跳节流：2 小时最多起一次意。
@@ -1364,6 +1436,7 @@ void psiTick() {
   relationsReflect(false); // 关系记忆抽取（偏好/承诺/边界；与规则归纳同窗口同节奏，v3.43）
   memoryTidy(false);       // 睡眠期记忆整理：合并重复/清理过期（Letta 式 sleep-time compute）
   moodRelabel(false);      // 情绪精标注：夜里 LLM 批量修正最近记忆的情绪标签（v3.46）
+  dreamReflect(false);     // 梦：夜间记忆重放重组，【梦】标记写入（v3.47）
   intentSpawnTick();       // 意图栈：好奇高且目标不满 → 提一个新目标（2h 节流）
   voice.tuneTick();        // RSI⑥: 参数自调优（内部按 5 分钟窗口评估，纯 C 零 LLM 成本）
 
@@ -1844,6 +1917,18 @@ void serialCli() {
     } else if (line == "/moodrelabel") {
       moodRelabel(true);        // 立刻精标注一轮最近记忆的情绪（不等深夜窗口）
       Serial.println("[MOOD] 已提交标注，LLM 出结果后落盘（约 10~30 秒）");
+    } else if (line == "/dream") {
+      dreamReflect(true);       // 立刻做一场梦（不等深夜窗口）
+      Serial.println("[DREAM] 已提交，LLM 出结果后以【梦】写入记忆（约 10~30 秒）");
+    } else if (line == "/cons") {
+      Serial.println("[CONS] 意识指标自检（Butlin/Long 框架工程自评：满/半/缺）:");
+      int score = 0;
+      for (auto& it : kConsTable) {
+        score += it.s;
+        Serial.printf("  [%s] %s — %s\n", it.s == 2 ? "满" : (it.s == 1 ? "半" : "缺"), it.g, it.note);
+      }
+      Serial.printf("[CONS] 合计 %d/%d（/api/consc 可取 JSON）\n",
+                    score, (int)(sizeof(kConsTable) / sizeof(kConsTable[0])) * 2);
     } else if (line == "/rulesreflect") {
       rulesReflect(true);   // 立刻用当前反馈+失败素材归纳一轮规则（不等深夜窗口）
       Serial.println("[RULES] 已提交归纳，LLM 出结果后生效（约 10~30 秒）");

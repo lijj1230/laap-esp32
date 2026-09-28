@@ -49,6 +49,8 @@ private:
   void handleRelationsApi();     // 关系记忆文本（偏好/承诺/边界）
   void handleRelationsReflect(); // 立刻抽一轮关系事实
   void handleMoodRelabel();      // 立刻精标注一轮记忆情绪
+  void handleConsc();            // 意识指标自检（Butlin/Long 框架工程自评）
+  void handleDream();            // 立刻做一场梦
   void handleNotFound();
 
   WebServer server{80};
@@ -74,4 +76,6 @@ String laapIdleInfo();        // 独白计时诊断（"还差多久冒泡"）
 void rulesReflect(bool force);// 立刻归纳一轮行为规则（记忆页"立刻归纳"按钮用）
 void relationsReflect(bool force); // 立刻从最近经历抽一轮关系事实（偏好/承诺/边界）
 void moodRelabel(bool force);      // 立刻精标注一轮最近记忆的情绪标签
+void dreamReflect(bool force);     // 立刻做一场梦（记忆重放重组）
+String laapConscAudit();           // 意识指标自检 JSON（由 ino 提供）
 bool laapLlmBusy();           // 后台 LLM 任务在飞（含独白/反思/整理的多步流水线）
