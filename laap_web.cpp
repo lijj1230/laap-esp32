@@ -11,6 +11,7 @@
 #include "laap_vision.h"
 #include "laap_audio.h"
 #include "laap_metrics.h"
+#include "laap_r0.h"       // R0 微型循环处理器（状态暴露）
 #include "laap_snap.h"
 #include "laap_rules.h"
 #include "laap_skills.h"
@@ -710,6 +711,8 @@ void LaapWeb::handleStatus() {
     ",\"fs_total_kb\":" + String(LittleFS.totalBytes() / 1024) +
     ",\"screen_off\":" + cfg.s.screenOffSec +
     ",\"vad_stop\":" + cfg.s.vadStopMs +
+    ",\"r0_err\":" + String(r0.rollingErr(), 2) +
+    ",\"r0_steps\":" + (uint32_t)r0.steps() +
     ",\"uptime_s\":" + String(millis() / 1000) +
     ",\"uptime_total_min\":" + String(laapUptimeMin()) +
     ",\"heap_kb\":" + String(ESP.getFreeHeap() / 1024) +

@@ -33,6 +33,16 @@ public:
   // 发现新知（active inference：好奇=不确定性下降）。gain01=新颖度 0..1
   // （1=查到全新的东西，0=全是已知），新颖越高满足越多。gain01<0 表示无法评估，不调用。
   void onDiscovery(float gain01);
+  // ---- R3 预测-误差回环（v3.48）：自发行为收尾时立一个类别化预期（五选一，
+  // 固件可判定），每拍对照观测判应验/落空，误差回注需求并进下一拍世界模型——
+  // 环路从自身的预测闭合，而不只是从主人输入闭合 ----
+  enum : uint8_t { EXP_NONE = 0, EXP_OWNER_COME, EXP_OWNER_AWAY, EXP_WORLD_ACTIVE, EXP_WORLD_QUIET };
+  void setExpectation(uint8_t cat);   // 立预期（立下时刻起算判定窗口）
+  void expectOutcome(bool fulfilled); // 固件判定结果：误差回注需求 + 留档给下一拍提示词
+  uint8_t expectation() const { return _expCat; }
+  uint32_t expectAtMs() const { return _expAtMs; }
+  String expectLine() const;          // 世界模型 JSON 片段（含上次应验/落空）
+  void noteSurprise(float s01);       // R0 循环处理器的世界预测误差（0..1）→ 好奇微抬
 
   // ---- 意图栈（PIANO goals 模块）：1~3 个持久小目标，跨轮推进（/mem/intents.txt） ----
   // 行格式 "ts|text"；独白隔轮围绕 intent[0] 推进，模型报【完成】即结算并大降好奇
@@ -90,6 +100,11 @@ private:
   Needs _n;
   Needs _savedN;                       // 上次落盘的需求快照（任一维漂移 >0.05 触发补写，v3.42）
   float _savedPl = 0.5f;
+  // R3 预测-误差回环状态
+  uint8_t _expCat = 0;                // 当前预期（0=无）
+  uint32_t _expAtMs = 0;              // 预期立下时刻
+  bool _expLast = false;              // 上次判定：true=应验
+  String _expLastTxt;                 // 上次判定的人话（"主人会来——落空了"）
   // 性格参数（进化对象）
   float _openness = 0.5f;      // 开放性：放大好奇权重
   float _sociability = 0.5f;   // 外向性：放大社交权重

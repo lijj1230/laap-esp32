@@ -46,6 +46,7 @@
 #include "laap_snap.h"      // "自我"文件快照回滚
 #include "laap_rules.h"     // 行为规则集（RSI 闭环的载体/注入）
 #include "laap_skills.h"    // 口令技能库（RSI④：主人教的 trigger→指令）
+#include "laap_r0.h"        // R0 微型循环处理器（ESN 世界预测，误差回注好奇）
 
 // ---------- 全局（定义在各模块 .cpp，头文件已 extern） ----------
 
@@ -142,10 +143,10 @@ const char* laapLastExpr() { return g_lastExpr.c_str(); }
 // ============================================================
 struct ConscItem { const char* g; uint8_t s; const char* note; };
 static const ConscItem kConsTable[] = {
-  {"循环处理(RPT)",          0, "推理前馈；系统级预测-误差回环在设计中（真循环最小化：预期字段+落差回注）"},
+  {"循环处理(RPT)",          1, "8单元ESN逐拍预测下一拍传感（权重级循环h(t)←h(t-1)，v3.48），误差=惊讶回注需求；推理内仍前馈"},
   {"专用模块+有限带宽(GWT)",  2, "语音/视觉/搜索/记忆/认知各自成模块，提示词通道带宽有限"},
-  {"工作台竞争(GWT)",        1, "工作记忆环+需求门控=舞台；缺候选-评审-仲裁（召回层 v3.43 已有竞争雏形）"},
-  {"全局广播(GWT)",          1, "世界模型每拍注入=面向单一推理的广播；缺胜者内容广播"},
+  {"工作台竞争(GWT)",        1, "工作记忆环+需求门控=舞台；表达路径已一拍三候选自评审(v3.48)，两段式仲裁待做"},
+  {"全局广播(GWT)",          1, "世界模型每拍注入+类别化预期-误差回环闭合(v3.48)；无独立仲裁器"},
   {"高阶自我监控(HOT)",      1, "自我报告+失败环+规则自进化；缺置信度自报与反馈校准"},
   {"统一自我模型(HOT)",      1, "世界模型+性格进化+情绪需求跨重启连续(v3.42)；非学习式自模型"},
   {"目标导向能动(Agency)",    2, "需求驱动自发行为+意图栈跨轮推进+口令技能+RSI闭环"},
@@ -194,9 +195,18 @@ void arisExpress(bool forced, const String& trigger) {
   // 静默期不计冷却、不消费需求——天亮 dominance 还在阈值上就自然开口
   if (!forced && laapInQuietWindow()) return;
   s_lastExpressMs = millis();                    // 受理即计时（失败也已占用这一轮）
+  // R2+R3（v3.48）：表达输出契约扩展——三候选自选 + 类别化预期。写在 user 消息里
+  // 而非共享系统提示词（聊天/独白共用后者，不能动）。全部行可缺省，解析失败回退旧契约
+  String up = buildUserPrompt("", trigger);
+  up += "\n\n[本次输出格式] 恰好如下：\n"
+        "第一行：情绪词（happy/curious/excited/lonely/anxious/tired/calm 之一）\n"
+        "第二~四行：A|、B|、C| 开头的三种不同说法（各≤40字，角度或措辞不同）\n"
+        "第五行：选定:A（或 B/C，挑最像你此刻真心想说的一条）\n"
+        "第六行：预期:主人会来|主人不来|环境有动静|环境安静|没想好（五选一）\n"
+        "除以上行外不要输出任何别的内容。";
   LlmMsg m[2] = {
     {"system", buildSystemPrompt()},
-    {"user", buildUserPrompt("", trigger)} };
+    {"user", up} };
   if (llmSubmit(m, 2, cfg.s.llmMaxTokens < 80 ? 80 : cfg.s.llmMaxTokens, 0.95f, "", LK_EXPRESS))
     display.drawFace("curious", true);           // 起意表情（后台思考中）
 }
@@ -458,7 +468,9 @@ static LlmReply monologueGenerate() {
                + (g_monoSight.length() ? String("你刚才亲眼看到：「" + g_monoSight + "」。") : "")
                + String("刚从网上查到资料：") +
                (g_monoKnow.length() ? g_monoKnow : String("（没查到，凭已有认知聊）")) +
-               "。把这个发现说给主人听，像分享趣闻，可以有具体数字或事实。"},
+               "。把这个发现说给主人听，像分享趣闻，可以有具体数字或事实。"
+               "说完另起最后一行写「预期:主人会来|主人不来|环境有动静|环境安静|没想好」"
+               "（五选一，你对接下来一小会儿的直觉预测，这行不会被念出来）。"},
     {"assistant", ctx},
     {"user", "说说你的发现。"} };
   return llm.chatMsgs(m2, 4, cfg.s.llmMaxTokens < 80 ? 80 : cfg.s.llmMaxTokens, 0.95f);
@@ -682,6 +694,15 @@ void maybeTeachExtract() {
 }
 
 // F4 收割：后台 LLM 出结果时在这里落成品（表情/记忆/进化/说话）
+// R3（v3.48）：预期中文短语 → 类别码（宽松匹配；"不来"先于"会来"判——"不会来"含"会来"）
+static uint8_t parseExpectCat(const String& s) {
+  if (s.indexOf("不来") >= 0 || s.indexOf("不会来") >= 0) return Cognition::EXP_OWNER_AWAY;
+  if (s.indexOf("会来") >= 0) return Cognition::EXP_OWNER_COME;
+  if (s.indexOf("动静") >= 0) return Cognition::EXP_WORLD_ACTIVE;
+  if (s.indexOf("安静") >= 0) return Cognition::EXP_WORLD_QUIET;
+  return Cognition::EXP_NONE;
+}
+
 void llmHarvest() {
   if (!g_llmHasNew) return;
   g_llmHasNew = false;
@@ -779,6 +800,20 @@ void llmHarvest() {
                     llm.lastError.c_str(), g_llmFailStreak);
       return;
     }
+    // R3（v3.48）：剥离尾行「预期:…」——不念出、不进记忆正文，写入认知供固件判定。
+    // 仅当尾行前还有正文时才剥（整条只剩预期行=格式失败，保留原文照常念）
+    { int nl = r.say.lastIndexOf('\n');
+      if (nl > 0) {
+        String lastLn = r.say.substring(nl + 1);
+        lastLn.trim();
+        if (lastLn.startsWith("预期:") || lastLn.startsWith("预期：")) {
+          uint8_t cat = parseExpectCat(lastLn);
+          r.say = r.say.substring(0, nl);
+          r.say.trim();
+          if (cat != Cognition::EXP_NONE) mind.setExpectation(cat);
+        }
+      }
+    }
     g_lastSay = r.say;
     g_lastExpr = r.expr.length() ? r.expr : "curious";
     mind.onMonologue();      // 自言自语也算表达/好奇被满足（原来不算 → 需求只涨不落）
@@ -813,6 +848,38 @@ void llmHarvest() {
     g_recentTopics += g_monoTopic + "；";
     if (g_recentTopics.length() > 240) g_recentTopics = g_recentTopics.substring(g_recentTopics.length() - 160);
     return;
+  }
+  // R2+R3（v3.48）：解析表达的自评审候选/选定/预期行。全部行可选——
+  // 模型没按新格式来就自动回退旧两行契约，行为不会劣化
+  if (kind == LK_EXPRESS && r.ok) {
+    String cand[3], picked;
+    uint8_t expCat = Cognition::EXP_NONE;
+    int p0 = 0;
+    while (p0 < (int)r.say.length()) {
+      int e = r.say.indexOf('\n', p0);
+      String ln = (e < 0) ? r.say.substring(p0) : r.say.substring(p0, e);
+      p0 = (e < 0) ? (int)r.say.length() : e + 1;
+      ln.trim();
+      if (ln.length() >= 3 && ln[1] == '|' && ln[0] >= 'A' && ln[0] <= 'C') {
+        String body = ln.substring(2); body.trim();
+        if (body.length() > 1) cand[ln[0] - 'A'] = body;
+      } else if (ln.startsWith("选定")) {
+        int cp = ln.indexOf(':'); if (cp < 0) cp = ln.indexOf('：');
+        if (cp >= 0) { String c = ln.substring(cp + 1); c.trim();
+          if (c.length() && c[0] >= 'A' && c[0] <= 'C') picked = c; }
+      } else if (ln.startsWith("预期")) {
+        int cp = ln.indexOf(':'); if (cp < 0) cp = ln.indexOf('：');
+        if (cp >= 0) expCat = parseExpectCat(ln.substring(cp + 1));
+      }
+    }
+    if (cand[0].length() || cand[1].length() || cand[2].length()) {
+      int pi = picked.length() ? (picked[0] - 'A') : 0;
+      if (pi < 0 || pi > 2 || !cand[pi].length())
+        pi = cand[0].length() ? 0 : (cand[1].length() ? 1 : 2);
+      r.say = cand[pi];                            // 胜者成为本次表达（广播）
+      Serial.printf("[LAAP·表达] 三候选自评审 → 选 %c（%u 字）\n", 'A' + pi, (unsigned)r.say.length());
+    }
+    if (expCat != Cognition::EXP_NONE) mind.setExpectation(expCat);
   }
   String say;
   if (r.ok) {
@@ -1444,6 +1511,31 @@ void psiTick() {
   float motion = 0;
   if (g_imuOk) motion = imuMotionLevel();
   mind.sense(motion, (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0);
+  // R0 微型循环处理器（v3.48）：逐拍预测下一拍世界传感（ESN 权重级循环），
+  // 预测误差=惊讶度 → 回注好奇。动静/信号都归一到 0..1
+  { float rq = (WiFi.RSSI() == 0) ? 0.5f : constrain((-WiFi.RSSI() - 30) / 60.0f, 0.0f, 1.0f);
+    r0.tick(constrain(motion, 0.0f, 1.0f), rq);
+    mind.noteSurprise(r0.lastErr()); }
+
+  // R3 预期判定（v3.48）：立下 ≥10 分钟按观测判应验/落空；「主人会来」被真到访即刻判定
+  { static bool s_sawMotion = false;
+    if (motion > 0.3f) s_sawMotion = true;
+    uint8_t ec = mind.expectation();
+    if (ec != Cognition::EXP_NONE) {
+      bool ownerCame = mind.lastUserMs != 0 && mind.lastUserMs >= mind.expectAtMs();
+      if (ec == Cognition::EXP_OWNER_COME && ownerCame) {
+        mind.expectOutcome(true); s_sawMotion = false;
+      } else if (millis() - mind.expectAtMs() > 600000UL) {
+        bool fulfilled = true;
+        if (ec == Cognition::EXP_OWNER_COME) fulfilled = ownerCame;
+        else if (ec == Cognition::EXP_OWNER_AWAY) fulfilled = !ownerCame;
+        else if (ec == Cognition::EXP_WORLD_ACTIVE) fulfilled = s_sawMotion;
+        else if (ec == Cognition::EXP_WORLD_QUIET) fulfilled = !s_sawMotion;
+        mind.expectOutcome(fulfilled);
+        s_sawMotion = false;
+      }
+    } else s_sawMotion = false;
+  }
   // 小凌②③: 身体感受进内核（体温/信号/时长 → 需求衰减调制）
   mind.senseBody(temperatureRead(), WiFi.RSSI(), millis(), dtMin);
   laapTrustSet(mind.trust);   // 小凌⑥: 心跳时同步回写（cfg.save() 时落 NVS）
@@ -1929,6 +2021,9 @@ void serialCli() {
       }
       Serial.printf("[CONS] 合计 %d/%d（/api/consc 可取 JSON）\n",
                     score, (int)(sizeof(kConsTable) / sizeof(kConsTable[0])) * 2);
+    } else if (line == "/r0") {
+      Serial.printf("[R0] 微型循环处理器：步数 %lu｜本拍误差 %.2f｜滚动 %.2f（对下一拍动静/信号的预测偏差=惊讶度，回注好奇）\n",
+                    (unsigned long)r0.steps(), r0.lastErr(), r0.rollingErr());
     } else if (line == "/rulesreflect") {
       rulesReflect(true);   // 立刻用当前反馈+失败素材归纳一轮规则（不等深夜窗口）
       Serial.println("[RULES] 已提交归纳，LLM 出结果后生效（约 10~30 秒）");
@@ -2032,6 +2127,7 @@ void setup() {
   voice.begin();   // 音频管线 + 编解码器 + VAD 校准
   laapNetInit();   // 显式建网络互斥锁（懒创建 check-then-create 在两任务同进时有竞态）
   metrics.loadPrev();  // 读回上一段会话的指标快照（崩溃/自愈重启的事故现场不丢）
+  r0.begin();          // R0 微型循环处理器：储备池初始化（读出层随运行在线学）
   // 音量 0：以前"部分保存会把音量写成 0"（哨兵 bug，已修），所以开机要钳回 30；
   // 现在 0 只可能来自明确设置（网页/CLI），再改写就等于吞掉用户的静音选择——
   // 改为只提示一句，并告诉怎么恢复（"没声音"最常见的原因就是这里被写成 0）

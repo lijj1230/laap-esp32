@@ -343,6 +343,42 @@ const char* Cognition::goalCn() const {
   return goals[best];
 }
 
+// ---- R3 预测-误差回环（v3.48）----
+static const char* kExpectCn[] = { "没什么可预期", "主人会来", "主人不会来", "世界将有动静", "世界会安静" };
+
+void Cognition::setExpectation(uint8_t cat) {
+  if (cat > EXP_WORLD_QUIET) cat = EXP_NONE;
+  _expCat = cat;
+  _expAtMs = millis();
+}
+
+void Cognition::expectOutcome(bool fulfilled) {
+  _expLast = fulfilled;
+  _expLastTxt = String(kExpectCn[_expCat]) + (fulfilled ? "——应验了" : "——落空了");
+  // 误差回注：预测错了才需要学——按类别把惊讶写进对应需求（小幅，稳态环自己消化）
+  if (_expCat == EXP_OWNER_COME) {
+    _n.social = min(1.0f, _n.social + (fulfilled ? -0.08f : 0.05f));  // 来了=念想落地；落空=更想念
+    if (fulfilled) trustUpdate(1, 0);
+  } else if (_expCat == EXP_OWNER_AWAY) {
+    if (!fulfilled) _n.social = min(1.0f, _n.social + 0.06f);         // 意外来人=惊喜
+  } else if (_expCat == EXP_WORLD_ACTIVE || _expCat == EXP_WORLD_QUIET) {
+    if (!fulfilled) _n.curiosity = min(1.0f, _n.curiosity + 0.05f);   // 世界不按预想走=好奇
+  }
+  _expCat = EXP_NONE;                            // 评估完清空，等下次自发行为再立
+}
+
+void Cognition::noteSurprise(float s01) {
+  if (s01 < 0) s01 = 0;
+  if (s01 > 1) s01 = 1;
+  _n.curiosity += 0.02f * s01 * (1.0f - _n.curiosity);   // 惊讶→好奇微抬（稳态环消化）
+}
+
+String Cognition::expectLine() const {
+  String s = String("\"expect\":\"") + kExpectCn[_expCat] + "\"";
+  if (_expLastTxt.length()) s += String(",\"expect_last\":\"") + _expLastTxt + "\"";
+  return s;
+}
+
 // ================= 世界模型 =================
 String Cognition::worldJson() const {
   time_t now = time(nullptr);
@@ -366,7 +402,7 @@ String Cognition::worldJson() const {
          ",\"security\":" + String(_n.security, 2) +
          ",\"expression\":" + String(_n.expression, 2) +
          "},\"trust\":" + String(trust, 2) +
-         ",\"mood\":\"" + moodKey() + "\",\"goal\":\"" + goalCn() + "\"}";
+         "," + expectLine() + ",\"mood\":\"" + moodKey() + "\",\"goal\":\"" + goalCn() + "\"}";
 }
 
 String Cognition::traitsLine() const {
