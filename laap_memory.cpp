@@ -554,6 +554,15 @@ int MemorySystem::relationsApply(const String& llmText) {
   }
   File f = LittleFS.open(REL_PATH, "a");
   if (!f) return 0;
+  // 残尾修复（同 begin() 对 episodes 的处理）：半写行无换行，直接追加会拼成损坏行
+  {
+    File rf = LittleFS.open(REL_PATH, "r");
+    if (rf) {
+      size_t sz = rf.size();
+      if (sz) { rf.seek(sz - 1); if (rf.read() != '\n') f.print('\n'); }
+      rf.close();
+    }
+  }
   int added = 0, start = 0;
   while (start < (int)llmText.length()) {
     int e = llmText.indexOf('\n', start);
@@ -563,25 +572,30 @@ int MemorySystem::relationsApply(const String& llmText) {
     if (ln.length() > 1 && ln[0] == '-') { ln = ln.substring(1); ln.trim(); }  // 容忍 "- " 列表符
     int bar = ln.indexOf('|');
     if (bar <= 0) continue;
-    String k = ln.substring(0, bar); k.trim();
+    String k = sanitizeUtf8(ln.substring(0, bar));   // 类型段同样清洗（v3.49 审计：原来裸进文件）
+    k.trim();
+    k = utf8Cut(k, 12);
     String x = sanitizeUtf8(ln.substring(bar + 1));
     x.trim();
     x = utf8Cut(x, 80);
     // 类型宽容匹配（模型可能输出 "1.偏好" / "-偏好" 这类前缀）
     if (k.indexOf("偏好") < 0 && k.indexOf("承诺") < 0 && k.indexOf("边界") < 0) continue;
-    if (x.length() < 6 || existing.indexOf(x) >= 0) continue;   // 太短/已知的不记
+    if (x.length() < 6 || existing.indexOf(relJsonEsc(x)) >= 0) continue;   // 太短/已知的不记（比转义形态，含引号条目也能去重）
     time_t now = time(nullptr);
     f.printf("{\"t\":%lu,\"k\":\"%s\",\"x\":\"%s\"}\n",
-             (unsigned long)(now > 1700000000 ? (uint32_t)now : 0), k.c_str(), relJsonEsc(x).c_str());
+             (unsigned long)(now > 1700000000 ? (uint32_t)now : 0), relJsonEsc(k).c_str(), relJsonEsc(x).c_str());
     existing += x + "\n";    // 本轮后面的行也照常去重
     lines++; added++;
   }
   f.close();
   if (lines > REL_MAX) {     // 封顶：只留最近 REL_MAX 条（tmp+rename 原子替换）
     File in = LittleFS.open(REL_PATH, "r");
+    if (!in) return added;                  // 打不开就别动正式文件（防空文件转正=清库）
     String keep; int n2 = 0;
     while (in && in.available()) {
       String l = in.readStringUntil('\n');
+      String k2, x2;
+      if (!l.length() || !relParseLine(l, k2, x2)) continue;   // 顺手丢掉残尾/损坏行
       if (l.length()) { keep += l + "\n"; if (++n2 > REL_MAX) { keep = keep.substring(keep.indexOf('\n') + 1); n2--; } }
     }
     if (in) in.close();
@@ -664,26 +678,27 @@ int MemorySystem::moodApply(const String& llmText) {
     ln[nMap] = (int)no; mo[nMap] = mood; nMap++;
   }
   if (!nMap) return 0;
+  // 流式重写：逐行读→命中映射就地改写→写 tmp——不整份入堆（300 行可到 60-90KB，
+  // 夜间堆碎片化时不该再吃这么大块）。trim 后判空与编号口径一致（episodicNumberedTail），
+  // 非空行数不变 → emb.bin 行序对齐不破
+  laapSnapMake("episodes", false);               // 重写前拍快照（与淘汰/强化/整理同级安全网；v3.49 审计补）
   File in = LittleFS.open(EP_PATH, "r");
   if (!in) return 0;
-  std::vector<String> lines;
-  while (in.available()) {
-    String l = in.readStringUntil('\n');
-    if (l.length()) lines.push_back(l);           // 与编号口径一致：只数非空行
-  }
-  in.close();
-  int applied = 0;
-  for (int i = 0; i < nMap; i++) {
-    int idx = ln[i] - 1;
-    if (idx < 0 || idx >= (int)lines.size()) continue;
-    if (setLineMood(lines[idx], mo[i])) applied++;
-  }
-  if (!applied) return 0;
   String tmpPath = String(EP_PATH) + ".tmp";
   File w = LittleFS.open(tmpPath, "w");
-  if (!w) return 0;
-  for (auto& l : lines) { w.print(l); w.print('\n'); }
-  w.close();
+  if (!w) { in.close(); return 0; }
+  int lineno = 0, applied = 0;
+  while (in.available()) {
+    String l = in.readStringUntil('\n');
+    l.trim();
+    if (!l.length()) continue;
+    lineno++;
+    for (int i = 0; i < nMap; i++)
+      if (ln[i] == lineno && setLineMood(l, mo[i])) applied++;
+    w.print(l); w.print('\n');
+  }
+  in.close(); w.close();
+  if (!applied) { LittleFS.remove(tmpPath); return 0; }
   LittleFS.remove(EP_PATH);
   LittleFS.rename(tmpPath.c_str(), EP_PATH);
   return applied;

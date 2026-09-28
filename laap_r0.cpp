@@ -11,11 +11,34 @@ void LaapR0::begin() {
   }
   for (int o = 0; o < NI; o++)
     for (int j = 0; j < OUT; j++) _wOut[o][j] = 0.0f;   // 读出层从零学起
+  // 幂迭代估谱半径并归一化到 0.9——"回声态"从断言变成构造性保证（v3.49 审计补）
+  {
+    float v[N];
+    for (int i = 0; i < N; i++) v[i] = 1.0f;
+    float rho = 0;
+    for (int it = 0; it < 12; it++) {
+      float w[N], n2 = 0;
+      for (int i = 0; i < N; i++) {
+        float s = 0;
+        for (int j = 0; j < N; j++) s += _wRes[i][j] * v[j];
+        w[i] = s; n2 += s * s;
+      }
+      n2 = sqrtf(n2);
+      if (n2 < 1e-6f) break;
+      rho = n2;
+      for (int i = 0; i < N; i++) v[i] = w[i] / n2;
+    }
+    if (rho > 1e-6f) {
+      float sc = 0.9f / rho;
+      for (int i = 0; i < N; i++) for (int j = 0; j < N; j++) _wRes[i][j] *= sc;
+    }
+  }
   _run = false; _err = _roll = 0; _steps = 0;
 }
 
 void LaapR0::tick(float motion01, float rssi01) {
   float x[NI] = { constrain(motion01, 0.0f, 1.0f), constrain(rssi01, 0.0f, 1.0f) };
+  if (!isfinite(x[0]) || !isfinite(x[1])) return;  // 异常输入不进状态（防 NaN 毒化权重）
   if (!_run) {                                    // 首拍：无预测可评，只建状态
     memcpy(_xPrev, x, sizeof(x));
     _run = true;

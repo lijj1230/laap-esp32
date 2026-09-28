@@ -236,15 +236,19 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
     lastError = "响应 content 为空（思考模型吃满 max_tokens？把单次回复上限调大试试）";
     return r;
   }
-  // 期望两行: 表情词\n要说的话（宽松解析）
+  // 期望两行: 表情词\n要说的话（宽松解析）。首行**确实是**情绪词才剥——
+  // 夜间清单/梦的多行输出首行是非情绪词正文，曾被无条件吞掉（v3.49 审计修复：
+  // 关系抽取每晚必丢第一条、情绪标注丢首条映射、梦丢首句，全部静默）
   content.trim();
   int nl = content.indexOf('\n');
   if (nl > 0) {
     String e = content.substring(0, nl); e.trim(); e.toLowerCase();
     e.replace(" ", ""); e.replace(",", ""); e.replace("。", "");
     if (e == "happy" || e == "curious" || e == "excited" || e == "lonely" ||
-        e == "anxious" || e == "tired" || e == "calm") r.expr = e;
-    r.say = content.substring(nl + 1);
+        e == "anxious" || e == "tired" || e == "calm") {
+      r.expr = e;
+      r.say = content.substring(nl + 1);
+    }
   }
   if (r.expr.length() == 0) r.expr = "calm";
   if (r.say.length() == 0) r.say = content;

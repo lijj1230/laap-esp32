@@ -103,7 +103,6 @@ private:
   // R3 预测-误差回环状态
   uint8_t _expCat = 0;                // 当前预期（0=无）
   uint32_t _expAtMs = 0;              // 预期立下时刻
-  bool _expLast = false;              // 上次判定：true=应验
   String _expLastTxt;                 // 上次判定的人话（"主人会来——落空了"）
   // 性格参数（进化对象）
   float _openness = 0.5f;      // 开放性：放大好奇权重

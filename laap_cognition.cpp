@@ -194,6 +194,8 @@ void Cognition::resetEvolution() {
   _gen = 0; _cycles = 0; _chats = 0;
   _n = Needs();                        // "整个人重来"连需求/情绪一起归零（否则旧值会被写回盘）
   _pleasure = 0.5f;
+  _expCat = EXP_NONE;                  // R3 预期残留一并清（否则上一世的 expect_last 进提示词）
+  _expLastTxt = "";
   saveEvolution(true);
 }
 
@@ -353,14 +355,15 @@ void Cognition::setExpectation(uint8_t cat) {
 }
 
 void Cognition::expectOutcome(bool fulfilled) {
-  _expLast = fulfilled;
   _expLastTxt = String(kExpectCn[_expCat]) + (fulfilled ? "——应验了" : "——落空了");
   // 误差回注：预测错了才需要学——按类别把惊讶写进对应需求（小幅，稳态环自己消化）
   if (_expCat == EXP_OWNER_COME) {
-    _n.social = min(1.0f, _n.social + (fulfilled ? -0.08f : 0.05f));  // 来了=念想落地；落空=更想念
+    _n.social += (fulfilled ? -0.08f : 0.05f);    // 来了=念想落地；落空=更想念
+    if (_n.social < 0.05f) _n.social = 0.05f;     // 双侧钳（单侧 min 会瞬时出负需求）
+    if (_n.social > 1) _n.social = 1;
     if (fulfilled) trustUpdate(1, 0);
   } else if (_expCat == EXP_OWNER_AWAY) {
-    if (!fulfilled) _n.social = min(1.0f, _n.social + 0.06f);         // 意外来人=惊喜
+    if (!fulfilled) _n.social = min(1.0f, _n.social + 0.06f);   // 意外来人=意外之喜激发交流欲（想多聊）
   } else if (_expCat == EXP_WORLD_ACTIVE || _expCat == EXP_WORLD_QUIET) {
     if (!fulfilled) _n.curiosity = min(1.0f, _n.curiosity + 0.05f);   // 世界不按预想走=好奇
   }

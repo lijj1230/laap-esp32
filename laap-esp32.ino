@@ -694,8 +694,10 @@ void maybeTeachExtract() {
 }
 
 // F4 收割：后台 LLM 出结果时在这里落成品（表情/记忆/进化/说话）
-// R3（v3.48）：预期中文短语 → 类别码（宽松匹配；"不来"先于"会来"判——"不会来"含"会来"）
+// R3（v3.48）：预期中文短语 → 类别码（宽松匹配；"不来"先于"会来"判——"不会来"含"会来"；
+// 同时含两者=整串菜单回显没选题，不判）
 static uint8_t parseExpectCat(const String& s) {
+  if (s.indexOf("会来") >= 0 && s.indexOf("不来") >= 0) return Cognition::EXP_NONE;
   if (s.indexOf("不来") >= 0 || s.indexOf("不会来") >= 0) return Cognition::EXP_OWNER_AWAY;
   if (s.indexOf("会来") >= 0) return Cognition::EXP_OWNER_COME;
   if (s.indexOf("动静") >= 0) return Cognition::EXP_WORLD_ACTIVE;
@@ -852,7 +854,7 @@ void llmHarvest() {
   // R2+R3（v3.48）：解析表达的自评审候选/选定/预期行。全部行可选——
   // 模型没按新格式来就自动回退旧两行契约，行为不会劣化
   if (kind == LK_EXPRESS && r.ok) {
-    String cand[3], picked;
+    String cand[3], picked, rest;
     uint8_t expCat = Cognition::EXP_NONE;
     int p0 = 0;
     while (p0 < (int)r.say.length()) {
@@ -860,6 +862,7 @@ void llmHarvest() {
       String ln = (e < 0) ? r.say.substring(p0) : r.say.substring(p0, e);
       p0 = (e < 0) ? (int)r.say.length() : e + 1;
       ln.trim();
+      if (!ln.length()) continue;
       if (ln.length() >= 3 && ln[1] == '|' && ln[0] >= 'A' && ln[0] <= 'C') {
         String body = ln.substring(2); body.trim();
         if (body.length() > 1) cand[ln[0] - 'A'] = body;
@@ -870,6 +873,8 @@ void llmHarvest() {
       } else if (ln.startsWith("预期")) {
         int cp = ln.indexOf(':'); if (cp < 0) cp = ln.indexOf('：');
         if (cp >= 0) expCat = parseExpectCat(ln.substring(cp + 1));
+      } else {
+        rest = rest.length() ? rest + "\n" + ln : ln;   // 非元行都留作回退正文
       }
     }
     if (cand[0].length() || cand[1].length() || cand[2].length()) {
@@ -878,6 +883,8 @@ void llmHarvest() {
         pi = cand[0].length() ? 0 : (cand[1].length() ? 1 : 2);
       r.say = cand[pi];                            // 胜者成为本次表达（广播）
       Serial.printf("[LAAP·表达] 三候选自评审 → 选 %c（%u 字）\n", 'A' + pi, (unsigned)r.say.length());
+    } else if (rest.length()) {
+      r.say = rest;   // 候选标记走样时至少把「选定/预期」元行剥掉再广播（v3.49 审计）
     }
     if (expCat != Cognition::EXP_NONE) mind.setExpectation(expCat);
   }
@@ -1522,7 +1529,7 @@ void psiTick() {
     if (motion > 0.3f) s_sawMotion = true;
     uint8_t ec = mind.expectation();
     if (ec != Cognition::EXP_NONE) {
-      bool ownerCame = mind.lastUserMs != 0 && mind.lastUserMs >= mind.expectAtMs();
+      bool ownerCame = mind.lastUserMs != 0 && (int32_t)(mind.lastUserMs - mind.expectAtMs()) >= 0;  // 差值比较回绕安全
       if (ec == Cognition::EXP_OWNER_COME && ownerCame) {
         mind.expectOutcome(true); s_sawMotion = false;
       } else if (millis() - mind.expectAtMs() > 600000UL) {
