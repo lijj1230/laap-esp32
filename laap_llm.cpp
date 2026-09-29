@@ -155,26 +155,29 @@ static WiFiClient* connAcquire(LlmKeepConn& slot, const String& host, int port,
   return c;
 }
 
-// 归还连接：clean=本次响应按帧干净结束。新建连接干净结束且槽位空 → 收养供下次复用
+// 归还连接：clean=本次响应按帧干净结束。新建连接干净结束且槽位空 → 收养供下次复用。
+// c 的生命周期在本函数内一次性处置（v3.56 审计修 P0：原实现对"复用且不干净"先在槽位
+// 里 delete、尾部又按 keep=false 再 delete 同一指针 = 双重 delete/堆损坏）。
+// 锁用 portMAX_DELAY：持锁段只有 10ms 探测与 stop，有界；拿不到锁就删会让槽位悬垂。
 static void connFinish(LlmKeepConn& slot, WiFiClient* c, bool clean,
                        const String& host, int port, bool tls) {
   if (!c) return;
-  bool keep = false;
-  if (s_connMtx && xSemaphoreTake(s_connMtx, pdMS_TO_TICKS(100)) == pdTRUE) {
-    if (c == slot.c) {                       // 复用的那条
+  bool owned = false;                       // true=锁内已处置完毕，尾部不再动
+  if (s_connMtx && xSemaphoreTake(s_connMtx, portMAX_DELAY) == pdTRUE) {
+    if (c == slot.c) {                      // 复用的那条：干净与否都已在槽位处置
       slot.inUse = false;
       if (clean) slot.lastUse = millis();
       else { slot.c->stop(); delete slot.c; slot.c = nullptr; }
-      keep = clean;
+      owned = true;
     } else if (clean && !slot.c && !slot.inUse) {   // 新建干净 + 槽位空 → 收养
       slot.c = c; slot.inUse = false;
       slot.host = host; slot.port = port; slot.tls = tls;
       slot.lastUse = millis();
-      keep = true;
+      owned = true;
     }
     xSemaphoreGive(s_connMtx);
   }
-  if (!keep) { c->stop(); delete c; }
+  if (!owned) { c->stop(); delete c; }      // 只有"新建且未收养"走这里
 }
 
 // HTTP 响应按帧精确读取（全仓唯一实现：v3.55 的 chat/embed 读法推广到 search/vision/
@@ -194,7 +197,7 @@ bool laapHttpRead(WiFiClient* c, uint32_t timeoutMs, String& hdrs, String& paylo
   if (!hdrs.endsWith("\r\n\r\n")) return false;
 
   String low = hdrs; low.toLowerCase();                // 头字段统一小写后检索（锚定行首，防 X-Content-Length 之类误匹配）
-  bool srvClose = low.indexOf("\nconnection: close") >= 0;
+  bool srvClose = low.indexOf("\nconnection: close") >= 0 || low.indexOf("\nconnection:close") >= 0;
   bool chunked = false;
   { int i = low.indexOf("\ntransfer-encoding:");
     if (i >= 0 && low.indexOf("chunked", i) >= 0) chunked = true; }

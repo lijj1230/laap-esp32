@@ -281,6 +281,15 @@ static String g_chatSearchErr;                        // 失败原因（failNote
 // 视觉阶段一（v3.54）：同上发布纪律；1=看到（直答成品） 0=没看成（已自动转普通聊天兜底）
 static volatile int8_t g_chatLookState = -1;
 static String g_chatLookErr;                          // 视觉失败原因（failNote 素材）
+// 收割快照（v3.56 审计）：随结果同代发布。原实现在下一请求出队时就复位这些变量，
+// 上一代结果未收割时被覆盖 → 失败被当成功结算、网页答案串台、端到端延迟采到近零样本
+static volatile int8_t g_resSearchState = -1;
+static String g_resSearchErr;
+static volatile int8_t g_resLookState = -1;
+static String g_resLookErr;
+static String g_resUserText;                          // 随结果发布的"当时主人问了什么"
+static uint32_t g_resChatStartMs = 0;                 // 同代端到端计时起点
+static uint32_t g_resLookStartMs = 0;
 static uint32_t g_lookStartMs = 0;                    // 视觉受理时刻（rspDir 口径）
 static uint8_t g_llmFailStreak = 0;                   // LLM 连续失败次数（≥2 独白让路）
 // 后台 LLM 是否在飞（含独白/反思/整理——多步流水线一跑就是几十秒）。
@@ -540,6 +549,10 @@ static void llmTaskFunc(void*) {
       }
       rr = llm.chatMsgs(req->msgs, req->nm, req->maxTokens, req->temperature);
     }
+    g_resSearchState = g_chatSearchState; g_resSearchErr = g_chatSearchErr;
+    g_resLookState = g_chatLookState;     g_resLookErr = g_chatLookErr;
+    g_resUserText = g_pendingUserText;
+    g_resChatStartMs = g_chatStartMs; g_resLookStartMs = g_lookStartMs;
     g_resultKind = req->kind;
     g_llmResult = rr;
     g_llmBusy = false;
@@ -779,21 +792,20 @@ void llmHarvest() {
   g_llmHasNew = false;
   LlmReply r = g_llmResult;
   uint8_t kind = g_resultKind;
-  if (kind == LK_LOOK && g_chatLookState == 0) {      // 没看成：已按普通聊天兜底（v3.54），按聊天结算
+  if (kind == LK_LOOK && g_resLookState == 0) {       // 没看成：已按普通聊天兜底（v3.54），按聊天结算
     metrics.vision(false);
-    metrics.failNote(String("视觉: ") + g_chatLookErr);
-    memory.logEvent("user", g_pendingUserText);
+    metrics.failNote(String("视觉: ") + g_resLookErr);
+    memory.logEvent("user", g_resUserText);
     kind = LK_CHAT;
   }
-  if (g_chatSearchState >= 0) {   // 本轮带搜索（v3.53 阶段一）：计数移回 loopTask（metrics 不跨任务写）
-    metrics.search(g_chatSearchState == 1);
-    if (g_chatSearchState == 0) metrics.failNote(String("搜索: ") + g_chatSearchErr);
-    g_chatSearchState = -1;
+  if (g_resSearchState >= 0) {    // 本轮带搜索（v3.53 阶段一）：计数移回 loopTask（metrics 不跨任务写）
+    metrics.search(g_resSearchState == 1);
+    if (g_resSearchState == 0) metrics.failNote(String("搜索: ") + g_resSearchErr);
   }
   if (kind != LK_LOOK) {              // 看见直答不是 LLM 调用：不计 llm 指标（v3.54）
     metrics.llm(r.ok);   // 后台 LLM 成败（含独白/反思/压缩：服务商健康度的总信号）
     if (!r.ok) metrics.failNote(String("LLM: ") + llm.lastError);   // 规则归纳的失败素材
-    g_llmFailStreak = r.ok ? 0 : (uint8_t)(g_llmFailStreak + 1);   // 退避计数（独白据此让路）
+    g_llmFailStreak = r.ok ? 0 : (uint8_t)(g_llmFailStreak >= 255 ? 255 : g_llmFailStreak + 1);   // 退避计数（饱和防回绕，独白据此让路）
   }
   if (kind == LK_CONSOLIDATE) {                        // 记忆压缩：只更新自我认知，不说话
     if (r.ok && r.say.length() > 10) {
@@ -884,11 +896,13 @@ void llmHarvest() {
   }
   if (kind == LK_LOOK) {                              // 看见：视觉直答结算（v3.54 阶段一下沉）
     metrics.vision(true);
-    metrics.rspDir(millis() - g_lookStartMs);
+    metrics.rspDir(millis() - g_resLookStartMs);
     vision.logSight(r.say);
     g_lastSay = r.say; g_lastExpr = r.expr.length() ? r.expr : "curious";
     g_chatReply = r.say; g_chatSeq++;                // 网页轮询取件闭环（受理→成品）
-    memory.logEvent("user", g_pendingUserText);
+    g_chatPending = false;                           // 成品即不再 pending（v3.56 审计：看图成功分支原漏清，
+                                                     // 体检门与自愈打盹门被永久卡住）
+    memory.logEvent("user", g_resUserText);
     memory.logEvent("aris", r.say);
     laapActivity();
     Serial.printf("[Aris·看] %s\n", r.say.c_str());
@@ -1001,7 +1015,7 @@ void llmHarvest() {
     display.drawFace(r.expr.c_str());
     mind.onExpressed(true);
     if (kind == LK_CHAT) {
-      mind.evolveAfterChat(g_pendingUserText.length());  // 表达不进化
+      mind.evolveAfterChat(g_resUserText.length());      // 表达不进化（同代快照）
       mind.trustUpdate(1, 0);                            // 小凌⑥: 有问必答=正向互动
     }
   } else {
@@ -1029,7 +1043,7 @@ void llmHarvest() {
     g_chatReply = say; g_chatSeq++;   // 聊天成品：网页轮询取件
     g_chatPending = false;            // 成品即不再 pending——原来忘了清，网页没取件就一直
                                       // 占着互斥门，后台体检永远报"LLM 正忙"（实测挂一整夜）
-    metrics.rspLlm(millis() - g_chatStartMs);   // 提问→成品端到端（含排队）
+    metrics.rspLlm(millis() - g_resChatStartMs);   // 提问→成品端到端（含排队，同代快照）
   }
   laapActivity();                                            // 它开口说话=活动
   // 自发表达带【自发】标记：后台记忆页要能一眼区分"它主动说的"和"对话回复"
@@ -1053,7 +1067,7 @@ bool arisIdleMonologue() {
   }
   // 必须在清快照之前拦：上一轮 LK_MONO 还在后台跑时，llmTask 正在写 g_monoTopic/
   // g_monoKnow 这批 String——先清后查会构成跨任务写写竞争（String 撕裂=堆损坏）
-  if (laapLlmBusy()) {
+  if (laapLlmBusy() || g_llmHasNew) {   // 未收割的上一代独白中间产物还等着收割侧读，不能清
     Serial.println("[LAAP·独白] LLM 忙，本轮不提交");
     return false;
   }
@@ -1238,7 +1252,7 @@ String buildUserPrompt(const String& userText) {
   int top = 0;
   for (int i = 1; i < 5; i++) if (v[i] > v[top]) top = i;
   // 只有需求真的"渴"时才给语气指引：全都很低时还提示"慵懒"会让模型干脆不答话
-  if (v[top] < 0.45f) p += "[状态提示] 状态平稳，正常回应就好。\n";
+  if (v[top] < 0.60f) p += "[状态提示] 状态平稳，正常回应就好。\n";   // 0.60 与 system 侧平静门同阈（v3.56 审计对齐）
   else                p += String("[状态提示] ") + hint[top] + "。\n";
   // F6 联想回忆：25% 概率让一段旧事漂进此刻（意识流）
   if (userText.length() && (esp_random() % 100) < 25) {
@@ -1374,7 +1388,6 @@ void nightlyReflect(bool force) {
     Serial.printf("[LAAP·反思] 跳过：近期记忆只有 %u 字节（<80，没素材）\n", (unsigned)recent.length());
     return;
   }
-  if (!force) g_lastReflectDay = day;
   Serial.printf("[LAAP·反思] 开始复盘（素材 %u 字节）…\n", (unsigned)recent.length());
 
   String sys = String("你是") + cfg.s.agentName + "。深夜，你在复盘自己的一天。"
@@ -1384,8 +1397,12 @@ void nightlyReflect(bool force) {
   // 反思要"想清楚再写"，思考型模型（v4 系）在小预算下会把额度全花在推理上、正文返回空
   // （实测 160/320/640 全空）。起步就给足，再靠 llm 内部的翻倍重试兜底。
   int cap = cfg.s.llmMaxTokens > 1000 ? cfg.s.llmMaxTokens : 1000;
-  if (!llmSubmit(m, 2, cap, 0.8f, LK_REFLECT))   // 忙就放弃（明天再说）
-    Serial.println("[LAAP·反思] LLM 正忙，本次放弃");
+  // 日闸在提交成功后才吃（v3.56 审计：原来提交前就消费，跨 0 点恰逢 LLM 忙=当晚反思静默丢失）
+  if (llmSubmit(m, 2, cap, 0.8f, LK_REFLECT)) {
+    if (!force) g_lastReflectDay = day;
+  } else {
+    Serial.println("[LAAP·反思] LLM 正忙，本次放弃（下个心跳再试）");
+  }
 }
 
 // ============================================================
@@ -2086,9 +2103,15 @@ void serialCli() {
       if (arisIdleMonologue()) Serial.println("[LAAP·独白] 已提交，等后台出结果（约 10~30 秒）");
     } else if (line.startsWith("/nothink")) {
       String a = line.substring(8); a.trim();
-      if (a.length()) { cfg.s.llmNoThink = (a.toInt() != 0) ? 1 : 0; cfg.save(); }
-      Serial.printf("[LLM] 关闭思考 = %s（请求里%s带 thinking:disabled）\n",
-                    cfg.s.llmNoThink ? "开" : "关", cfg.s.llmNoThink ? "" : "不");
+      bool digits = a.length() > 0;
+      for (unsigned int ni = 0; ni < a.length() && digits; ni++) if (!isDigit(a[ni])) digits = false;
+      if (!digits) { Serial.println("[LLM] 用法：/nothink 0|1（非数字不写配置）"); }
+      else {
+        cfg.s.llmNoThink = (a.toInt() != 0) ? 1 : 0;
+        cfg.save();
+        Serial.printf("[LLM] 关闭思考 = %s（请求里%s带 thinking:disabled）\n",
+                      cfg.s.llmNoThink ? "开" : "关", cfg.s.llmNoThink ? "" : "不");
+      }
     } else if (line == "/reflect") {
       nightlyReflect(true);          // 立刻做一次夜间反思（不等 0-5 点窗口）
     } else if (line == "/metrics") {

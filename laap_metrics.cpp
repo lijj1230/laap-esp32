@@ -14,7 +14,6 @@ LaapMetrics metrics;
 bool LaapMetrics::feedback(int v, const String& user, const String& reply) {
   File f = LittleFS.open("/mem/feedback.jsonl", "a");
   if (!f) { Serial.println("[METRICS] 反馈落盘失败（feedback.jsonl 打不开）"); return false; }
-  if (v > 0) fbUp++; else fbDown++;   // 计数移到落盘成功之后（v3.51：写失败也计数=永久偏差）
   time_t now = time(nullptr);
   String line = String("{\"t\":") + (now > 1600000000 ? String((long)now) : String("-1")) +
                 ",\"v\":" + v +
@@ -23,6 +22,7 @@ bool LaapMetrics::feedback(int v, const String& user, const String& reply) {
   line += "\"}\n";
   bool ok = f.print(line) == line.length();
   f.close();
+  if (ok) { if (v > 0) fbUp++; else fbDown++; }   // 计数在落盘成功后（v3.56 审计：代码与注释不符，写失败虚高）
   if (ok && LittleFS.exists("/mem/feedback.jsonl")) {
     File s = LittleFS.open("/mem/feedback.jsonl", "r");
     size_t sz = s ? s.size() : 0;

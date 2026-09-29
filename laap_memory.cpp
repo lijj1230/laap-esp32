@@ -33,9 +33,14 @@ bool MemorySystem::begin() {
         f = LittleFS.open(EP_PATH, "r");
         String all = f.readString();
         f.close();
-        int cut = all.lastIndexOf('\n');
-        File w = LittleFS.open(EP_PATH, "w");
-        if (w) { if (cut >= 0) w.print(all.substring(0, cut + 1)); w.close(); }
+        if (all.length() == 0) {
+          // readString 失败（堆紧张）返回空串：此时照常截断会把整份记忆清空——保原文件（v3.56 审计）
+          Serial.println("[MEM] 残尾修复读取失败，跳过（防误清）");
+        } else {
+          int cut = all.lastIndexOf('\n');
+          File w = LittleFS.open(EP_PATH, "w");
+          if (w) { if (cut >= 0) w.print(all.substring(0, cut + 1)); w.close(); }
+        }
         Serial.println("[MEM] 修复掉电残尾：截断未写完的最后一行");
       }
     }
@@ -448,7 +453,7 @@ String MemorySystem::recallSmart(const String& query, int maxChars) {
     int xp = hits[best].line.indexOf("\"x\":\"");
     if (xp >= 0) {
       x = hits[best].line.substring(xp + 5);
-      x.replace("\\n", " "); x.replace("\\\"", "\"");
+      x.replace("\\n", " "); x.replace("\\t", " "); x.replace("\\\"", "\"");   // \t 转义是 v3.56 转义收敛后的新形态
       int xe = x.lastIndexOf('"');
       if (xe > 0) x = x.substring(0, xe);
       x = sanitizeUtf8(x);
@@ -918,6 +923,7 @@ void MemorySystem::clearAll() {
   LittleFS.remove("/evolution.json");
   LittleFS.remove(EMB_PATH);              // 向量缓存一并清，否则旧向量错配新记忆
   LittleFS.remove(REL_PATH);              // 关系记忆也是"自我"：清空后 40 条偏好/承诺仍在盘上并继续进提示词（v3.51 审计）
+  LittleFS.remove("/mem/intents.txt");    // 意图栈也是记忆（v3.56 审计：出厂重置漏了它，重启后旧目标继续驱动独白）
   _count = 0; _workLen = 0; _workHead = 0;
   _embCount = 0; _embFail = 0;
 }
@@ -997,7 +1003,7 @@ bool MemorySystem::applyImport(String& msg) {
       continue;
     }
     if (!l.length()) continue;
-    if (section == 1) { semBuf += l; nSem++; }
+    if (section == 1) { semBuf += l; semBuf += '\n'; nSem++; }   // v3.56 审计：原来无分隔，多行自我认知被拼成一行
     else if (section == 2) { epsTmp.print(l); epsTmp.print('\n'); nEps++; }
     else if (section == 3) { evoBuf += l; nEvo++; }
     else if (section == 4) { relBuf += l; relBuf += '\n'; nRel++; }

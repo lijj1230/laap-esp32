@@ -26,7 +26,8 @@ static int rd(uint8_t reg, uint8_t* buf, int n) {
   if (Wire.endTransmission(false) != 0) return -1;
   if (Wire.requestFrom((int)QMI_ADDR, n) != n) return -2;
   for (int i = 0; i < n; i++) buf[i] = Wire.read();   // 必须读出：否则残留数据污染下次读取
-  Wire.endTransmission(true);
+  // v3.56 审计：requestFrom 已发 STOP，再补 endTransmission(true) 是一次空写事务
+  // （laap_touch v3.51 同款结论已移除），删。
   return 0;
 }
 

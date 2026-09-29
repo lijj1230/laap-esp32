@@ -130,7 +130,7 @@ static int httpsPost(const String& url, const String& contentType, const uint8_t
     sent += n;
   }
   String hdrs, payload;
-  laapHttpRead(c, 40000, hdrs, payload, 200000);
+  laapHttpRead(c, 40000, hdrs, payload, 600000);   // 火山 wav+base64 ≈64KB/s：200KB 只够 3 秒，长回复必败（v3.56 审计）
   c->stop();
   int sp = hdrs.indexOf(' ');
   int code = sp > 0 ? hdrs.substring(sp + 1, sp + 4).toInt() : 0;
@@ -303,10 +303,15 @@ bool VolcTts::speak(const String& text, String& err) {
 
   size_t decLen = 0;
   mbedtls_base64_decode(nullptr, 0, &decLen, (const uint8_t*)b64.c_str(), b64.length());
+  if (decLen == 0 || decLen > 900000) { err = "音频数据长度异常"; return false; }
   uint8_t* wav = (uint8_t*)malloc(decLen + 8);
   if (!wav) { err = "解码缓冲分配失败"; return false; }
   size_t olen = 0;
-  mbedtls_base64_decode(wav, decLen, &olen, (const uint8_t*)b64.c_str(), b64.length());
+  if (mbedtls_base64_decode(wav, decLen, &olen, (const uint8_t*)b64.c_str(), b64.length()) != 0 || olen == 0) {
+    free(wav);
+    err = "音频 base64 解码失败";
+    return false;
+  }
   // 解 WAV：找 fmt 采样率与 data 块。逐字节拼 32 位读——Xtensa 上 *(uint32_t*) 非对齐
   // 直接 LoadStoreAlignment panic（fmt 块带 cbSize=18 字节时后续块错位 2 字节就踩中）；
   // 块声明长按实际收口，防止 playPcm 越界读

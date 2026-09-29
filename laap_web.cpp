@@ -497,11 +497,11 @@ void LaapWeb::handleSettingsPage() {
     "async function save(e){e.preventDefault();"
     "const b=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},"
     "body:JSON.stringify({ssid:ssid.value,pass:pass.value,base:base.value,key:key.value,key_set:1,model:model.value,"
-    "agent:agent.value,owner:owner.value,wcity:wcity.value,wcity_set:1,persona:persona.value,tick:tick.value,thold:thold.value,"
+    "agent:agent.value,agent_set:1,owner:owner.value,owner_set:1,wcity:wcity.value,wcity_set:1,persona:persona.value,persona_set:1,tick:tick.value,thold:thold.value,"
     "idlesil:idlesil.value,idleevery:idleevery.value,qstart:qstart.value,qend:qend.value,volume:volume.value,brightness:brightness.value,screenoff:screenoff.value,vadstop:vadstop.value,llmcont:llmcont.value,llmtok:llmtok.value,nothink:nothink.checked?1:0,srchkeys:srchkeys.value,srchkeys_set:1,srchapi:srchapi.value,srchapi_set:1,"
-    "vmode:vmode.value,ttsch:ttsch.value,ttsvoice:ttsvoice.value,ttsrate:ttsrate.value,"
-    "volcappid:volcappid.value,volctoken:volctoken.value,volctoken_set:1,volcvoice:volcvoice.value,"
-    "asrbase:asrbase.value,asrkey:asrkey.value,asrkey_set:1,asrmodel:asrmodel.value,asr2base:asr2base.value,asr2key:asr2key.value,asr2key_set:1,asr2model:asr2model.value,asr2_set:1,"
+    "vmode:vmode.value,ttsch:ttsch.value,ttsvoice:ttsvoice.value,ttsvoice_set:1,ttsrate:ttsrate.value,ttsrate_set:1,"
+    "volcappid:volcappid.value,volcappid_set:1,volctoken:volctoken.value,volctoken_set:1,volcvoice:volcvoice.value,volcvoice_set:1,"
+    "asrbase:asrbase.value,asrbase_set:1,asrkey:asrkey.value,asrkey_set:1,asrmodel:asrmodel.value,asrmodel_set:1,asr2base:asr2base.value,asr2key:asr2key.value,asr2key_set:1,asr2model:asr2model.value,asr2_set:1,"
     "embbase:embbase.value,embbase_set:1,embkey:embkey.value,embkey_set:1,embmodel:embmodel.value,embmodel_set:1,"
     "wakeword:wakeword.value,visionbase:visionbase.value,vlbase:vlbase.value,vkey:vkey.value,vkey_set:1,vmodel:vmodel.value,"
     "wakeword_set:1,visionbase_set:1,vlbase_set:1,vmodel_set:1})});"
@@ -571,14 +571,14 @@ void LaapWeb::handleSave() {
   if (flag("vmodel_set")) strlcpy(cfg.s.visionModel, vmodel.c_str(), sizeof(cfg.s.visionModel));
   if (vmode.length()) { long v = vmode.toInt(); cfg.s.voiceMode = (uint8_t)(v < 0 ? 0 : (v > 3 ? 3 : v)); }
   if (ttsch.length()) { long v = ttsch.toInt(); cfg.s.ttsChannel = (uint8_t)(v < 0 ? 0 : (v > 3 ? 3 : v)); }
-  if (ttsvoice.length()) strlcpy(cfg.s.ttsVoice, ttsvoice.c_str(), sizeof(cfg.s.ttsVoice));
-  if (ttsrate.length()) strlcpy(cfg.s.ttsRate, ttsrate.c_str(), sizeof(cfg.s.ttsRate));
-  if (volcappid.length()) strlcpy(cfg.s.volcAppid, volcappid.c_str(), sizeof(cfg.s.volcAppid));
+  if (flag("ttsvoice_set")) strlcpy(cfg.s.ttsVoice, ttsvoice.c_str(), sizeof(cfg.s.ttsVoice));
+  if (flag("ttsrate_set")) strlcpy(cfg.s.ttsRate, ttsrate.c_str(), sizeof(cfg.s.ttsRate));
+  if (flag("volcappid_set")) strlcpy(cfg.s.volcAppid, volcappid.c_str(), sizeof(cfg.s.volcAppid));
   if (flag("volctoken_set")) setSecret(volctoken, cfg.s.volcToken, sizeof(cfg.s.volcToken), "火山 Token");
-  if (volcvoice.length()) strlcpy(cfg.s.volcVoice, volcvoice.c_str(), sizeof(cfg.s.volcVoice));
-  if (asrbase.length()) strlcpy(cfg.s.asrBase, asrbase.c_str(), sizeof(cfg.s.asrBase));
+  if (flag("volcvoice_set")) strlcpy(cfg.s.volcVoice, volcvoice.c_str(), sizeof(cfg.s.volcVoice));
+  if (flag("asrbase_set")) strlcpy(cfg.s.asrBase, asrbase.c_str(), sizeof(cfg.s.asrBase));
   if (flag("asrkey_set")) setSecret(asrkey, cfg.s.asrKey, sizeof(cfg.s.asrKey), "ASR Key");
-  if (asrmodel.length()) strlcpy(cfg.s.asrModel, asrmodel.c_str(), sizeof(cfg.s.asrModel));
+  if (flag("asrmodel_set")) strlcpy(cfg.s.asrModel, asrmodel.c_str(), sizeof(cfg.s.asrModel));
   // 备用 ASR 支持"清空"（带 _set 哨兵即写入，空=不启用）；Key 留空=保持不变
   if (flag("asr2_set")) {
     strlcpy(cfg.s.asr2Base, asr2base.c_str(), sizeof(cfg.s.asr2Base));
@@ -597,10 +597,10 @@ void LaapWeb::handleSave() {
   if (model.length()) strlcpy(cfg.s.llmModel, model.c_str(), sizeof(cfg.s.llmModel));
   // 自由文本一律先按字符边界截断再落库（v3.51）：strlcpy 裸截会在汉字中间切断，
   // 半个汉字进 LLM 请求体 = 非法 UTF-8 → 400（"设完人设后它就不说话了"）
-  if (agent.length()) strlcpy(cfg.s.agentName, utf8Cut(agent, sizeof(cfg.s.agentName) - 1).c_str(), sizeof(cfg.s.agentName));
-  if (owner.length()) strlcpy(cfg.s.ownerName, utf8Cut(owner, sizeof(cfg.s.ownerName) - 1).c_str(), sizeof(cfg.s.ownerName));
+  if (flag("agent_set")) strlcpy(cfg.s.agentName, utf8Cut(agent, sizeof(cfg.s.agentName) - 1).c_str(), sizeof(cfg.s.agentName));
+  if (flag("owner_set")) strlcpy(cfg.s.ownerName, utf8Cut(owner, sizeof(cfg.s.ownerName) - 1).c_str(), sizeof(cfg.s.ownerName));
   if (flag("wcity_set")) strlcpy(cfg.s.city, utf8Cut(get("wcity"), sizeof(cfg.s.city) - 1).c_str(), sizeof(cfg.s.city));   // 城市：空=按IP定位
-  if (persona.length()) strlcpy(cfg.s.persona, utf8Cut(persona, sizeof(cfg.s.persona) - 1).c_str(), sizeof(cfg.s.persona));
+  if (flag("persona_set")) strlcpy(cfg.s.persona, utf8Cut(persona, sizeof(cfg.s.persona) - 1).c_str(), sizeof(cfg.s.persona));
   // 只在真的带了字段时才改（原来无条件 toInt()：缺少 tick/thold 的部分保存会把它们打成下限 10）
   String tick = get("tick"), thold = get("thold");
   if (tick.length()) { long v = tick.toInt(); cfg.s.tickSec = (uint32_t)(v < 10 ? 10 : (v > 3600 ? 3600 : v)); }

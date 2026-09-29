@@ -325,10 +325,9 @@ String LaapVision::lookLocked(const String& question) {
              (auth.length() ? ("\r\n" + auth) : "") +
              "\r\nContent-Type: application/json\r\nContent-Length: " + String((unsigned)clen) +
              "\r\nConnection: close\r\n\r\n");
-  cli->print(prefix);
-  cli->print(b64);       // PSRAM 里的 205KB，直接按 NUL 结尾整段发出
-  cli->print(suffix);
+  size_t sent = cli->print(prefix) + cli->print(b64) + cli->print(suffix);   // PSRAM 里 205KB 按整段发出
   free(b64);
+  if (sent != clen) { lastError = "请求发送不完整（连接中断）"; cli->stop(); delete cli; return ""; }
   String hdrs, payload;
   laapHttpRead(cli, 45000, hdrs, payload, 40000);
   cli->stop(); delete cli;
