@@ -127,7 +127,7 @@ String laapInteractSearch(const String& userText);   // 带联网搜索的交互
 void llmHarvest();                                   // F4: 收割后台 LLM 结果
 struct LlmRequest;
 bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
-               const String& userText, uint8_t kind = 0);
+               const String& userText, uint8_t kind = 0, const String& searchQ = String());
 bool arisIdleMonologue();       // 返回是否真的提交成功（失败不推进"已独白"状态）
 void laapResetIdleClock();      // 主人交互后重置独白计时（它自己说话不重置）
 String laapIdleInfo();          // 独白计时诊断（/api/status）
@@ -266,12 +266,17 @@ struct LlmRequest {
   int maxTokens;
   float temperature;
   String userText;          // 原始用户话（空=后台类请求）
+  String searchQ;           // v3.53：非空=聊天阶段一先在后台搜索，结果注入第二条 system
   uint8_t kind;             // LlmKind
 };
 
 static LlmReply g_llmResult;
 static volatile bool g_llmHasNew = false;
 static volatile uint8_t g_resultKind = LK_CHAT;       // 本次结果的请求种类
+// 搜索阶段一（v3.53）：llmTask 写、llmHarvest 消费（与 g_llmResult 同一发布纪律：
+// 先写完再置 g_llmHasNew；单请求在飞，无并发）
+static volatile int8_t g_chatSearchState = -1;        // -1=本轮无搜索 0=失败 1=成功
+static String g_chatSearchErr;                        // 失败原因（failNote 素材）
 static uint8_t g_llmFailStreak = 0;                   // LLM 连续失败次数（≥2 独白让路）
 // 后台 LLM 是否在飞（含独白/反思/整理——多步流水线一跑就是几十秒）。
 // 逐项体检前必须看这个：TLS 握手互相抢 ~40KB 最大连续块，抢到的结果也是失真的
@@ -495,10 +500,28 @@ static void llmTaskFunc(void*) {
     // 而结果要几秒后才产出；主循环里所有提交路径都排在 llmHarvest 之前——于是
     // "新一代 kind + 旧一代结果"会被错配收割（聊天回复被当独白吞掉、夜间任务产物被当聊天念出）
     LlmReply rr;
-    if (req->kind == LK_MONO)
+    g_chatSearchState = -1; g_chatSearchErr = "";
+    if (req->kind == LK_MONO) {
       rr = monologueGenerate();                  // 多步流水线也在后台跑
-    else
+    } else {
+      // 阶段一（v3.53）：带搜索词的聊天先在后台搜——主循环不再被 3-28s 的搜索阻塞
+      // （独白流水线的搜索本来就在本任务跑，同一已验证模式）
+      if (req->searchQ.length()) {
+        String know = laapSearch.search(req->searchQ, 3, 500);
+        g_chatSearchState = know.length() ? 1 : 0;
+        g_chatSearchErr = laapSearch.lastError;
+        Serial.printf("[LAAP] 搜索「%s」: %s\n", req->searchQ.c_str(),
+                      know.length() ? "有收获" : laapSearch.lastError.c_str());
+        if (know.length() && req->nm < 14) {     // 注入为第二条 system（与原同步路径同一形态）
+          for (int i = req->nm; i > 1; i--) req->msgs[i] = req->msgs[i - 1];
+          req->msgs[1] = {"system", String("[联网搜索] 系统刚刚替你联网查过了，以下是最新网页资料。"
+                                           "请直接依据它回答主人的问题；你有联网能力，"
+                                           "禁止说「我查不到/我没法联网」：") + know};
+          req->nm++;
+        }
+      }
       rr = llm.chatMsgs(req->msgs, req->nm, req->maxTokens, req->temperature);
+    }
     g_resultKind = req->kind;
     g_llmResult = rr;
     g_llmBusy = false;
@@ -509,7 +532,7 @@ static void llmTaskFunc(void*) {
 
 // 受理一个 LLM 请求（立即返回 true=已入队，false=忙/队满）
 bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
-               const String& userText, uint8_t kind) {
+               const String& userText, uint8_t kind, const String& searchQ) {
   // TLS 握手要 ~31KB+ 连续内部内存；ASR 预热连接会占住最大的一块。
   // 堆紧时先请它让位（实测 maxblk 30KB 时 LLM 三连"连接失败"的根因之一）
   if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 36000)
@@ -522,7 +545,7 @@ bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
   req->nm = (nm > 14) ? 14 : nm;
   for (int i = 0; i < req->nm; i++) req->msgs[i] = { msgs[i].role, msgs[i].content };
   req->maxTokens = maxTokens; req->temperature = temperature;
-  req->userText = userText; req->kind = kind;
+  req->userText = userText; req->kind = kind; req->searchQ = searchQ;
   // 请求结构摘要（/api/status 的 llm_ctx + 串口）：正常聊天最后一段必须是 u(本次提问)
   String shape = String("n=") + req->nm + " [";
   for (int i = 0; i < req->nm; i++) {
@@ -636,32 +659,19 @@ String laapInteractSearch(const String& userText) {
     }
   }
 
-  String knowledge;
+  // 搜索下沉为 llmTask 阶段一（v3.53）：主循环不再被 3-28s 的搜索阻塞（脸/网页/VAD 持续活着）。
+  // 资料注入与计分都在后台/收割侧完成，受理即回
+  String searchQ;
   if (wantsSearch(userText)) {
     display.drawFace("curious");
-    String q = searchQueryOf(userText);
-    knowledge = laapSearch.search(q, 3, 500);
-    // 网络锁被后台占用时别记成"搜索失败"（v3.51 审计：污染 RSI 命中率并误导归因）
-    bool netBusy = laapSearch.lastError.indexOf("正忙") >= 0 || laapSearch.lastError.indexOf("占用") >= 0;
-    if (!netBusy) {
-      metrics.search(knowledge.length() > 0);   // 搜索命中率：内容空洞时答案差的前置原因
-      if (!knowledge.length()) metrics.failNote(String("搜索: ") + laapSearch.lastError);
-    } else if (!knowledge.length()) {
-      Serial.println("[LAAP] 搜索跳过计分：网络锁被后台任务占用（非搜索失败）");
-    }
-    Serial.printf("[LAAP] 搜索「%s」: %s\n", q.c_str(),
-                  knowledge.length() ? "有收获" : laapSearch.lastError.c_str());
+    searchQ = searchQueryOf(userText);
   }
 
   LlmMsg msgs[14];                                // F3: 真多轮（system+时间+历史轮+user）
   int nm = 0;
   msgs[nm++] = {"system", buildSystemPrompt()};
-  // 关键措辞：必须让它明白"这是刚替你联网查到的最新资料"，否则它常以"我没有联网能力/
-  // 我只有一副耳朵"为由拒答（实测"查天气"就这么答的，尽管资料已经给它了）
-  if (knowledge.length())
-    msgs[nm++] = {"system", String("[联网搜索] 系统刚刚替你联网查过了，以下是最新网页资料。"
-                                   "请直接依据它回答主人的问题；你有联网能力，"
-                                   "禁止说「我查不到/我没法联网」：") + knowledge};
+  // [联网搜索] 注入已下沉到 llmTask 阶段一（v3.53）：搜索完成后在后台插为第二条 system，
+  // 提示词形态与原同步路径完全一致（见 llmTaskFunc 的注入块）
 
   // 最近对话轮（远→近），最多 10 条进 messages。角色用记忆里真实的说话人：
   // 旧版按 (nm-2)%2 猜奇偶，无搜索结果时整段反相（主人的话标成 assistant、它自己的话标成 user）
@@ -686,7 +696,7 @@ String laapInteractSearch(const String& userText) {
   memory.logEvent("user", userText);   // 记事：此刻快照已取完，本次提问只出现在队尾一次
   skills.hit(userText);                // 口令技能命中计数（热度用于淘汰与展示）
   // F4: 丢给后台 LLM 任务，立即返回"思考中"；loop 里 llmHarvest() 收割
-  if (llmSubmit(msgs, nm, cfg.s.llmMaxTokens, 0.85f, userText)) {
+  if (llmSubmit(msgs, nm, cfg.s.llmMaxTokens, 0.85f, userText, LK_CHAT, searchQ)) {
     g_pendingUserText = userText;
     g_chatStartMs = millis();                     // 端到端延迟计时起点（llmHarvest 里收割）
     g_chatPending = true;                         // 网页据此改为轮询 /api/chat/reply
@@ -732,6 +742,11 @@ void llmHarvest() {
   g_llmHasNew = false;
   LlmReply r = g_llmResult;
   uint8_t kind = g_resultKind;
+  if (g_chatSearchState >= 0) {   // 本轮带搜索（v3.53 阶段一）：计数移回 loopTask（metrics 不跨任务写）
+    metrics.search(g_chatSearchState == 1);
+    if (g_chatSearchState == 0) metrics.failNote(String("搜索: ") + g_chatSearchErr);
+    g_chatSearchState = -1;
+  }
   metrics.llm(r.ok);   // 后台 LLM 成败（含独白/反思/压缩：服务商健康度的总信号）
   if (!r.ok) metrics.failNote(String("LLM: ") + llm.lastError);   // 规则归纳的失败素材
   g_llmFailStreak = r.ok ? 0 : (uint8_t)(g_llmFailStreak + 1);   // 退避计数（独白据此让路）

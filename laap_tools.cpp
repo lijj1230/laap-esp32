@@ -247,19 +247,29 @@ static float g_geoLat = 999, g_geoLon = 999; static String g_geoCity;
 static bool weatherOpenMeteo(const String& city, String& out) {
   // 5 分钟缓存
   if (g_omCity == city && g_omText.length() && millis() - g_omMs < 300000UL) { out = g_omText; return true; }
+  // 60s 失败缓存（v3.51）：网络半通时原来 geo(10s)+forecast(10s)+wttr(6s) 每次问都全量重打
+  static uint32_t s_omFailMs = 0;
+  static String s_omFailCity;
+  if (s_omFailCity == city && s_omFailMs && millis() - s_omFailMs < 60000UL) return false;
   float lat, lon;
   if (g_geoCity != city || g_geoLat > 900) {
     String body = dechunk(httpGetText("geocoding-api.open-meteo.com",
-                    "/v1/search?name=" + urlEncQuery(city) + "&count=1&language=zh&format=json", 10000));
-    if (!jsonNum(body, "latitude", lat) || !jsonNum(body, "longitude", lon)) return false;
+                    "/v1/search?name=" + urlEncQuery(city) + "&count=1&language=zh&format=json", 6000));
+    if (!jsonNum(body, "latitude", lat) || !jsonNum(body, "longitude", lon)) {
+      s_omFailMs = millis(); s_omFailCity = city;   // 失败留底：60s 内不重打三发
+      return false;
+    }
     g_geoCity = city; g_geoLat = lat; g_geoLon = lon;
   }
   lat = g_geoLat; lon = g_geoLon;
   char p[176];
   snprintf(p, sizeof(p), "/v1/forecast?latitude=%.4f&longitude=%.4f&current=temperature_2m,weather_code&timezone=auto", lat, lon);
-  String body = dechunk(httpGetText("api.open-meteo.com", p, 10000));
+  String body = dechunk(httpGetText("api.open-meteo.com", p, 6000));
   float tempC = 0, code = 0;
-  if (!jsonNum(body, "temperature_2m", tempC) || !jsonNum(body, "weather_code", code)) return false;
+  if (!jsonNum(body, "temperature_2m", tempC) || !jsonNum(body, "weather_code", code)) {
+    s_omFailMs = millis(); s_omFailCity = city;
+    return false;
+  }
   out = wmoCn((int)code) + " " + String((int)(tempC + (tempC >= 0 ? 0.5f : -0.5f))) + "度";
   g_omCity = city; g_omText = out; g_omMs = millis();
   Serial.printf("[WEA-OM] %s → %s（lat %.3f lon %.3f）\n", city.c_str(), out.c_str(), lat, lon);
