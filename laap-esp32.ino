@@ -405,9 +405,9 @@ static LlmReply monologueGenerate() {
   LlmMsg m1[2] = {
     {"system", String("你是") + cfg.s.agentName + "，正在独处自学。基于你的性格参数与最近经历，" +
                (goalPart.length() ? goalPart : String("这次从「") + dom + "」领域里找一个值得琢磨的具体问题。") +
-               "只回两行：第一行是问题本身（15字内，不要标点结尾）；"
-               "第二行是搜索引擎查询词：8~20个字的完整短语，像人在搜索框里输入的那样具体，"
-               "主语放最前，不要拆成单个的词。"
+               "给出三个候选念头，按下面格式，候选之间用一行 —— 分隔："
+               "第一行：问题本身（15字内，不要标点结尾）；第二行：搜索引擎查询词（8~20个字的完整短语，"
+               "像人在搜索框里输入的那样具体，主语放最前）。三个候选要从不同角度出发、彼此明显不同。"
                "最近已经想过这些（连同它们的任何变体、换个说法，都不要再出）：" + g_monoTopics},
     {"user", String("独处思考中，此刻情绪「") + mind.moodCn() + "」。想一个新问题。"} };
   // 1600 而不是 60：思考型模型（v4 系）光"想"就能吃掉上千 token，给 60 的结果是
@@ -435,6 +435,43 @@ static LlmReply monologueGenerate() {
   query = tidySearchQuery(rest, topic);
   // 注意别把空格替换成 '+'：laap_search 的编码器本来就把空格编成 '+'，
   // 预替换的 '+' 会被二次编码成 %2B（字面加号），还让 bigram 覆盖率跨词必 miss
+  // C2 念头竞争仲裁（v3.60）：模型吐了多个候选（"——"分组）时端侧打分选冠军——
+  // 新颖度为主（noveltyOf 向量通道，无向量退 -1 不参与），叠加意图相关性微调。
+  // 主题从"规则直选"升级为"竞争胜出"（GWT winner-take-all 的选题层）
+  {
+    String body = topic;
+    int sp1 = body.indexOf("\\n——");
+    if (sp1 < 0) sp1 = body.indexOf("——");
+    if (sp1 > 0) {
+      String cands[3]; int nc = 0;
+      int pos = 0;
+      while (nc < 3) {
+        int sep = body.indexOf("——", pos);
+        String seg = (sep < 0) ? body.substring(pos) : body.substring(pos, sep);
+        seg.trim();
+        // 段内第一行=问题；去掉可能混入的行
+        int snl = seg.indexOf('\\n');
+        if (snl > 0) seg = seg.substring(0, snl);
+        seg.trim();
+        if (seg.length() >= 4) cands[nc++] = seg;
+        if (sep < 0) break;
+        pos = sep + 2;
+      }
+      if (nc > 1) {
+        int best = 0; float bestScore = -1;
+        for (int i = 0; i < nc; i++) {
+          float nov = memory.noveltyOf(cands[i]);
+          float score = (nov >= 0 ? nov : 0.5f);            // 无向量=中性分
+          if (g_monoGoal.length() && cands[i].indexOf(g_monoGoal.substring(0, min(4, (int)g_monoGoal.length()))) >= 0)
+            score += 0.15f;                                  // 意图相关微调
+          Serial.printf("[C2] 候选%d 「%s」 %.2f\\n", i + 1, cands[i].c_str(), score);
+          if (score > bestScore) { bestScore = score; best = i; }
+        }
+        topic = cands[best];
+        Serial.printf("[C2] 冠军: 「%s」（%d 候选竞争）\\n", topic.c_str(), nc);
+      }
+    }
+  }
   g_monoTopic = topic;
 
   // 起意前看一眼世界——"看"是有成本的感知，按需求驱动（active inference）：
