@@ -3,8 +3,19 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
 #include "driver/spi_master.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 static esp_lcd_panel_handle_t s_panel = nullptr;
+
+// 颜色传输完成信号（v3.51 审计）：fillRect 复用 static 缓冲喂异步 DMA，
+// 无完成同步时上一次传输仍在读缓冲、下一次已改写 → 条状错色/残影
+static SemaphoreHandle_t s_lcdDone = nullptr;
+static bool IRAM_ATTR lcdTransDone(esp_lcd_panel_io_handle_t, esp_lcd_panel_io_event_data_t*, void*) {
+  BaseType_t hp = pdFALSE;
+  if (s_lcdDone) xSemaphoreGiveFromISR(s_lcdDone, &hp);
+  return hp == pdTRUE;
+}
 
 LaapDisplay display;
 
@@ -57,7 +68,10 @@ void LaapDisplay::fillRect(int x, int y, int w, int h, uint16_t c) {
   int yy = y;
   while (yy < y + h) {
     int rows = (y + h - yy < rowsPerPass) ? (y + h - yy) : rowsPerPass;
+    // 传输前清空可能残留的信号、传输后等到完成——static 缓冲才能安全复用（v3.51 审计）
+    if (s_lcdDone) while (xSemaphoreTake(s_lcdDone, 0) == pdTRUE) {}
     esp_lcd_panel_draw_bitmap(s_panel, xx0, yy, xx1 + 1, yy + rows, buf);
+    if (s_lcdDone) xSemaphoreTake(s_lcdDone, pdMS_TO_TICKS(100));
     yy += rows;
   }
 }
@@ -69,8 +83,9 @@ void LaapDisplay::fillCircle(int cx, int cy, int r, uint16_t c) {
   }
 }
 
-// ST7789 完整厂商上电序列（小智/BSP 同款）：精简序列喂不醒冷态屏幕时，
-// 电源(PWRCTRL/VCOM)/伽马/门驱动这些寄存器是必需的——实测冷启动黑屏的根治项
+// ST7789 完整厂商上电序列（小智/BSP 同款）：精简序列喂不醒冷态屏幕时用。
+// 注意：**当前无调用者**（v3.51 审计核实）——IDF st7789 组件已含基础初始化，
+// 实测屏幕工作正常；此表保留供冷启动/换屏排查时手动调用
 void LaapDisplay::vendorInit() {
   lcdCmd(0xEF); { uint8_t d[] = {0x03, 0x80, 0x02}; lcdData(d, 3); }
   lcdCmd(0xCF); { uint8_t d[] = {0x00, 0xC1, 0x30}; lcdData(d, 3); }
@@ -126,10 +141,11 @@ void LaapDisplay::begin() {
   io_config.trans_queue_depth = 10;
   io_config.lcd_cmd_bits = 8;
   io_config.lcd_param_bits = 8;
-  io_config.on_color_trans_done = nullptr;
+  io_config.on_color_trans_done = lcdTransDone;   // v3.51：传输完成回调，配合 fillRect 的等待
   io_config.user_ctx = nullptr;
   ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((spi_host_device_t)SPI3_HOST, &io_config, &panel_io));
   g_laapPanelIO = panel_io;
+  if (!s_lcdDone) s_lcdDone = xSemaphoreCreateBinary();
 
   esp_lcd_panel_dev_config_t panel_config = {};
   panel_config.reset_gpio_num = -1;

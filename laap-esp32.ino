@@ -320,7 +320,11 @@ static String tidySearchQuery(String kw, const String& topic) {
 // 结果相关性粗检：查询（CJK）相邻二字组在结果文本中的覆盖率 0..1。
 // 覆盖率≈0 = 结果与查询几乎无关（跑题）；纯 ASCII 查询不参与判定（返回 1）
 static float queryBigramCoverage(const String& know, const String& q) {
-  if (!((unsigned char)q[0] >= 0x80)) return 1.0f;
+  // 纯 ASCII 查询不判定；但"首字节判定"会把 "AI 是什么"/"5G 怎么样" 整条绕过（v3.51 审计）——
+  // 改为扫描全文是否含 CJK 字节
+  bool hasCJK = false;
+  for (unsigned int i = 0; i < q.length(); i++) if ((unsigned char)q[i] >= 0x80) { hasCJK = true; break; }
+  if (!hasCJK) return 1.0f;
   int off[48];
   int nOff = 0;
   for (unsigned int k = 0; k < q.length() && nOff < 47; k++)
@@ -480,11 +484,16 @@ static void llmTaskFunc(void*) {
   for (;;) {
     LlmRequest* req = nullptr;
     if (xQueueReceive(g_llmQueue, &req, portMAX_DELAY) != pdTRUE || !req) continue;
-    g_resultKind = req->kind;
+    // kind 与结果必须**同代写入**（v3.51 审计）：旧代码在出队瞬间就改写 g_resultKind，
+    // 而结果要几秒后才产出；主循环里所有提交路径都排在 llmHarvest 之前——于是
+    // "新一代 kind + 旧一代结果"会被错配收割（聊天回复被当独白吞掉、夜间任务产物被当聊天念出）
+    LlmReply rr;
     if (req->kind == LK_MONO)
-      g_llmResult = monologueGenerate();         // 多步流水线也在后台跑
+      rr = monologueGenerate();                  // 多步流水线也在后台跑
     else
-      g_llmResult = llm.chatMsgs(req->msgs, req->nm, req->maxTokens, req->temperature);
+      rr = llm.chatMsgs(req->msgs, req->nm, req->maxTokens, req->temperature);
+    g_resultKind = req->kind;
+    g_llmResult = rr;
     g_llmBusy = false;
     g_llmHasNew = true;               // loop 轮询收割
     delete req;
@@ -625,8 +634,14 @@ String laapInteractSearch(const String& userText) {
     display.drawFace("curious");
     String q = searchQueryOf(userText);
     knowledge = laapSearch.search(q, 3, 500);
-    metrics.search(knowledge.length() > 0);   // 搜索命中率：内容空洞时答案差的前置原因
-    if (!knowledge.length()) metrics.failNote(String("搜索: ") + laapSearch.lastError);
+    // 网络锁被后台占用时别记成"搜索失败"（v3.51 审计：污染 RSI 命中率并误导归因）
+    bool netBusy = laapSearch.lastError.indexOf("正忙") >= 0 || laapSearch.lastError.indexOf("占用") >= 0;
+    if (!netBusy) {
+      metrics.search(knowledge.length() > 0);   // 搜索命中率：内容空洞时答案差的前置原因
+      if (!knowledge.length()) metrics.failNote(String("搜索: ") + laapSearch.lastError);
+    } else if (!knowledge.length()) {
+      Serial.println("[LAAP] 搜索跳过计分：网络锁被后台任务占用（非搜索失败）");
+    }
     Serial.printf("[LAAP] 搜索「%s」: %s\n", q.c_str(),
                   knowledge.length() ? "有收获" : laapSearch.lastError.c_str());
   }
@@ -853,7 +868,11 @@ void llmHarvest() {
                       mind.needs().security, mind.needs().expression);
     voice.speak(r.say, g_lastExpr.c_str());
     g_recentTopics += g_monoTopic + "；";
-    if (g_recentTopics.length() > 240) g_recentTopics = g_recentTopics.substring(g_recentTopics.length() - 160);
+    if (g_recentTopics.length() > 240) {      // 从字符边界切（v3.51）：字节切会从续字节起，非法 UTF-8 进提示词
+      int cut = g_recentTopics.length() - 160;
+      while (cut < (int)g_recentTopics.length() && ((unsigned char)g_recentTopics[cut] & 0xC0) == 0x80) cut++;
+      g_recentTopics = g_recentTopics.substring(cut);
+    }
     return;
   }
   // R2+R3（v3.48）：解析表达的自评审候选/选定/预期行。全部行可选——
@@ -1561,8 +1580,10 @@ void psiTick() {
     arisExpress(false, "tick");
   }
 
-  // 周期性记忆压缩：每 48 次心跳 或 4 小时
-  if (mind.cycles() % 48 == 0 || millis() - g_lastConsumeMs > 4UL * 3600UL * 1000UL) {
+  // 周期性记忆压缩：每 4 小时一次。旧写的 `cycles % 48 ||` 让 OR 恒真落在 24 分钟节拍上
+  // （48×30s），每天 ~60 次 LLM 调用抢唯一槽位（聊天被挤成"让我把刚才的想完…"）——
+  // v3.51 审计改回注释声明的 4 小时口径
+  if (millis() - g_lastConsumeMs > 4UL * 3600UL * 1000UL) {
     consolidateMemory();
   }
   // 性格进化落盘降频：周期数变化时才写（原来每 30s 全量写，每天 2880 次 flash 磨损）
@@ -1606,7 +1627,8 @@ void connectWifi() {
 //  串口 CLI
 // ============================================================
 void serialCli() {
-  while (Serial.available()) {
+  // 每轮最多处理 8 行：无换行字节流曾能让 while(readStringUntil) 永久占住主循环（v3.51 审计）
+  for (int cliGuard = 0; cliGuard < 8 && Serial.available(); cliGuard++) {
     String line = Serial.readStringUntil('\n');
     line.trim();
     if (!line.length()) continue;
@@ -1639,12 +1661,19 @@ void serialCli() {
                     cfg.s.screenOffSec, display.screenOn() ? "亮" : "灭", display.getBrightness());
       Serial.println("[LCD] 用法: /screen 60  → 60 秒无交互息屏并保存");
     } else if (line.startsWith("/screen ")) {
-      int v = line.substring(8).toInt();
-      if (v < 0) v = 0; if (v > 3600) v = 3600;
-      cfg.s.screenOffSec = (uint16_t)v;
-      cfg.save();
-      g_lastActivityMs = millis();
-      Serial.printf("[LCD] 静默 %d 秒后息屏（0=常亮），已保存\n", v);
+      // 严格解析（v3.51 审计）：toInt 对非数字归零 = 静默被悄悄改成"常亮"并落盘
+      String arg = line.substring(8); arg.trim();
+      bool okNum = arg.length() > 0;
+      for (unsigned int i = 0; i < arg.length(); i++) if (arg[i] < '0' || arg[i] > '9') okNum = false;
+      if (!okNum) { Serial.println("[LCD] 参数须为数字（用法: /screen 60，0-3600 秒，0=常亮）"); }
+      else {
+        int v = arg.toInt();
+        if (v < 0) v = 0; if (v > 3600) v = 3600;
+        cfg.s.screenOffSec = (uint16_t)v;
+        cfg.save();
+        g_lastActivityMs = millis();
+        Serial.printf("[LCD] 静默 %d 秒后息屏（0=常亮），已保存\n", v);
+      }
     } else if (line == "/status") {
       Serial.println("[世界模型] " + mind.worldJson());
       Serial.println("[语义记忆] " + memory.semantic());
@@ -1662,7 +1691,8 @@ void serialCli() {
                       acc > 0 ? (String(acc, 2) + " g").c_str() : "无");
       }
     } else if (line == "/portal") {
-      webui.beginAP();
+      if (webui.inAP()) Serial.println("[LAAP] 已在配置热点模式");
+      else webui.beginAP();                 // 重复 beginAP 会重挂路由+重建监听套接字（v3.51 审计）
     } else if (line == "/lcd") {
       Serial.println("[LCD] " + display.lcdDiag());
     } else if (line == "/touchpad") {
@@ -1756,7 +1786,7 @@ void serialCli() {
                     rb, rb & 1, (rb >> 1) & 1, (rb >> 2) & 1, audio.volume());
       Serial.println("[AUD] 播 1s 测试音…（此时 PA 应为 1）");
       audio.paSet(true);
-      int16_t tone[1600];                    // 440Hz 100ms@16k，播 10 次=1s
+      static int16_t tone[1600];                 // 440Hz 100ms@16k，播 10 次=1s（static：3.2KB 不上栈，与 /beep 同规格，v3.51）
       for (int i = 0; i < 1600; i++) tone[i] = (int16_t)(8000 * sinf(2 * PI * 440 * i / 16000));
       for (int r = 0; r < 10; r++) audio.playPcm(tone, 1600, 16000);
       Wire.beginTransmission(0x19); Wire.write(0x01); Wire.endTransmission(false);
@@ -1870,12 +1900,21 @@ void serialCli() {
                     audio.micGainDb() / 10.0);
       Serial.println("[AUD] 判据：/beep 看近场回环 RMS、说话时 /asrtest 看 RMS（<50 无声，>300 正常）");
     } else if (line.startsWith("/micgain ")) {
-      int db10 = (int)(line.substring(9).toFloat() * 10 + 0.5);
+      String arg = line.substring(9); arg.trim();
+      bool okNum = arg.length() > 0; int dots = 0;
+      for (unsigned int i = 0; i < arg.length(); i++) {
+        if (arg[i] == '.') { if (++dots > 1) okNum = false; }
+        else if (arg[i] < '0' || arg[i] > '9') okNum = false;
+      }
+      if (!okNum) { Serial.println("[AUD] 参数须为数字（用法: /micgain 0-37.5，档位 3dB 一档）"); }
+      else {
+      int db10 = (int)(arg.toFloat() * 10 + 0.5);
       if (db10 < 0) db10 = 0; if (db10 > 375) db10 = 375;
       bool okg = audio.setMicGainDb(db10);
       Serial.printf("[AUD] 麦克风增益 → %.1f dB%s\n", audio.micGainDb() / 10.0,
                     okg ? "" : "（寄存器写入失败）");
       Serial.println("[AUD] 接着打 /asrtest 或 /asrloop 看效果（增益过高会削顶，RMS 长期贴近 3 万就是不合适）");
+      }
     } else if (line == "/asrsend") {
       // ASR 请求自检（不录音、不用出声）：合成 1s 音 → 打印 WAV 头关键字段 → 发给配置的 ASR。
       // 用来把"请求格式/服务端"与"麦克风录音内容"彻底分开：这里通了才轮到查录音。
@@ -2055,21 +2094,26 @@ void serialCli() {
     } else if (line == "/tidy") {
       memoryTidy(true);
       Serial.println("[TIDY] 已提交整理，LLM 出清单后自动执行（约 10~30 秒）");
-    } else if (line.startsWith("/vol")) {
-      // 必须区分"查询"和"设置"：旧代码对空参数 `"".toInt()`=0 也放行，
-      // 于是打一句 /vol 查询就把音量写成 0 并落盘 → 整机静音（且重启也不恢复）
-      String arg = line.substring(4); arg.trim();
-      int v = arg.length() ? arg.toInt() : -1;
-      if (arg.length() && v >= 0 && v <= 100) {
+    } else if (line == "/vol" || line.startsWith("/vol ")) {
+      // 严格解析（v3.51 审计）：旧代码 startsWith("/vol") 会把 "/volume 80" 也吃进来，
+      // toInt("ume 80")=0 落在合法区间 → 打错字就把音量写成 0 并落盘（重启不恢复）。
+      // 非纯数字一律当查询，绝不写配置
+      String arg = (line.length() > 4) ? line.substring(4) : String(); arg.trim();
+      bool okNum = arg.length() > 0;
+      for (unsigned int i = 0; i < arg.length(); i++) if (arg[i] < '0' || arg[i] > '9') okNum = false;
+      int v = okNum ? arg.toInt() : -1;
+      if (okNum && v >= 0 && v <= 100) {
         audio.setVolume((uint8_t)v); cfg.s.volume = (uint8_t)v; cfg.save();
         Serial.printf("[LAAP] 音量 %d%%\n", v);
       } else {
         Serial.printf("[LAAP] 当前音量 %d%%（用法: /vol 0-100）\n", audio.volume());
       }
-    } else if (line.startsWith("/bright")) {
-      String arg = line.substring(7); arg.trim();
-      int v = arg.length() ? arg.toInt() : -1;
-      if (arg.length() && v >= 5 && v <= 100) {
+    } else if (line == "/bright" || line.startsWith("/bright ")) {
+      String arg = (line.length() > 7) ? line.substring(7) : String(); arg.trim();
+      bool okNum = arg.length() > 0;
+      for (unsigned int i = 0; i < arg.length(); i++) if (arg[i] < '0' || arg[i] > '9') okNum = false;
+      int v = okNum ? arg.toInt() : -1;
+      if (okNum && v >= 5 && v <= 100) {
         display.setBrightness((uint8_t)v); cfg.s.brightness = (uint8_t)v; cfg.save();
         Serial.printf("[LAAP] 亮度 %d%%\n", v);
       } else {
@@ -2103,9 +2147,10 @@ void setup() {
   Serial.printf("[LAAP] 内部堆 %u KB / PSRAM %u KB / 环任务栈 %u 字节\n",
                 (unsigned)(ESP.getFreeHeap() / 1024),
                 (unsigned)(ESP.getFreePsram() / 1024),
-                (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
+                (unsigned)uxTaskGetStackHighWaterMark(NULL));   // 已是字节：旧代码 ×sizeof(StackType_t) 虚高 4 倍（v3.51）
 
-  memory.begin();
+  if (!memory.begin())
+    Serial.println("[LAAP] !! LittleFS 挂载失败：记忆/规则/技能/快照本次不可用（/reset 或检查分区）");
   cfg.begin();
   cfg.load();
   g_uptimeBaseMin = cfg.uptimeBase();   // 累计运行时长（跨重启累计，单位分钟）

@@ -74,7 +74,10 @@ void LaapSkills::hit(const String& userText) {
   ensureLoaded();
   bool changed = false;
   for (int i = 0; i < _n; i++)
-    if (_s[i].trig.length() && userText.indexOf(_s[i].trig) >= 0) { _s[i].hits++; changed = true; }
+    if (_s[i].trig.length() && userText.indexOf(_s[i].trig) >= 0) {
+      if (_s[i].hits < 60000) _s[i].hits++;   // 饱和加法：uint16 回绕会把最热技能变成"最冷"被淘汰（v3.51 审计）
+      changed = true;
+    }
   if (changed) save();
 }
 

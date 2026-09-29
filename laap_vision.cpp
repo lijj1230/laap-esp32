@@ -224,21 +224,25 @@ static camera_fb_t* grabWholeFrame(int tries) {
 // 诊断用：抓帧 → PNG → base64（与 look 同一条链路），返回 base64 文本
 String LaapVision::debugPngB64(size_t& outLen) {
   outLen = 0;
-  if (!_ok) { lastError = "摄像头未就绪"; return ""; }
+  // 与 look() 同持网络锁（v3.51 审计：本函数曾绕过模块自述的跨任务互斥——写 lastError、
+  // 抓帧、分配 308KB PSRAM，与后台独白的 look 并发 = String 撕裂 + PSRAM 峰值叠加）
+  if (!laapNetLock(1500)) { lastError = "视觉正忙（后台占用）"; return ""; }
+  auto fail = [&](const char* m) -> String { lastError = m; laapNetUnlock(); return ""; };
+  if (!_ok) return fail("摄像头未就绪");
   camera_fb_t* fb = grabWholeFrame(4);
-  if (!fb) { lastError = "抓帧失败/连续截断"; return ""; }
+  if (!fb) return fail("抓帧失败/连续截断");
   long ageMs = frameAgeMs(fb);
   size_t pngLen = 0;
   uint8_t* png = rgb565ToPng(fb->buf, (int)fb->width, (int)fb->height, pngLen);
   esp_camera_fb_return(fb);
   Serial.printf("[LOOKDUMP] 帧时间戳：距现在 %ld ms（越小越新）\n", ageMs);
-  if (!png) { lastError = "PNG 生成失败"; return ""; }
+  if (!png) return fail("PNG 生成失败");
   size_t need = 4 * ((pngLen + 2) / 3) + 8;
   char* b64 = (char*)ps_malloc(need);
-  if (!b64) { free(png); lastError = "PSRAM 不足"; return ""; }
+  if (!b64) { free(png); return fail("PSRAM 不足"); }
   size_t olen = 0;
   if (mbedtls_base64_encode((unsigned char*)b64, need, &olen, png, pngLen) != 0) {
-    free(png); free(b64); lastError = "base64 失败"; return "";
+    free(png); free(b64); return fail("base64 失败");
   }
   free(png);
   String out; out.reserve(olen + 4);
@@ -248,6 +252,7 @@ String LaapVision::debugPngB64(size_t& outLen) {
   }
   free(b64);
   outLen = olen;
+  laapNetUnlock();
   return out;
 }
 
@@ -269,8 +274,9 @@ String LaapVision::lookLocked(const String& question) {
   bool bridge = cfg.s.visionBase[0] != 0;
   bool direct = cfg.s.visionLlmBase[0] != 0;
   if (!bridge && !direct) { lastError = "视觉未配置（填手机桥 URL 或直连视觉 base）"; return ""; }
-  // base64 约 205KB、原始帧 150KB：都放 PSRAM。旧代码只看内部堆（90KB 时就报"内存不足"而永远跳过视觉）
-  if (ESP.getFreePsram() < 400000) { lastError = "PSRAM 不足，跳过视觉"; return ""; }
+  // base64 约 205KB、PNG 230KB 同时存活（峰值 ~540KB）+ 驱动 4 帧：门限按其定（v3.51 审计：
+  // 原 400KB 门限过线后仍会在 b64 分配处失败，白抓一帧；旧代码只看内部堆是更早的坑）
+  if (ESP.getFreePsram() < 700000) { lastError = "PSRAM 不足，跳过视觉"; return ""; }
 
   camera_fb_t* fb = grabWholeFrame(6);
   if (!fb) { lastError = "抓帧失败/连续截断"; return ""; }
@@ -318,7 +324,7 @@ String LaapVision::lookLocked(const String& question) {
     suffix = "\"}}]}],\"max_tokens\":300}";
   }
 
-  if (!url.startsWith("http")) { lastError = "URL 无效"; return ""; }
+  if (!url.startsWith("http")) { free(b64); lastError = "URL 无效"; return ""; }   // 补 free：曾泄漏 ~308KB/次（v3.51 审计）
   bool tls = url.startsWith("https");
   int dp = url.indexOf("://"), hp = url.indexOf('/', dp + 3);
   String host = (hp < 0) ? url.substring(dp + 3) : url.substring(dp + 3, hp);

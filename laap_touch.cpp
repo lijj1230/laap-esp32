@@ -9,7 +9,8 @@ static bool rd(uint8_t reg, uint8_t* buf, int n) {
   if (Wire.endTransmission(false) != 0) return false;
   if (Wire.requestFrom((int)LTP_ADDR, n) != n) return false;
   for (int i = 0; i < n; i++) buf[i] = Wire.read();   // 必须读完，否则残留数据污染下次读取
-  Wire.endTransmission(true);
+  // 不再补 endTransmission(true)：requestFrom 内部已释放 Wire 互斥并收尾——
+  // 多打这一发会对信号量二次 Give（互斥失效）+ 每 10ms 给 FT6236 一个空写事务（v3.51 审计）
   return true;
 }
 

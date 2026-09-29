@@ -22,12 +22,12 @@ void LaapVoice::begin() {
 void LaapVoice::speak(const String& text, const char* expr) {
   if (!_ready || (VoiceMode)cfg.s.voiceMode == VoiceMode::Off) return;
   if (!text.length()) return;
-  // 栈水位护栏：TTS 要过一次 TLS 握手，峰值吃 6-8KB（默认 8KB 环任务栈实测踩金丝雀重启）。
-  // 栈不够时宁可不说话也不能重启——文字已经上屏，用户照样看得到回复。
+  // 栈水位护栏：TTS 要过一次 TLS 握手。单位注意——本 IDF 的 uxTaskGetStackHighWaterMark
+  // 返回**字节**（task.h 原文 "in bytes (as opposed to words)"），旧代码按"字"×4，读数虚高
+  // 4 倍、护栏实际是 2.6KB（v3.51 审计）。实测空闲余量约 4-5KB，阈值保持 2600 字节不变
   UBaseType_t hw = uxTaskGetStackHighWaterMark(NULL);
   if (hw < 2600) {
-    Serial.printf("[VOICE] 栈余量仅 %u 字节，跳过播报（防栈溢出重启；文字已显示）\n",
-                  (unsigned)(hw * sizeof(StackType_t)));
+    Serial.printf("[VOICE] 栈余量仅 %u 字节，跳过播报（防栈溢出重启；文字已显示）\n", (unsigned)hw);
     display.drawFace(expr ? expr : "calm", false);
     _cooldownMs = millis() + 600;
     return;
@@ -70,7 +70,7 @@ bool LaapVoice::listenAndTranscribe(String& heard) {
 
   // 按键模式平时不泵，预滚缓冲里是陈年旧音——录前清掉，别回填进录音头（VAD 模式才靠预滚保句首）
   if ((VoiceMode)cfg.s.voiceMode != VoiceMode::Vad) audio.prerollFlush();
-  if (!audio.recordStart(12)) { lastError = "录音缓冲分配失败"; return false; }
+  if (!audio.recordStart(12)) { display.drawRecState(false); lastError = "录音缓冲分配失败"; return false; }
   uint32_t t0 = millis();
   uint32_t waitCap = 8000UL + audio.vadStopMs();   // 起始静默 8s + 说完后的判停尾
   bool spoke = false;
@@ -84,6 +84,8 @@ bool LaapVoice::listenAndTranscribe(String& heard) {
   size_t got = audio.recordBytes();
   audio.recordStop();
   display.drawRecState(false);
+  audio.vadReset();   // 清 VAD 残留（v3.51）：容量截断退出时 _vadSpeech 仍为真，
+                      // 冷却结束后会被判成"还在说话"再起一轮空对话（录 8s 静音→"没听清"）
   // 尾部静音裁剪：判停窗口默认 5s，不裁就白传几秒静音（上传量/识别延迟/计费秒数全翻倍）
   { const int16_t* p = audio.recordData();
     size_t samples = got / 2;
@@ -119,16 +121,16 @@ String LaapVoice::converse() {
   // 播报后冷却期内不接受新的按键轮次（VAD 路径一直有这层，按键路径以前没有）：
   // 麦克风增益调到 37.5dB 后，它自己的回声足以被判成"有人在说话"，紧接着按一下 BOOT
   // 就会让它对着自己的尾音再答一次 —— 症状同样是"回答了两次"。
+  // 手动按键授权一次性消费：必须在**所有**早退之前（v3.51 审计：冷却早退曾把它留下，
+  // 残留授权会让下一次 VAD 自动触发绕过唤醒词门）
+  bool manualOnce = g_manualOnce;
+  g_manualOnce = false;
   if ((int32_t)(millis() - _cooldownMs) < 0) {
     metrics.cooldownDrop();   // 冷却期丢弃：37.5dB 高增益下回声自触发的量（/micgain 调参参考）
     Serial.println("[VOICE] 刚播报完还在冷却期，忽略这次触发（防自听见）");
     return "";
   }
   metrics.vadTrigger();       // 一轮真实对话（含"没听清"和唤醒词拒绝）
-  // 手动按键授权一次性消费：提到最前，"没听清/ASR 失败"路径也不残留——
-  // 否则残留的授权会让下一次环境噪声自动触发绕过唤醒词门
-  bool manualOnce = g_manualOnce;
-  g_manualOnce = false;
   String heard;
   if (!listenAndTranscribe(heard)) {
     if (lastError == "没听清") voice.speak("嗯？刚才没听清。", "curious");

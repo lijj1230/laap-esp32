@@ -56,7 +56,8 @@ void AsrClient::warmup() {
   while (base.endsWith("/")) base.remove(base.length() - 1);
   bool dash = base.indexOf("dashscope") >= 0;
   String url = base + (dash ? "/api/v1/services/audio/asr/transcription" : "/audio/transcriptions");
-  int dp = url.indexOf("://"); if (dp < 0) return;
+  int dp = url.indexOf("://");
+  if (dp < 0) { warmUnlock(); return; }   // 畸形 asrBase（少打 https://）：持锁早退=永久死锁整个主循环（v3.51 审计）
   int hp = url.indexOf('/', dp + 3);
   g_warmHost = (hp < 0) ? url.substring(dp + 3) : url.substring(dp + 3, hp);
   String path = url.substring(hp);

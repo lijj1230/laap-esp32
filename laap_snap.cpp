@@ -8,6 +8,7 @@ static const SnapEntry SNAPS[] = {
   { "evolution", "/evolution.json"    },
   { "rules",     "/mem/rules.txt"     },
   { "skills",    "/mem/skills.txt"    },
+  { "relations", "/mem/relations.jsonl" },   // v3.51 审计：关系记忆也是"自我"的一部分，补进快照链
 };
 static const int SNAP_N = sizeof(SNAPS) / sizeof(SNAPS[0]);
 static const char* SNAP_DIR = "/snap";
@@ -70,16 +71,22 @@ bool laapSnapMake(const char* name, bool force) {
     if (f) f.close();
     if (skip) return false;       // 自动档跳过
   }
+  // 先写 tmp 再轮换再转正（v3.51 审计）：原顺序"先删 newest 再 copyFile"——
+  // copyFile 失败（盘满/源文件恰在重写窗口不存在）时 v1 已成空壳且无本体
+  String tmp = newest + ".tmp";
+  LittleFS.remove(tmp);
+  if (!copyFile(tmp.c_str(), e->path)) {
+    LittleFS.remove(tmp);
+    Serial.printf("[SNAP] %s 快照写入失败（轮换未动，旧版保留）\n", name);
+    return false;
+  }
   for (int v = SNAP_KEEP; v >= 2; v--) {                // .2→.3，.1→.2（老的被挤掉）
     String from = snapPath(name, v - 1), to = snapPath(name, v);
     if (LittleFS.exists(to)) LittleFS.remove(to);
     if (LittleFS.exists(from)) LittleFS.rename(from, to);
   }
   if (LittleFS.exists(newest)) LittleFS.remove(newest);
-  if (!copyFile(newest.c_str(), e->path)) {
-    Serial.printf("[SNAP] %s 快照写入失败\n", name);
-    return false;
-  }
+  LittleFS.rename(tmp.c_str(), newest.c_str());
   Serial.printf("[SNAP] %s 已快照（%s）\n", name, e->path);
   return true;
 }
@@ -93,6 +100,12 @@ bool laapSnapRestore(const char* name, int ver) {
   if (!e || ver < 1 || ver > SNAP_KEEP || !dirReady()) return false;
   String src = snapPath(name, ver);
   if (!LittleFS.exists(src)) return false;
+  {   // 空快照拒绝恢复（v3.51 审计：写失败可能留下空壳占着版本号，恢复=把自我清成白纸）
+    File cf = LittleFS.open(src, "r");
+    size_t sz = cf ? cf.size() : 0;
+    if (cf) cf.close();
+    if (!sz) { Serial.printf("[SNAP] %s v%d 是空快照，拒绝恢复\n", name, ver); return false; }
+  }
   if (LittleFS.exists(e->path))                         // 现状先存 .pre（回滚本身也要有后悔药）
     copyFile((String(SNAP_DIR) + "/" + name + ".pre").c_str(), e->path);
   if (!copyFile(e->path, src.c_str())) return false;

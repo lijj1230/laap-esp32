@@ -956,6 +956,7 @@ void MemorySystem::clearAll() {
   LittleFS.remove("/mem/semantic.txt");
   LittleFS.remove("/evolution.json");
   LittleFS.remove(EMB_PATH);              // 向量缓存一并清，否则旧向量错配新记忆
+  LittleFS.remove(REL_PATH);              // 关系记忆也是"自我"：清空后 40 条偏好/承诺仍在盘上并继续进提示词（v3.51 审计）
   _count = 0; _workLen = 0; _workHead = 0;
   _embCount = 0; _embFail = 0;
 }
@@ -991,6 +992,10 @@ String MemorySystem::exportDump() {
   out += "###EVOLUTION\n";
   { File f = LittleFS.open("/evolution.json", "r");
     if (f) { String s = f.readString(); s.trim(); if (s.length()) { out += s; out += '\n'; } f.close(); } }
+  out += "###RELATIONS\n";   // 关系记忆（v3.51 审计补）：与 EPISODES 同规格整行搬运
+  { File f = LittleFS.open(REL_PATH, "r");
+    if (f) { while (f.available()) { String l = f.readStringUntil('\n'); l.trim();
+              if (l.length()) { out += sanitizeUtf8(l); out += '\n'; } } f.close(); } }
   out += "###END\n";
   return out;
 }
@@ -1015,8 +1020,9 @@ bool MemorySystem::applyImport(String& msg) {
   if (!in) { msg = "没收到上传内容"; return false; }
   File epsTmp = LittleFS.open("/mem/episodes.imp", "w");
   if (!epsTmp) { in.close(); msg = "文件系统写入失败"; return false; }
-  int section = 0, nSem = 0, nEps = 0, nEvo = 0;
-  String semBuf, evoBuf;
+  int section = 0, nSem = 0, nEps = 0, nEvo = 0, nRel = 0;
+  bool sawEnd = false;
+  String semBuf, evoBuf, relBuf;
   while (in.available()) {
     String l = in.readStringUntil('\n');
     l.trim();
@@ -1024,20 +1030,30 @@ bool MemorySystem::applyImport(String& msg) {
       if      (l.startsWith("###SEMANTIC"))  section = 1;
       else if (l.startsWith("###EPISODES"))  section = 2;
       else if (l.startsWith("###EVOLUTION")) section = 3;
-      else section = 0;                      // ###LAAP-MEMORY / ###END
+      else if (l.startsWith("###RELATIONS")) section = 4;
+      else if (l.startsWith("###END")) { sawEnd = true; section = 0; }
+      else section = 0;                      // ###LAAP-MEMORY
       continue;
     }
     if (!l.length()) continue;
     if (section == 1) { semBuf += l; nSem++; }
     else if (section == 2) { epsTmp.print(l); epsTmp.print('\n'); nEps++; }
     else if (section == 3) { evoBuf += l; nEvo++; }
+    else if (section == 4) { relBuf += l; relBuf += '\n'; nRel++; }
   }
   in.close();
   epsTmp.close();
   // 认不出格式就别动记忆（宁可不导入，也不能把主人的人格清成白纸）
-  if (!nEps && !nSem && !nEvo) {
+  if (!nEps && !nSem && !nEvo && !nRel) {
     LittleFS.remove("/mem/episodes.imp"); LittleFS.remove(IMP_PATH);
     msg = "内容不像记忆备份（没有 ###SEMANTIC/###EPISODES 段头）";
+    return false;
+  }
+  // 截断备份拒绝（v3.51 审计）：导出侧有 ###END 校验、导入侧没有——上传被截断的备份
+  // 会把情景记忆静默替换成前半段（回执还报"已导入 N 条"）
+  if (!sawEnd) {
+    LittleFS.remove("/mem/episodes.imp"); LittleFS.remove(IMP_PATH);
+    msg = "备份不完整（缺 ###END 结尾，可能上传被截断）——已拒绝，未改动任何记忆";
     return false;
   }
   // 分段可缺：只有情景段才替换情景记忆（否则"只恢复性格"的导入会把记忆清空）
@@ -1051,6 +1067,13 @@ bool MemorySystem::applyImport(String& msg) {
   // 语义/性格：有就覆盖，没有就保留原样
   if (nSem) { File f = LittleFS.open("/mem/semantic.txt", "w"); if (f) { f.print(semBuf); f.close(); } }
   if (nEvo) { File f = LittleFS.open("/evolution.json", "w"); if (f) { f.print(evoBuf); f.close(); } }
+  if (nRel) {   // 关系记忆（v3.51）：有才覆盖，无则保留（老备份没有此段）
+    File rf = LittleFS.open("/mem/relations.jsonl.tmp", "w");
+    if (rf) { rf.print(relBuf); rf.close();
+      LittleFS.remove(REL_PATH);
+      LittleFS.rename("/mem/relations.jsonl.tmp", REL_PATH);
+    }
+  }
   LittleFS.remove(EMB_PATH);   // 向量与行序绑死：换了记忆必须整份作废重建
   LittleFS.remove(IMP_PATH);
   _embCount = 0; _embFail = 0;
@@ -1062,6 +1085,7 @@ bool MemorySystem::applyImport(String& msg) {
   if (nEps) msg += String(nEps) + " 条情景记忆";
   if (nSem) msg += (nEps ? "、" : "") + String("自我认知");
   if (nEvo) msg += ((nEps || nSem) ? "、" : "") + String("性格进化");
+  if (nRel) msg += ((nEps || nSem || nEvo) ? "、" : "") + String(nRel) + " 条关系记忆";
   if (!nEps) msg += "（备份里没有情景段，原有记忆保持不变）";
   Serial.printf("[MEM] %s（_count=%lu）\n", msg.c_str(), (unsigned long)_count);
   return true;

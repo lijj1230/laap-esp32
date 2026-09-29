@@ -97,10 +97,13 @@ void laapToolsInit() {
 // 根因备注：让大模型从搜索结果里"自己得出天气"时，它常因自身人设（无联网能力的生命体）
 // 回答"我查不到/我没有联网能力"。端侧直接取一行纯文本天气更稳更快（2026-09-26）。
 static String httpGetText(const String& host, const String& path, int timeoutMs) {
+  // 与搜索/视觉同持一把网络锁（v3.51 审计：天气是全仓唯一漏网的联网路径，
+  // 与后台独白 TLS 抢 ~40KB 连续块 = 任一方"连接失败"）
+  if (!laapNetLock(1500)) { Serial.println("[WEA] 网络正忙（后台任务占用），本次跳过"); return ""; }
   WiFiClientSecure cli;
   cli.setInsecure();                    // 端侧自签策略，见 README
   cli.setTimeout(timeoutMs);
-  if (!cli.connect(host.c_str(), 443)) return "";
+  if (!cli.connect(host.c_str(), 443)) { laapNetUnlock(); return ""; }
   cli.print(String("GET ") + path + " HTTP/1.1\r\nHost: " + host +
             "\r\nUser-Agent: curl/8.0\r\nAccept: */*\r\nConnection: close\r\n\r\n");
   String resp; resp.reserve(2048);
@@ -113,8 +116,9 @@ static String httpGetText(const String& host, const String& path, int timeoutMs)
   cli.stop();
   int sp = resp.indexOf(' ');
   int status = (sp > 0) ? resp.substring(sp + 1, sp + 4).toInt() : 0;
-  if (status != 200) { Serial.printf("[WEA] HTTP %d\n", status); return ""; }
+  if (status != 200) { Serial.printf("[WEA] HTTP %d\n", status); laapNetUnlock(); return ""; }
   int bs = resp.indexOf("\r\n\r\n");
+  laapNetUnlock();
   return (bs > 0) ? resp.substring(bs + 4) : String("");
 }
 

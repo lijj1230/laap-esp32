@@ -64,6 +64,24 @@ LaapWeb webui;
 
 // 本地小工具：取 JSON 字段原值（容错 "k":"v" 与 "k": "v" 两种写法，数字/布尔按原文返回）。
 // 早期只匹配无空格的 "k":" 形式：遇到带空格 JSON 会解析成空串，配上 _set 哨兵会静默清空配置。
+// \uXXXX 解码辅助（v3.51）：浏览器 JSON.stringify 把换行/控制字符/emoji 编成转义序列，
+// 旧解码把 \n 还原成字母 'n'——多行人设落库即坏
+static unsigned hex4(const String& s, int i) {
+  unsigned v = 0;
+  for (int k = 0; k < 4 && i + k < (int)s.length(); k++) {
+    char c = s[i + k]; v <<= 4;
+    if (c >= '0' && c <= '9') v |= (unsigned)(c - '0');
+    else if (c >= 'a' && c <= 'f') v |= (unsigned)(c - 'a' + 10);
+    else if (c >= 'A' && c <= 'F') v |= (unsigned)(c - 'A' + 10);
+  }
+  return v;
+}
+static void appendUtf8(String& o, unsigned cp) {
+  if (cp < 0x80) o += (char)cp;
+  else if (cp < 0x800) { o += (char)(0xC0 | (cp >> 6)); o += (char)(0x80 | (cp & 0x3F)); }
+  else if (cp < 0x10000) { o += (char)(0xE0 | (cp >> 12)); o += (char)(0x80 | ((cp >> 6) & 0x3F)); o += (char)(0x80 | (cp & 0x3F)); }
+  else { o += (char)(0xF0 | (cp >> 18)); o += (char)(0x80 | ((cp >> 12) & 0x3F)); o += (char)(0x80 | ((cp >> 6) & 0x3F)); o += (char)(0x80 | (cp & 0x3F)); }
+}
 static String jsonField(const String& b, const char* k) {
   String pat = String("\"") + k + "\":";
   int i = b.indexOf(pat);
@@ -81,7 +99,29 @@ static String jsonField(const String& b, const char* k) {
   String v;
   while (j < (int)b.length()) {
     char c = b[j];
-    if (c == '\\' && j + 1 < (int)b.length()) { v += b[j + 1]; j += 2; continue; }
+    if (c == '\\' && j + 1 < (int)b.length()) {
+      char e = b[j + 1];
+      if (e == 'u' && j + 5 < (int)b.length()) {          // \uXXXX（含代理对，v3.51）
+        unsigned cp = hex4(b, j + 2);
+        j += 6;
+        if (cp >= 0xD800 && cp <= 0xDBFF && j + 5 < (int)b.length() && b[j] == '\\' && b[j + 1] == 'u') {
+          unsigned lo = hex4(b, j + 2);
+          if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); j += 6; }
+        }
+        appendUtf8(v, cp);
+        continue;
+      }
+      switch (e) {                                        // \n \t \r 等还原成真实字符（v3.51：旧代码字母化）
+        case 'n': v += '\n'; break;
+        case 't': v += '\t'; break;
+        case 'r': v += '\r'; break;
+        case 'b': v += '\b'; break;
+        case 'f': v += '\f'; break;
+        default:  v += e; break;                          // \" \\ \/ 等
+      }
+      j += 2;
+      continue;
+    }
     if (c == '"') break;
     v += c; j++;
   }
@@ -582,10 +622,12 @@ void LaapWeb::handleSave() {
   if (base.length()) strlcpy(cfg.s.llmBase, base.c_str(), sizeof(cfg.s.llmBase));
   if (flag("key_set")) setSecret(key, cfg.s.llmKey, sizeof(cfg.s.llmKey), "大模型 Key");
   if (model.length()) strlcpy(cfg.s.llmModel, model.c_str(), sizeof(cfg.s.llmModel));
-  if (agent.length()) strlcpy(cfg.s.agentName, agent.c_str(), sizeof(cfg.s.agentName));
-  if (owner.length()) strlcpy(cfg.s.ownerName, owner.c_str(), sizeof(cfg.s.ownerName));
-  if (flag("wcity_set")) strlcpy(cfg.s.city, get("wcity").c_str(), sizeof(cfg.s.city));   // 城市：空=按IP定位
-  if (persona.length()) strlcpy(cfg.s.persona, persona.c_str(), sizeof(cfg.s.persona));
+  // 自由文本一律先按字符边界截断再落库（v3.51）：strlcpy 裸截会在汉字中间切断，
+  // 半个汉字进 LLM 请求体 = 非法 UTF-8 → 400（"设完人设后它就不说话了"）
+  if (agent.length()) strlcpy(cfg.s.agentName, utf8Cut(agent, sizeof(cfg.s.agentName) - 1).c_str(), sizeof(cfg.s.agentName));
+  if (owner.length()) strlcpy(cfg.s.ownerName, utf8Cut(owner, sizeof(cfg.s.ownerName) - 1).c_str(), sizeof(cfg.s.ownerName));
+  if (flag("wcity_set")) strlcpy(cfg.s.city, utf8Cut(get("wcity"), sizeof(cfg.s.city) - 1).c_str(), sizeof(cfg.s.city));   // 城市：空=按IP定位
+  if (persona.length()) strlcpy(cfg.s.persona, utf8Cut(persona, sizeof(cfg.s.persona) - 1).c_str(), sizeof(cfg.s.persona));
   // 只在真的带了字段时才改（原来无条件 toInt()：缺少 tick/thold 的部分保存会把它们打成下限 10）
   String tick = get("tick"), thold = get("thold");
   if (tick.length()) { long v = tick.toInt(); cfg.s.tickSec = (uint32_t)(v < 10 ? 10 : (v > 3600 ? 3600 : v)); }
@@ -723,7 +765,7 @@ void LaapWeb::handleStatus() {
     ",\"uptime_total_min\":" + String(laapUptimeMin()) +
     ",\"heap_kb\":" + String(ESP.getFreeHeap() / 1024) +
     // 环任务栈历史最低余量（字节）：TTS 的 TLS 握手最吃栈，低于 2-3KB 就该警惕
-    ",\"stack_min\":" + String((unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t))) +
+    ",\"stack_min\":" + String((unsigned)uxTaskGetStackHighWaterMark(NULL)) +   // 已是字节（旧代码 ×sizeof(StackType_t) 虚高 4 倍，v3.51）
     // 最大连续块：TLS 握手要一整块 ~40KB，碎片多时"总空闲够"也会连不上（排障关键指标）
     ",\"heap_max_kb\":" + String((unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024)) +
     ",\"wifi_rssi\":" + (WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) : String("0")) +

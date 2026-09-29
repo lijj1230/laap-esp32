@@ -31,7 +31,11 @@ String LlmClient::jsonEscape(const String& s) {
       case '\n': o += "\\n";  break;
       case '\r': o += "";     break;
       case '\t': o += "\\t";  break;
-      default:   o += c;
+      default:
+        // 其余控制字符必须转义成 \uXXXX（裸 0x01-0x1F 是非法 JSON，DeepSeek 严格校验直接 400；
+        // 与 sanitizeUtf8 家族同源教训——v3.51 审计补）
+        if ((unsigned char)c < 0x20) { char b[8]; snprintf(b, sizeof(b), "\\u%04X", (unsigned char)c); o += b; }
+        else o += c;
     }
   }
   return o;
@@ -141,7 +145,9 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
   if (!client) { lastError = "连接失败:" + host; return r; }
 
   uint32_t t0 = millis();
-  String req = String("POST ") + path + " HTTP/1.1\r\nHost: " + host +
+  // Host 头必须带非默认端口（自建网关 https://gw.lan:8443/v1 是最典型填法，v3.51 审计）
+  String hostHdr = (port == 443 || port == 80) ? host : host + ":" + String(port);
+  String req = String("POST ") + path + " HTTP/1.1\r\nHost: " + hostHdr +
     "\r\nAuthorization: Bearer " + cfg.s.llmKey +
     "\r\nContent-Type: application/json\r\nContent-Length: " + body.length() +
     "\r\nConnection: close\r\n\r\n" + body;
@@ -165,8 +171,12 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
   r.httpStatus = (sp > 0) ? resp.substring(sp + 1, sp + 4).toInt() : 0;
   int bodyStart = resp.indexOf("\r\n\r\n");
   String payload = (bodyStart > 0) ? resp.substring(bodyStart + 4) : resp;
-  // 处理 chunked 传输：把行间 chunk 头去掉
-  if (payload.indexOf("{\"id\"") < 0 && payload.length() > 0) {
+  // chunked 只在响应头声明时才去壳（v3.51 审计）：旧实现嗅探 body——成功响应首字段恰是
+  // {"id" 导致最需要去壳时反而跳过；多行 JSON 里恰为纯 hex 的行还会被误删
+  bool chunked = false;
+  { int he = resp.indexOf("Transfer-Encoding");
+    if (he >= 0 && resp.indexOf("chunked", he) >= 0) chunked = true; }
+  if (chunked && payload.length() > 0) {
     String clean; int pos = 0;
     while (pos < (int)payload.length()) {
       int nl = payload.indexOf('\n', pos);
@@ -232,6 +242,11 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
                     fin0.c_str(), maxTokens, bigger);
       LlmReply r2 = chatMsgsContinue(msgs, count, bigger, temperature, depth - 1);
       if (r2.ok) return r2;
+      // r2 也失败：保留它的真实错误（连接失败/HTTP 错误已写入 lastError）——
+      // 旧代码无条件覆盖成"content 为空"，ping() 据此把网络故障误报成"连通正常"（v3.51 审计）
+      if (!lastError.length() || lastError.indexOf("content 为空") >= 0)
+        lastError = "响应 content 为空（思考模型吃满 max_tokens？把单次回复上限调大试试）";
+      return r;
     }
     lastError = "响应 content 为空（思考模型吃满 max_tokens？把单次回复上限调大试试）";
     return r;
@@ -255,6 +270,7 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
   r.say.trim();
 
   // 截断续发：finish_reason=length 且还有续写深度 → 带前文再续（messages≤10 硬守卫）
+  bool extended = false;
   String fin;
   if (depth > 0 && count + 2 <= 12 &&
       extractStringField(payload, "finish_reason", fin) && fin == "length") {
@@ -266,11 +282,14 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
     LlmReply r2 = chatMsgsContinue(msgs2, count + 2, maxTokens, temperature, depth - 1);
     if (r2.ok && r2.say.length()) {
       r.say += r2.say;                              // 续段直接拼接（续写不含表情行）
+      extended = true;
     }
   }
 
-  // 上限 600B≈200 汉字：原来 240B 会把正常回答切在半句话上（"台词被腰斩"）
-  if (r.say.length() > 600) r.say = utf8Cut(r.say, 600);
+  // 上限：常规 600B≈200 汉字（原 240B 会切半句话）；有续写则放宽到 1000B——
+  // 否则首段已超 600B 时续写内容 100% 被截掉，白花一次 API 调用（v3.51 审计）
+  int sayCap = extended ? 1000 : 600;
+  if (r.say.length() > sayCap) r.say = utf8Cut(r.say, sayCap);
   r.ok = true;
   lastError = "";
   // 回绕改造后无起始时刻需要

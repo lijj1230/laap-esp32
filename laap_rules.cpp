@@ -52,7 +52,8 @@ bool LaapRules::apply(const String& llmOutput) {
     ln.trim();
     if (!ln.length()) continue;
     // 剥前缀：- / • / * / 1. / 1、 / ①
-    if (ln[0] == '-' || ln[0] == '•' || ln[0] == '*') { ln = ln.substring(1); ln.trim(); }
+    if (ln[0] == '-' || ln[0] == '*') { ln = ln.substring(1); ln.trim(); }
+    else if (ln.startsWith("•")) { ln = ln.substring(strlen("•")); ln.trim(); }   // '•' 是多字节字面量：ln[0]=='•' 恒假（v3.51 审计），改字符串比较
     else if (ln[0] >= '0' && ln[0] <= '9') {
       // 数字必须紧跟 ". / 、 )" 才算序号：否则"12点睡觉"会被啃成"点睡觉"
       int d = 0;
@@ -62,8 +63,8 @@ bool LaapRules::apply(const String& llmOutput) {
         ln = ln.substring(d + 1); ln.trim();
       }
     }
-    else if (ln[0] == (char)0xE2 && ln.length() > 3) { ln = ln.substring(3); ln.trim(); } // ①等 U+2460 起 3B
-    // 过滤：太短（<4B 不成话）、太长截到上限、明显是解释行（含"规则""输出"开头的元话语）
+    else if ((unsigned char)ln[0] == 0xE2 && ln.length() > 3) { ln = ln.substring(3); ln.trim(); } // ①等 U+2000-2FFF 起 3B
+    // 过滤：<8B 不成话、>160B 丢弃（v3.51 审计：注释曾写"截到上限"，实际是丢行——以代码为准）
     if (ln.length() < 8 || ln.length() > 160) continue;
     if (ln.startsWith("规则") || ln.startsWith("输出") || ln.startsWith("以下") || ln.startsWith("好的")) continue;
     picked[n++] = utf8Cut(ln, RULE_BYTES);

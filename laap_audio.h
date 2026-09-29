@@ -43,6 +43,9 @@ public:
   // ---- VAD ----
   void vadCalibrate(uint32_t ms);    // 静默环境校准
   bool vadSpeaking() const { return _vadSpeech; }
+  // VAD 状态复位（v3.51）：一轮录音结束后清残留——容量截断退出时 _vadSpeech 为真，
+  // 会被冷却后的 loopTick 判成"还在说话"而误起下一轮
+  void vadReset() { _vadSpeech = false; _silenceMs = 0; }
   float micRms() const { return _fastRms; }
   // 触发阈值乘数（自调优旋钮，RSI⑥）：1.0=默认灵敏度，>1 更不敏感（防环境噪声/回声误触发）。
   // 上限 1.6：乘数只升不降的历史曾把它顶到 2.0 → 远场人声全部埋掉（"要凑很近才理人"）

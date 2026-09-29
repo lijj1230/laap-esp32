@@ -58,8 +58,9 @@ bool LaapMetrics::feedback(int v, const String& user, const String& reply) {
     File s = LittleFS.open("/mem/feedback.jsonl", "r");
     size_t sz = s ? s.size() : 0;
     if (s) s.close();
-    if (sz > 24 * 1024) {
-      // 简单封顶：整读 → 只留最后 80 行 → 重写。反馈量级很小（几 KB），不值得更巧
+    if (sz > 40 * 1024) {
+      // 封顶：整读 → 只留最后 80 行 → 重写。阈值必须 > 80 行典型体积（~35KB），
+      // 否则每次追加后仍超限、每条反馈都触发一次 30KB 级重写（v3.51 审计：原 24KB 与保留 80 行自相矛盾）
       File r = LittleFS.open("/mem/feedback.jsonl", "r");
       String keep; int lines = 0;
       while (r && r.available()) {
