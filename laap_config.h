@@ -15,6 +15,8 @@ struct LaapSettings {
   char city[33]      = "";                          // 所在城市（天气用；空=按出口IP定位，定位可能不准）
   uint32_t tickSec   = 30;                          // PSI 心跳周期(秒)
   uint8_t threshold  = 55;                          // 主动表达阈值(0-100)
+  bool    expressEn = true;                         // 主动表达总开关(心跳触发路径；BOOT 键强制表达不受限)
+  uint8_t expressCdMin = 5;                         // 主动表达冷却(分钟，1-60)
   uint16_t idleSilenceMin = 10;                     // 独白起始静默(分钟)
   uint16_t idleEveryMin   = 20;                     // 独白间隔(分钟，0=关闭独白)
   uint8_t quietStart  = 23;                         // 自发说话静音窗起(时)：主动表达+独白深夜不吵人

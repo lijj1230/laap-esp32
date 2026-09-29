@@ -293,9 +293,12 @@ void Cognition::onLetdown(float expectation01) {
 // ================= 情绪 / 欲望 =================
 float Cognition::dominance() const {
   // 进化出的性格直接改变需求权重 —— 这就是自我进化闭环
-  float c = _n.curiosity * (0.6f + _openness);
-  float s = _n.social * (0.6f + _sociability);
-  float sec = _n.security * (0.6f + _sensitivity);
+  // 性格权重封顶 1.2 倍（v3.58）：原 0.6+trait 上限 1.6 倍会把后台阈值实际拉低 1/3
+  // （需求 60% 按 96% 触发=阈值形同虚设），且该参数只涨不跌=单向通胀。封顶后进化仍改
+  // 变触发倾向（0.9→1.2 倍区间），只是不再无界放大；内容/品味层面照常进化不受限
+  float c = _n.curiosity * (0.6f + min(_openness, 0.6f));
+  float s = _n.social * (0.6f + min(_sociability, 0.6f));
+  float sec = _n.security * (0.6f + min(_sensitivity, 0.6f));
   float m = _n.energy; if (_n.expression > m) m = _n.expression;
   if (c > m) m = c; if (s > m) m = s; if (sec > m) m = sec;
   return m;

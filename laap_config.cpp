@@ -29,6 +29,8 @@ void LaapConfig::load() {
   prefs.getString("wcity", s.city, sizeof(s.city));
   s.tickSec   = prefs.getUInt("tick", 30);
   s.threshold = prefs.getUChar("thold", 55);
+  s.expressEn = prefs.getBool("expren", true);
+  s.expressCdMin = prefs.getUChar("expcd", 5);
   s.idleSilenceMin = prefs.getUShort("idlesil", 10);
   s.idleEveryMin   = prefs.getUShort("idleevery", 20);
   s.quietStart     = prefs.getUChar("qstart", 23);
@@ -83,6 +85,8 @@ bool LaapConfig::save() {
   prefs.putString("wcity", s.city);
   prefs.putUInt("tick", s.tickSec);
   prefs.putUChar("thold", s.threshold);
+  prefs.putBool("expren", s.expressEn);
+  prefs.putUChar("expcd", s.expressCdMin);
   prefs.putUShort("idlesil", s.idleSilenceMin);
   prefs.putUShort("idleevery", s.idleEveryMin);
   prefs.putUChar("qstart", s.quietStart);

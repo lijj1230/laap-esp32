@@ -414,6 +414,8 @@ void LaapWeb::handleSettingsPage() {
     "<label>附加人设（可选）</label><textarea id='persona' rows='3'></textarea>"
     "<div class='row'><div style='flex:1'><label>心跳周期（秒）</label><input id='tick' type='number' min='10' max='3600'></div>"
     "<div style='flex:1'><label>主动表达阈值（0-100）</label><input id='thold' type='number' min='10' max='95'></div>"
+    "<div style='flex:1'><label>主动表达冷却（分，1-60）</label><input id='expcd' type='number' min='1' max='60'></div>"
+    "<div style='flex:1'><label>主动表达</label><select id='expren'><option value='1'>开</option><option value='0'>关</option></select></div>"
     "<div style='flex:1'><label>独白静默（分）</label><input id='idlesil' type='number' min='1' max='240'></div>"
     "<div style='flex:1'><label>独白间隔（分，0=关）</label><input id='idleevery' type='number' min='0' max='240'></div>"
     "<div style='flex:1'><label>静音窗起（时）</label><input id='qstart' type='number' min='0' max='23'></div>"
@@ -483,7 +485,7 @@ void LaapWeb::handleSettingsPage() {
     // 保存一次就把真 Key 覆盖成 "(sk-***abcd)" → 之后 401（这正是"之前正常、后来不通"的真凶）
     "ssid.value=s.ssid;base.value=s.llm_base;key.value='';key.placeholder=s.llm_key_masked?'已配置（'+s.llm_key_masked+'），留空=保持不变':'未配置，请填写';"
     "model.value=s.llm_model;agent.value=s.agent;owner.value=s.owner;wcity.value=s.city||'';persona.value=s.persona;"   // key 见上行：只留 placeholder 提示
-    "tick.value=s.tick;thold.value=s.threshold;idlesil.value=s.idle_silence;idleevery.value=s.idle_every;qstart.value=s.quiet_start;qend.value=s.quiet_end;volume.value=s.volume;brightness.value=s.brightness;screenoff.value=s.screen_off;vadstop.value=s.vad_stop;llmcont.value=s.llm_continue;llmtok.value=s.llm_max_tokens;nothink.checked=!!s.nothink;srchkeys.value=s.search_keys||'';srchapi.value=s.search_api||'';"
+    "tick.value=s.tick;thold.value=s.threshold;expcd.value=s.express_cd_min||5;expren.value=s.express_en?'1':'0';idlesil.value=s.idle_silence;idleevery.value=s.idle_every;qstart.value=s.quiet_start;qend.value=s.quiet_end;volume.value=s.volume;brightness.value=s.brightness;screenoff.value=s.screen_off;vadstop.value=s.vad_stop;llmcont.value=s.llm_continue;llmtok.value=s.llm_max_tokens;nothink.checked=!!s.nothink;srchkeys.value=s.search_keys||'';srchapi.value=s.search_api||'';"
     "vmode.value=s.voice_mode;ttsch.value=s.tts_channel;ttsvoice.value=s.tts_voice;ttsrate.value=s.tts_rate;"
     "volcappid.value=s.volc_appid;volctoken.value=s.volc_token_masked?'':'';volctoken.placeholder=s.volc_token_masked?'已配置，留空保持不变':'未配置';"
     "volcvoice.value=s.volc_voice;asrbase.value=s.asr_base;asrkey.value='';asrkey.placeholder=s.asr_key_masked?'已配置，留空保持不变':'未配置';"
@@ -497,7 +499,7 @@ void LaapWeb::handleSettingsPage() {
     "async function save(e){e.preventDefault();"
     "const b=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},"
     "body:JSON.stringify({ssid:ssid.value,pass:pass.value,base:base.value,key:key.value,key_set:1,model:model.value,"
-    "agent:agent.value,agent_set:1,owner:owner.value,owner_set:1,wcity:wcity.value,wcity_set:1,persona:persona.value,persona_set:1,tick:tick.value,thold:thold.value,"
+    "agent:agent.value,agent_set:1,owner:owner.value,owner_set:1,wcity:wcity.value,wcity_set:1,persona:persona.value,persona_set:1,tick:tick.value,thold:thold.value,expren:expren.value,expren_set:1,expcd:expcd.value,expcd_set:1,"
     "idlesil:idlesil.value,idleevery:idleevery.value,qstart:qstart.value,qend:qend.value,volume:volume.value,brightness:brightness.value,screenoff:screenoff.value,vadstop:vadstop.value,llmcont:llmcont.value,llmtok:llmtok.value,nothink:nothink.checked?1:0,srchkeys:srchkeys.value,srchkeys_set:1,srchapi:srchapi.value,srchapi_set:1,"
     "vmode:vmode.value,ttsch:ttsch.value,ttsvoice:ttsvoice.value,ttsvoice_set:1,ttsrate:ttsrate.value,ttsrate_set:1,"
     "volcappid:volcappid.value,volcappid_set:1,volctoken:volctoken.value,volctoken_set:1,volcvoice:volcvoice.value,volcvoice_set:1,"
@@ -605,6 +607,8 @@ void LaapWeb::handleSave() {
   String tick = get("tick"), thold = get("thold");
   if (tick.length()) { long v = tick.toInt(); cfg.s.tickSec = (uint32_t)(v < 10 ? 10 : (v > 3600 ? 3600 : v)); }
   if (thold.length()) { long v = thold.toInt(); cfg.s.threshold = (uint8_t)(v < 10 ? 10 : (v > 95 ? 95 : v)); }
+  if (flag("expren_set")) cfg.s.expressEn = get("expren").toInt() != 0;
+  if (flag("expcd_set")) { long v = get("expcd").toInt(); cfg.s.expressCdMin = (uint8_t)(v < 1 ? 1 : (v > 60 ? 60 : v)); }
   String idls = get("idlesil"), idev = get("idleevery");
   if (idls.length()) { long v = idls.toInt(); cfg.s.idleSilenceMin = (uint16_t)(v < 1 ? 1 : (v > 240 ? 240 : v)); }
   if (idev.length()) { long v = idev.toInt(); cfg.s.idleEveryMin = (uint16_t)(v < 0 ? 0 : (v > 240 ? 240 : v)); }
@@ -685,6 +689,8 @@ void LaapWeb::handleStatus() {
     "\",\"persona\":\"" + jsonEsc(cfg.s.persona) +
     "\",\"tick\":" + cfg.s.tickSec +
     ",\"threshold\":" + cfg.s.threshold +
+    ",\"express_en\":" + (cfg.s.expressEn ? "true" : "false") +
+    ",\"express_cd_min\":" + cfg.s.expressCdMin +
     ",\"idle_silence\":" + cfg.s.idleSilenceMin +
     ",\"idle_every\":" + cfg.s.idleEveryMin +
     ",\"quiet_start\":" + cfg.s.quietStart +

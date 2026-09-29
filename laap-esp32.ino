@@ -194,7 +194,9 @@ void arisExpress(bool forced, const String& trigger) {
   // forced=主人按了 BOOT 键（明确要求它说一句），不受冷却限制。
   static uint32_t s_lastExpressMs = 0;
   bool firstSinceBoot = (s_lastExpressMs == 0);      // 刚开机不该被冷却凭空堵住
-  if (!forced && !firstSinceBoot && millis() - s_lastExpressMs < 5UL * 60000UL) {
+  // 冷却可配（v3.58）：1-60 分钟钳制（防配置页写 0/255 造成刷屏或永不表达）
+  uint32_t cdMin = cfg.s.expressCdMin < 1 ? 1 : (cfg.s.expressCdMin > 60 ? 60 : cfg.s.expressCdMin);
+  if (!forced && !firstSinceBoot && millis() - s_lastExpressMs < cdMin * 60000UL) {
     Serial.printf("[LAAP] 主动表达冷却中（距上次 %lu 秒，触发=%s）\n",
                   (unsigned long)((millis() - s_lastExpressMs) / 1000), trigger.c_str());
     return;
@@ -1675,7 +1677,7 @@ void psiTick() {
 
   // 需求过阈值 → 主动表达
   float th = cfg.s.threshold / 100.0f;
-  if (mind.dominance() >= th) {
+  if (cfg.s.expressEn && mind.dominance() >= th) {
     arisExpress(false, "tick");
   }
 
