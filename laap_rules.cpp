@@ -88,6 +88,7 @@ bool LaapRules::apply(const String& llmOutput) {
 }
 
 void LaapRules::clear() {
+  laapSnapMake("rules", false);   // 清空前拍快照（v3.51：与 apply 同规格，/rules clear 也是破坏性操作）
   LittleFS.remove(RULES_PATH);
   _cache = "";
   _loaded = true;

@@ -12,8 +12,7 @@ static const SnapEntry SNAPS[] = {
 };
 static const int SNAP_N = sizeof(SNAPS) / sizeof(SNAPS[0]);
 static const char* SNAP_DIR = "/snap";
-static const int SNAP_KEEP = 3;              // 每个文件留 3 版
-static const uint32_t SNAP_MIN_INTERVAL_MS = 12UL * 3600UL * 1000UL;  // 自动档节流
+static const uint32_t SNAP_MIN_INTERVAL_MS = 12UL * 3600UL * 1000UL;  // 自动档节流（SNAP_KEEP 在 laap_snap.h）
 
 static const SnapEntry* findEntry(const char* name) {
   for (int i = 0; i < SNAP_N; i++)
@@ -109,6 +108,7 @@ bool laapSnapRestore(const char* name, int ver) {
   if (LittleFS.exists(e->path))                         // 现状先存 .pre（回滚本身也要有后悔药）
     copyFile((String(SNAP_DIR) + "/" + name + ".pre").c_str(), e->path);
   if (!copyFile(e->path, src.c_str())) return false;
+  LittleFS.remove("/mem/emb.bin");   // 向量与行序绑死：恢复后整份重建（v3.51：原来只靠条数不符兜底）
   Serial.printf("[SNAP] %s 已恢复到第 %d 版（原状态在 .pre）\n", name, ver);
   return true;
 }
@@ -128,7 +128,7 @@ String laapSnapListJson() {
       // ts<1.7e9（NTP 同步前写的）：年龄没有意义，报 -1 让前端显示"时间未知"
       int32_t ageH = (lw < 1700000000) ? -1 : (int32_t)(((long)time(nullptr) - (long)lw) / 3600L);
       if (any) j += ",";
-      j += String("{\"n\":") + v + ",\"kb\":" + (f.size() / 1024) + ",\"age_h\":" + ageH + "}";
+      j += String("{\"n\":") + v + ",\"kb\":" + ((f.size() + 512) / 1024) + ",\"age_h\":" + ageH + "}";   // 四舍五入（v3.51：整除让 <1KB 全显 0）
       f.close();
       any = true;
     }

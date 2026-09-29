@@ -13,16 +13,25 @@ void LaapSkills::ensureLoaded() {
   _loaded = true;
   File f = LittleFS.open(SKILLS_PATH, "r");
   if (!f) return;
-  while (f.available() && _n < SKILLS_MAX) {
+  while (f.available()) {
     String ln = f.readStringUntil('\n');
     ln.trim();
     int b1 = ln.indexOf('|');
     if (b1 <= 0) continue;
     int b2 = ln.indexOf('|', b1 + 1);
-    _s[_n].trig = ln.substring(0, b1);
-    _s[_n].instr = (b2 > 0) ? ln.substring(b1 + 1, b2) : ln.substring(b1 + 1);
-    _s[_n].hits = (b2 > 0) ? (uint16_t)ln.substring(b2 + 1).toInt() : 0;
-    if (_s[_n].trig.length() && _s[_n].instr.length()) _n++;
+    String trig = ln.substring(0, b1);
+    String instr = (b2 > 0) ? ln.substring(b1 + 1, b2) : ln.substring(b1 + 1);
+    uint16_t hits = (b2 > 0) ? (uint16_t)ln.substring(b2 + 1).toInt() : 0;
+    if (!trig.length() || !instr.length()) continue;
+    if (_n < SKILLS_MAX) {
+      _s[_n].trig = trig; _s[_n].instr = instr; _s[_n].hits = hits; _n++;
+    } else {
+      // 满了：与"淘汰最冷"同口径——顶掉当前 hits 最低者，而不是静默丢后面的行
+      // （v3.51：原来读满 12 条即停，文件里新写的技能重启后消失）
+      int coldest = 0;
+      for (int k = 1; k < _n; k++) if (_s[k].hits < _s[coldest].hits) coldest = k;
+      if (hits > _s[coldest].hits) { _s[coldest].trig = trig; _s[coldest].instr = instr; _s[coldest].hits = hits; }
+    }
   }
   f.close();
 }
@@ -82,6 +91,7 @@ void LaapSkills::hit(const String& userText) {
 }
 
 void LaapSkills::clear() {
+  laapSnapMake("skills", false);   // 清空前拍快照（v3.51：与 teach 同规格）
   _n = 0;
   LittleFS.remove(SKILLS_PATH);
 }

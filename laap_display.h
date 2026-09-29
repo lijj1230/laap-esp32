@@ -15,7 +15,7 @@
 #define SZP_LCD_BL       42
 #define SZP_LCD_W        320
 #define SZP_LCD_H        240
-#define SZP_LCD_SPI_HZ   40000000
+#define SZP_LCD_SPI_HZ   80000000   // 硬件实测稳定（ST7789 标称 ~15MHz，本屏 80MHz 无异常；v3.51 起唯一来源）
 
 // RGB565 常用色
 #define RGB565(r,g,b) ((((r)&0xF8)<<8)|(((g)&0xFC)<<3)|((b)>>3))

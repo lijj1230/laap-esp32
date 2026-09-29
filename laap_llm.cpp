@@ -12,10 +12,11 @@ String LlmClient::buildUrl() const {
   String base(cfg.s.llmBase);
   base.trim();
   while (base.endsWith("/")) base.remove(base.length() - 1);
-  // 已带 /v1 /v3 /v4 等版本段 → 直接拼 chat/completions
+  // 已带 /v1 /v3 /v4 等版本段 → 直接拼 chat/completions。
+  // 段长限 2-3 且不可是整段域名（"v1.example.com" 不该被当成版本段——v3.51）
   int slash = base.lastIndexOf('/');
   String last = slash >= 0 ? base.substring(slash + 1) : "";
-  bool hasVer = (last.length() >= 2 && last[0] == 'v' && isDigit(last[1]));
+  bool hasVer = (last.length() >= 2 && last.length() <= 3 && last[0] == 'v' && isDigit(last[1]));
   if (base.indexOf("/chat/completions") >= 0) return base;
   if (hasVer) return base + "/chat/completions";
   return base + "/v1/chat/completions";
@@ -41,6 +42,24 @@ String LlmClient::jsonEscape(const String& s) {
   return o;
 }
 
+// \uXXXX 解码辅助（v3.51）：网关以 ensure_ascii 返回中文时，旧代码整段跳过=缺字/空回复
+static unsigned llmHex4(const String& s, int i) {
+  unsigned v = 0;
+  for (int k = 0; k < 4 && i + k < (int)s.length(); k++) {
+    char c = s[i + k]; v <<= 4;
+    if (c >= '0' && c <= '9') v |= (unsigned)(c - '0');
+    else if (c >= 'a' && c <= 'f') v |= (unsigned)(c - 'a' + 10);
+    else if (c >= 'A' && c <= 'F') v |= (unsigned)(c - 'A' + 10);
+  }
+  return v;
+}
+static void llmAppendUtf8(String& o, unsigned cp) {
+  if (cp < 0x80) o += (char)cp;
+  else if (cp < 0x800) { o += (char)(0xC0 | (cp >> 6)); o += (char)(0x80 | (cp & 0x3F)); }
+  else if (cp < 0x10000) { o += (char)(0xE0 | (cp >> 12)); o += (char)(0x80 | ((cp >> 6) & 0x3F)); o += (char)(0x80 | (cp & 0x3F)); }
+  else { o += (char)(0xF0 | (cp >> 18)); o += (char)(0x80 | ((cp >> 12) & 0x3F)); o += (char)(0x80 | ((cp >> 6) & 0x3F)); o += (char)(0x80 | (cp & 0x3F)); }
+}
+
 // 宽松提取 "key":"value"（处理 \" \\ \n \t \uXXXX 转义）
 bool LlmClient::extractStringField(const String& json, const char* key, String& out) {
   String pat = String("\"") + key + "\"";
@@ -58,7 +77,14 @@ bool LlmClient::extractStringField(const String& json, const char* key, String& 
           if (n == 'n') v += '\n';
           else if (n == 't') v += '\t';
           else if (n == 'u' && j + 5 < (int)json.length()) {
-            // \uXXXX —— 常见仅为标点/emoji，跳过
+            // \uXXXX 解码（v3.51）：含代理对
+            unsigned cp = llmHex4(json, j + 2);
+            if (cp >= 0xD800 && cp <= 0xDBFF && j + 11 < (int)json.length() &&
+                json[j + 6] == '\\' && json[j + 7] == 'u') {
+              unsigned lo = llmHex4(json, j + 8);
+              if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); j += 6; }
+            }
+            llmAppendUtf8(v, cp);
             j += 4;
           } else v += n; // \" \\ \/ \b \f
           j += 2;
@@ -107,12 +133,12 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
   int hp = url.indexOf('/', dp + 3);
   String host = (hp < 0) ? url.substring(dp + 3) : url.substring(dp + 3, hp);
   String path = (hp < 0) ? "/" : url.substring(hp);
-  int port = 443;
+  bool useTls = url.startsWith("https");
+  int port = useTls ? 443 : 80;   // http:// 未写端口时别再连 443（v3.51）
   if (host.indexOf(':') >= 0) { // 自定义端口 http(s)://host:port
     port = host.substring(host.indexOf(':') + 1).toInt();
     host = host.substring(0, host.indexOf(':'));
   }
-  bool useTls = url.startsWith("https");
 
   String body = String("{\"model\":\"") + cfg.s.llmModel + "\",\"messages\":[";
   for (int i = 0; i < count; i++) {
@@ -140,7 +166,7 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
                   attempt + 1,
                   (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024),
                   600 + attempt * 700);
-    vTaskDelay(pdMS_TO_TICKS(600 + attempt * 700));
+    if (attempt < 2) vTaskDelay(pdMS_TO_TICKS(600 + attempt * 700));   // 最后一次失败不必再白等 2s（v3.51）
   }
   if (!client) { lastError = "连接失败:" + host; return r; }
 

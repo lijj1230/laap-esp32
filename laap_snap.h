@@ -18,6 +18,9 @@
 // logical 名 → 磁盘路径的登记表（想加新文件：表里添一行即可）
 struct SnapEntry { const char* name; const char* path; };
 
+// 每个文件保留的版本数（v3.51：唯一定义——web 的 ver 上限曾硬编码 3）
+constexpr int SNAP_KEEP = 3;
+
 // 拍一份（自动档按 12h 节流）。返回是否真的拍了。
 bool laapSnapMake(const char* name, bool force = false);
 // 全部登记文件各拍一份（force 透传）

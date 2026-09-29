@@ -88,7 +88,14 @@ static uint8_t g_teachRetry = 0;
 // 静默息屏 / 累计运行时长
 static uint32_t g_lastActivityMs = 0;      // 最近一次"值得亮屏"的活动
 static uint32_t g_uptimeBaseMin = 0;       // 开机时读回的累计运行分钟（NVS）
-uint32_t laapUptimeMin() { return g_uptimeBaseMin + millis() / 60000UL; }
+uint32_t laapUptimeMin() {
+  // 49.7 天 millis 回绕补偿（v3.51）：回绕后本段分钟数曾清零，累计时长倒退约 71582 分钟
+  static uint32_t s_lastMs = 0, s_wrapMin = 0;
+  uint32_t now = millis();
+  if (now < s_lastMs) s_wrapMin += 71583UL;    // 4294967296ms ≈ 71582.8 分钟
+  s_lastMs = now;
+  return g_uptimeBaseMin + s_wrapMin + now / 60000UL;
+}
 void laapUptimePersist() { cfg.saveUptime(laapUptimeMin()); }
 
 // 点亮屏幕（任何交互调用）：息屏时恢复背光 + 记活动时刻
@@ -1596,7 +1603,7 @@ void psiTick() {
   mind.trust += (0.60f - mind.trust) * 0.01f * dtMin;
   // 小凌⑥: 信任值变化超 ±0.05 才落 NVS（原来只在 cfg.save() 时顺带写，重启回滚）
   static float s_lastTrustSaved = -1;
-  if (s_lastTrustSaved < 0 || (mind.trust - s_lastTrustSaved > 0.05f) || (s_lastTrustSaved - mind.trust > 0.05f)) {
+  if (s_lastTrustSaved < 0 || (mind.trust - s_lastTrustSaved > 0.03f) || (s_lastTrustSaved - mind.trust > 0.03f)) {   // 0.05→0.03：单次 👍(+0.04)/👎(-0.03) 也要落盘（原死区让其重启即回滚，v3.51）
     s_lastTrustSaved = mind.trust;
     laapTrustSet(mind.trust);
     cfg.saveTrust();
@@ -1856,9 +1863,9 @@ void serialCli() {
       const size_t CAP = 16000 * 8;             // 最多 8 秒
       if (!capBuf) {
         capBuf = (int16_t*)heap_caps_malloc(CAP * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-        if (!capBuf) capBuf = (int16_t*)malloc(CAP * sizeof(int16_t));
       }
-      if (!capBuf) { Serial.println("[ASR] 缓冲分配失败"); continue; }
+      // 不回落内部堆（v3.51）：256KB 常驻内部堆会让之后所有 TLS"连接失败"，宁可不跑这个诊断
+      if (!capBuf) { Serial.println("[ASR] PSRAM 缓冲分配失败（无 PSRAM 或不足），跳过 /asrloop"); continue; }
       Serial.printf("[ASR] 自听回环：让它说「%s」…\n", txt.c_str());
       laapTtsCaptureBegin(capBuf, CAP, 24000);
       bool spoke = edgeTts.speak(txt, String(cfg.s.ttsVoice), String(cfg.s.ttsRate), false);

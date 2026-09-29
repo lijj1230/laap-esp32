@@ -398,7 +398,7 @@ String LaapSearch::searchLocked(const String& query, int maxHit, int maxLen) {
     err2 = "DDG跳过(连败退避)";
   } else {
     r = searchDdg(q, maxHit, maxLen);
-    if (r.length()) return r;
+    if (r.length()) { s_ddgFail = 0; return r; }   // 成功即复位退避（v3.51：原来只涨不落，DDG 恢复后仍被压 10 分钟）
     err2 = lastError;
     s_ddgFail++; s_ddgSkipMs = millis();
     if (s_ddgFail >= 2) Serial.println("[SEARCH] DDG 连败，10 分钟内跳过它");

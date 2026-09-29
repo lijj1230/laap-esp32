@@ -137,7 +137,7 @@ void LaapDisplay::begin() {
   io_config.cs_gpio_num = -1;          // NC：CS 由 PCA9557 常选
   io_config.dc_gpio_num = SZP_LCD_DC;
   io_config.spi_mode = 2;
-  io_config.pclk_hz = 80 * 1000 * 1000;
+  io_config.pclk_hz = SZP_LCD_SPI_HZ;   // 常量唯一定义（v3.51：原来头文件写 40MHz、这里硬编码 80MHz）
   io_config.trans_queue_depth = 10;
   io_config.lcd_cmd_bits = 8;
   io_config.lcd_param_bits = 8;
@@ -185,6 +185,7 @@ String LaapDisplay::lcdDiag() {
 }
 
 void LaapDisplay::setBrightness(uint8_t pct) {
+  if (pct > 100) pct = 100;      // 内部 API 自钳位（v3.51）：>100 会让 duty 变负 → uint32 巨值
   brightness = pct;
   // 实战派背光低电平点亮（反相）：亮度 pct 越大占空越小；息屏期间保持全灭
   int duty = 255 - (int)(255 * pct / 100);
@@ -417,6 +418,7 @@ void LaapDisplay::drawStatusLine(float tempC, int rssi, uint32_t heapKb, uint32_
 void LaapDisplay::drawNeeds(float energy, float curiosity, float social, float security, float expression) {
   float v[5] = {energy, curiosity, social, security, expression};
   for (int i = 0; i < 5; i++) {
+    if (!isfinite(v[i])) v[i] = 0;   // NaN 直通比较会得到未定义 int（v3.51）
     int p = (int)((v[i] < 0 ? 0 : (v[i] > 1 ? 1 : v[i])) * 100);
     if (p != needPct[i]) { needPct[i] = p; }
   }

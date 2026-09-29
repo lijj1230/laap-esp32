@@ -13,30 +13,10 @@ void LaapConfig::begin() {
 }
 
 void LaapConfig::load() {
-  s.wifiSsid[0] = s.wifiPass[0] = 0;
-  strlcpy(s.llmBase, "https://api.deepseek.com", sizeof(s.llmBase));
-  strlcpy(s.llmModel, "deepseek-chat", sizeof(s.llmModel));
-  strlcpy(s.agentName, "Aris", sizeof(s.agentName));
-  strlcpy(s.ownerName, "主人", sizeof(s.ownerName));
-  s.tickSec = 30;
-  s.threshold = 55;
-  s.idleSilenceMin = 10;
-  s.idleEveryMin = 20;
-  s.quietStart = 23;
-  s.quietEnd = 6;
-  s.volume = 70;
-  s.brightness = 90;
-  s.screenOffSec = 60;
-  s.llmContinue = 1;
-  s.llmMaxTokens = 500;
-  s.llmNoThink = 1;
-  s.voiceMode = 1;
-  s.ttsChannel = 0;
-  strlcpy(s.ttsVoice, "zh-CN-XiaoxiaoNeural", sizeof(s.ttsVoice));
-  strlcpy(s.ttsRate, "+0%", sizeof(s.ttsRate));
-  strlcpy(s.volcVoice, "zh_female_cancan_mars_bigtts", sizeof(s.volcVoice));
-  strlcpy(s.asrBase, "https://api.siliconflow.cn/v1", sizeof(s.asrBase));
-  strlcpy(s.asrModel, "FunAudioLLM/SenseVoiceSmall", sizeof(s.asrModel));
+  // 全量回默认再读 NVS（v3.51）：原来手动重置 9 个字符串+若干数值，其余 20 个字符字段
+  // 在 getString 失败时不写缓冲（本版核心语义）→ load 二次调用会静默沿用 RAM 旧值。
+  // 结构体默认值就是唯一权威默认表，整份重置后再由 NVS 覆盖
+  s = LaapSettings();
 
   prefs.getString("ssid", s.wifiSsid, sizeof(s.wifiSsid));
   prefs.getString("pass", s.wifiPass, sizeof(s.wifiPass));
@@ -90,10 +70,13 @@ void LaapConfig::load() {
 }
 
 bool LaapConfig::save() {
-  prefs.putString("ssid", s.wifiSsid);
+  // 关键键写失败要出声（v3.51）：原来 save() 恒 true，NVS 满/句柄异常时网页显示"已保存"、
+  // 重启还原（历史上"配置重启还原"类故障最易被误判为"网页没保存"）
+  bool ok = (prefs.putString("ssid", s.wifiSsid) != 0);
   prefs.putString("pass", s.wifiPass);
   prefs.putString("llmbase", s.llmBase);
-  prefs.putString("llmkey", s.llmKey);
+  ok = (prefs.putString("llmkey", s.llmKey) != 0) && ok;
+  if (!ok) Serial.println("[LAAP] !! 配置写入 NVS 失败（空间不足？）——本次保存可能未生效");
   prefs.putString("llmmodel", s.llmModel);
   prefs.putString("agent", s.agentName);
   prefs.putString("owner", s.ownerName);
@@ -137,7 +120,7 @@ bool LaapConfig::save() {
   prefs.putString("vkey", s.visionKey);
   prefs.putString("vmodel", s.visionModel);
   _provisioned = (s.wifiSsid[0] != 0) && (s.llmKey[0] != 0);
-  return true;
+  return ok;
 }
 
 // 轻量保存：只写信任值（心跳里周期调用，避免整盘 30+ 键重写磨损 NVS）

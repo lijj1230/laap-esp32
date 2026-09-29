@@ -68,6 +68,8 @@ private:
   String _failRing[6];
   uint8_t _failIdx = 0, _failCnt = 0;
   uint32_t _lastPersistMs = 0;        // 失败限速节流（60s）
+  uint32_t _lastFailMs = 0;           // 失败即时写自身的节流基准（v3.51：与周期快照解耦，
+                                      // 否则 5 分钟快照刚落盘后 60s 内的失败不会即时写）
   LaapMetrics* _prev = nullptr;       // 上一段会话快照（loadPrev 填充；指针防自嵌套）
   void failSticky();                  // 失败计数+1 后的节流即时落盘
 };

@@ -288,6 +288,7 @@ void LaapWeb::registerRoutes() {
         Serial.printf("[OTA] 失败: %s\n", msg.c_str());
         server.send(500, "application/json",
           String("{\"ok\":false,\"msg\":\"写入失败: ") + msg + "\"}");
+        otaErr = "";   // 用完即清（v3.51）：否则下次"非 multipart POST 不触发回调"时会把旧错误当本次原因
       }
     },
     [this]() {
@@ -746,7 +747,7 @@ void LaapWeb::handleStatus() {
     "\",\"vision_llm_base\":\"" + jsonEsc(cfg.s.visionLlmBase) +
     "\",\"vision_key_masked\":\"" + (String(cfg.s.visionKey).length() ? "已配置" : "") +
     "\",\"vision_model\":\"" + jsonEsc(cfg.s.visionModel) + "\"," +
-    "\"llm_ctx\":\"" + String(laapLastReqShape()) + "\"," +
+    "\"llm_ctx\":\"" + jsonEsc(laapLastReqShape()) + "\"," +   // 转义（v3.51）
     "\"vision_ready\":" + (vision.available() ? "true" : "false") +
     ",\"voice_ready\":" + (voice.ready() ? "true" : "false") +
     ",\"vad_paused\":" + (voice.vadPaused() ? "true" : "false") +
@@ -773,7 +774,7 @@ void LaapWeb::handleStatus() {
     ",\"needs\":" + needs +
     // 主动表达的"闸门状态"：dominance 越过 threshold 就会说话，冷却 3 分钟内不再说
     ",\"dominance\":" + String(mind.dominance(), 2) +
-    ",\"idle\":\"" + laapIdleInfo() + "\"" +
+    ",\"idle\":\"" + jsonEsc(laapIdleInfo()) + "\"" +   // 转义（v3.51：拼进 JSON 前统一过 jsonEsc）
     // 评估埋点（本次开机）：RSI 闭环的 fitness 端，网页/脚本都从这里读
     ",\"metrics\":{" + metrics.json() + "}" +
     "}";
@@ -966,7 +967,7 @@ void LaapWeb::handleMemImport() {
   bool ok = memory.applyImport(msg);
   if (ok) mind.reloadEvolution();   // 让盘上的性格进化立刻生效（否则被运行中的旧值覆盖）
   server.send(ok ? 200 : 500, "application/json",
-              String("{\"ok\":") + (ok ? "true" : "false") + ",\"msg\":\"" + msg + "\"}");
+              String("{\"ok\":") + (ok ? "true" : "false") + ",\"msg\":\"" + jsonEsc(msg) + "\"}");   // 转义（v3.51）
 }
 
 void LaapWeb::handleClear() {
@@ -1050,13 +1051,13 @@ void LaapWeb::handleSnapRestore() {
   String b = server.arg("plain");
   String name = jsonField(b, "name");
   int ver = (int)jsonField(b, "ver").toInt();
-  if (!name.length() || ver < 1 || ver > 3) {
+  if (!name.length() || ver < 1 || ver > SNAP_KEEP) {   // 版本上限用唯一定义（v3.51：原来硬编码 3）
     server.send(400, "application/json", "{\"ok\":false,\"msg\":\"name/ver 缺失或非法\"}");
     return;
   }
   if (!laapSnapRestore(name.c_str(), ver)) {
     server.send(500, "application/json",
-                String("{\"ok\":false,\"msg\":\"恢复失败：") + name + " 没有第 " + ver + " 版快照\"}");
+                String("{\"ok\":false,\"msg\":\"恢复失败：") + jsonEsc(name) + " 没有第 " + ver + " 版快照\"}");
     return;
   }
   // 恢复后必须重启：工作记忆环、语义向量缓存都与盘上文件绑死，热切换必错位

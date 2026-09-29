@@ -36,6 +36,7 @@ static void escTo(String& o, const String& s) {
     else if (c == '\n') o += "\\n";
     else if (c == '\r') o += "";
     else if (c == '\t') o += ' ';
+    else if ((unsigned char)c < 0x20) { char b[8]; snprintf(b, sizeof(b), "\\u%04X", (unsigned char)c); o += b; }   // 其余控制字符：JSONL 合法性（v3.51）
     else o += c;
   }
 }
@@ -43,9 +44,9 @@ static void escTo(String& o, const String& s) {
 // 单条反馈一行 JSONL。文件封顶 ~24KB，超了就重写保留最近 80 条：
 // 反馈是给"夜间反思当素材 / 人工复盘"用的，留最近的比留全部更有用。
 bool LaapMetrics::feedback(int v, const String& user, const String& reply) {
-  if (v > 0) fbUp++; else fbDown++;
   File f = LittleFS.open("/mem/feedback.jsonl", "a");
   if (!f) { Serial.println("[METRICS] 反馈落盘失败（feedback.jsonl 打不开）"); return false; }
+  if (v > 0) fbUp++; else fbDown++;   // 计数移到落盘成功之后（v3.51：写失败也计数=永久偏差）
   time_t now = time(nullptr);
   String line = String("{\"t\":") + (now > 1600000000 ? String((long)now) : String("-1")) +
                 ",\"v\":" + v +
@@ -105,6 +106,7 @@ void LaapMetrics::failNote(const String& s) {
   if (!s.length()) return;
   String note = s;
   note.trim();
+  if (!note.length()) return;   // 纯空白：写进环会产出空编号行并让 loadPrev 推导错位（v3.51）
   if (note.length() > 90) note = utf8Cut(note, 90);   // 字符边界截断（substring 半截汉字→归纳请求体 400）
   if (_failCnt && _failRing[(_failIdx + 5) % 6] == note) return;   // 连败同错误只记一条
   _failRing[_failIdx] = note;
@@ -129,6 +131,7 @@ String LaapMetrics::feedbackDigest(int maxLines) {
   if (!f) return "";
   String ring[8];
   if (maxLines > 8) maxLines = 8;
+  if (maxLines < 1) maxLines = 1;   // 下钳：<=0 会在取模处除零（v3.51）
   int idx = 0, cnt = 0;
   while (f.available()) {
     String ln = f.readStringUntil('\n');
@@ -217,7 +220,10 @@ void LaapMetrics::loadPrev() {
 }
 
 void LaapMetrics::failSticky() {
-  if (_lastPersistMs && millis() - _lastPersistMs < 60000) return;   // 失败写限速 60s
+  // 只受"失败即时写"自身节流（v3.51）：原来共用 _lastPersistMs，5 分钟周期快照刚落盘
+  // 会让随后 60s 内的失败失去即时落底保护
+  if (_lastFailMs && millis() - _lastFailMs < 60000) return;
+  _lastFailMs = millis();
   persist();
 }
 
