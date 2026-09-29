@@ -118,7 +118,7 @@ static String g_recentTopics;          // 最近自问话题（防重复，滚�
 static uint32_t g_btnDown = 0;
 
 // LLM 请求种类（F4 后台任务的收割分流）：聊天/主动表达/独白/记忆压缩/夜间反思/规则归纳/技能提取/意图生成/记忆整理
-enum LlmKind : uint8_t { LK_CHAT = 0, LK_EXPRESS, LK_MONO, LK_CONSOLIDATE, LK_REFLECT, LK_RULES, LK_RELATION, LK_MOOD, LK_DREAM, LK_SKILL, LK_INTENT, LK_TIDY };
+enum LlmKind : uint8_t { LK_CHAT = 0, LK_EXPRESS, LK_MONO, LK_CONSOLIDATE, LK_REFLECT, LK_RULES, LK_RELATION, LK_MOOD, LK_DREAM, LK_LOOK, LK_SKILL, LK_INTENT, LK_TIDY };
 
 // ---------- 函数声明 ----------
 void psiTick();
@@ -127,7 +127,8 @@ String laapInteractSearch(const String& userText);   // 带联网搜索的交互
 void llmHarvest();                                   // F4: 收割后台 LLM 结果
 struct LlmRequest;
 bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
-               const String& userText, uint8_t kind = 0, const String& searchQ = String());
+               const String& userText, uint8_t kind = 0, const String& searchQ = String(),
+               const String& lookQ = String());
 bool arisIdleMonologue();       // 返回是否真的提交成功（失败不推进"已独白"状态）
 void laapResetIdleClock();      // 主人交互后重置独白计时（它自己说话不重置）
 String laapIdleInfo();          // 独白计时诊断（/api/status）
@@ -267,6 +268,7 @@ struct LlmRequest {
   float temperature;
   String userText;          // 原始用户话（空=后台类请求）
   String searchQ;           // v3.53：非空=聊天阶段一先在后台搜索，结果注入第二条 system
+  String lookQ;             // v3.54：非空=先在后台看一眼（直答；失败自动转普通聊天兜底）
   uint8_t kind;             // LlmKind
 };
 
@@ -277,6 +279,10 @@ static volatile uint8_t g_resultKind = LK_CHAT;       // 本次结果的请求�
 // 先写完再置 g_llmHasNew；单请求在飞，无并发）
 static volatile int8_t g_chatSearchState = -1;        // -1=本轮无搜索 0=失败 1=成功
 static String g_chatSearchErr;                        // 失败原因（failNote 素材）
+// 视觉阶段一（v3.54）：同上发布纪律；1=看到（直答成品） 0=没看成（已自动转普通聊天兜底）
+static volatile int8_t g_chatLookState = -1;
+static String g_chatLookErr;                          // 视觉失败原因（failNote 素材）
+static uint32_t g_lookStartMs = 0;                    // 视觉受理时刻（rspDir 口径）
 static uint8_t g_llmFailStreak = 0;                   // LLM 连续失败次数（≥2 独白让路）
 // 后台 LLM 是否在飞（含独白/反思/整理——多步流水线一跑就是几十秒）。
 // 逐项体检前必须看这个：TLS 握手互相抢 ~40KB 最大连续块，抢到的结果也是失真的
@@ -501,8 +507,21 @@ static void llmTaskFunc(void*) {
     // "新一代 kind + 旧一代结果"会被错配收割（聊天回复被当独白吞掉、夜间任务产物被当聊天念出）
     LlmReply rr;
     g_chatSearchState = -1; g_chatSearchErr = "";
+    g_chatLookState = -1; g_chatLookErr = "";
     if (req->kind == LK_MONO) {
       rr = monologueGenerate();                  // 多步流水线也在后台跑
+    } else if (req->kind == LK_LOOK) {
+      // 阶段一（v3.54）：视觉在后台看——成功=直答成品；失败=自动转普通聊天兜底
+      // （与旧同步路径"look 失败交给搜索/大模型兜底"语义一致）
+      String d = vision.available() ? vision.look(req->lookQ) : String();
+      if (d.length()) {
+        g_chatLookState = 1;
+        rr.ok = true; rr.say = d; rr.expr = "curious";
+      } else {
+        g_chatLookState = 0; g_chatLookErr = vision.lastError;
+        Serial.printf("[LAAP] 视觉失败（%s），转普通聊天兜底\n", vision.lastError.c_str());
+        rr = llm.chatMsgs(req->msgs, req->nm, req->maxTokens, req->temperature);
+      }
     } else {
       // 阶段一（v3.53）：带搜索词的聊天先在后台搜——主循环不再被 3-28s 的搜索阻塞
       // （独白流水线的搜索本来就在本任务跑，同一已验证模式）
@@ -532,7 +551,7 @@ static void llmTaskFunc(void*) {
 
 // 受理一个 LLM 请求（立即返回 true=已入队，false=忙/队满）
 bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
-               const String& userText, uint8_t kind, const String& searchQ) {
+               const String& userText, uint8_t kind, const String& searchQ, const String& lookQ) {
   // TLS 握手要 ~31KB+ 连续内部内存；ASR 预热连接会占住最大的一块。
   // 堆紧时先请它让位（实测 maxblk 30KB 时 LLM 三连"连接失败"的根因之一）
   if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 36000)
@@ -545,7 +564,7 @@ bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
   req->nm = (nm > 14) ? 14 : nm;
   for (int i = 0; i < req->nm; i++) req->msgs[i] = { msgs[i].role, msgs[i].content };
   req->maxTokens = maxTokens; req->temperature = temperature;
-  req->userText = userText; req->kind = kind; req->searchQ = searchQ;
+  req->userText = userText; req->kind = kind; req->searchQ = searchQ; req->lookQ = lookQ;
   // 请求结构摘要（/api/status 的 llm_ctx + 串口）：正常聊天最后一段必须是 u(本次提问)
   String shape = String("n=") + req->nm + " [";
   for (int i = 0; i < req->nm; i++) {
@@ -628,20 +647,38 @@ String laapInteractSearch(const String& userText) {
     return toolReply;
   }
 
-  // 视觉：问"看到什么/看看/摄像头"时抓一帧让它看（走视觉后端，不进聊天上下文）
+  // 视觉：问"看到什么/看看/摄像头"时抓一帧让它看（v3.54 下沉 llmTask 阶段一——
+  // 主循环不再被最长 ~50s 的 look 阻塞；失败自动转普通聊天兜底，与旧语义一致）
   {
     static const char* vkeys[] = {"看到", "看见", "看看", "看一眼", "摄像头", "拍照", "这是啥", "这是什么", "眼前"};
     bool wantLook = false;
     for (auto k : vkeys) if (userText.indexOf(k) >= 0) { wantLook = true; break; }
     if (wantLook && vision.available()) {
-      Serial.println("[LAAP] 视觉请求：抓帧识图…");
+      Serial.println("[LAAP] 视觉请求：后台抓帧识图…");
+      display.drawFace("curious", true);
+      LlmMsg msgs[14]; int nm = 0;               // 兜底聊天消息：look 失败时 llmTask 直接转普通聊天
+      msgs[nm++] = {"system", buildSystemPrompt()};
+      { String turns[12]; uint8_t roles[12];
+        int nt = memory.recentTurns(turns, roles, 12);
+        int start = (nt > 10) ? nt - 10 : 0;
+        while (start < nt && roles[start] == 1) start++;
+        for (int i = start; i < nt && nm < 13; i++) msgs[nm++] = { roles[i] ? "assistant" : "user", turns[i] }; }
+      msgs[nm++] = {"user", buildUserPrompt(userText, "主人找你说话")};
+      g_pendingUserText = userText;              // 兜底聊天结算用（清空记忆等路径不碰它）
+      g_chatStartMs = millis(); g_lookStartMs = g_chatStartMs;
+      g_chatLookState = -1; g_chatLookErr = "";
+      if (llmSubmit(msgs, nm, cfg.s.llmMaxTokens, 0.85f, userText, LK_LOOK, String(), userText)) {
+        g_chatPending = true;                    // 受理即回：收割侧直答并念出（网页轮询取件闭环）
+        return "";
+      }
+      Serial.println("[LAAP] 后台忙：退回同步看图（旧行为）");
       display.drawFace("curious", true);
       String d = vision.look(userText);
       if (d.length()) {
         metrics.vision(true); metrics.rspDir(millis() - t0);
         vision.logSight(d);
         g_lastSay = d; g_lastExpr = "curious";
-        g_chatReply = d; g_chatSeq++;              // 直接成品，网页可立即显示
+        g_chatReply = d; g_chatSeq++;
         memory.logEvent("user", userText);
         memory.logEvent("aris", d);
         laapActivity();
@@ -742,14 +779,22 @@ void llmHarvest() {
   g_llmHasNew = false;
   LlmReply r = g_llmResult;
   uint8_t kind = g_resultKind;
+  if (kind == LK_LOOK && g_chatLookState == 0) {      // 没看成：已按普通聊天兜底（v3.54），按聊天结算
+    metrics.vision(false);
+    metrics.failNote(String("视觉: ") + g_chatLookErr);
+    memory.logEvent("user", g_pendingUserText);
+    kind = LK_CHAT;
+  }
   if (g_chatSearchState >= 0) {   // 本轮带搜索（v3.53 阶段一）：计数移回 loopTask（metrics 不跨任务写）
     metrics.search(g_chatSearchState == 1);
     if (g_chatSearchState == 0) metrics.failNote(String("搜索: ") + g_chatSearchErr);
     g_chatSearchState = -1;
   }
-  metrics.llm(r.ok);   // 后台 LLM 成败（含独白/反思/压缩：服务商健康度的总信号）
-  if (!r.ok) metrics.failNote(String("LLM: ") + llm.lastError);   // 规则归纳的失败素材
-  g_llmFailStreak = r.ok ? 0 : (uint8_t)(g_llmFailStreak + 1);   // 退避计数（独白据此让路）
+  if (kind != LK_LOOK) {              // 看见直答不是 LLM 调用：不计 llm 指标（v3.54）
+    metrics.llm(r.ok);   // 后台 LLM 成败（含独白/反思/压缩：服务商健康度的总信号）
+    if (!r.ok) metrics.failNote(String("LLM: ") + llm.lastError);   // 规则归纳的失败素材
+    g_llmFailStreak = r.ok ? 0 : (uint8_t)(g_llmFailStreak + 1);   // 退避计数（独白据此让路）
+  }
   if (kind == LK_CONSOLIDATE) {                        // 记忆压缩：只更新自我认知，不说话
     if (r.ok && r.say.length() > 10) {
       memory.setSemantic(r.say);
@@ -835,6 +880,22 @@ void llmHarvest() {
   if (kind == LK_TIDY) {                               // 记忆整理：执行删除清单
     if (r.ok) memory.applyTidyOps(r.say);
     else Serial.printf("[TIDY] 整理失败: %s\n", llm.lastError.c_str());
+    return;
+  }
+  if (kind == LK_LOOK) {                              // 看见：视觉直答结算（v3.54 阶段一下沉）
+    metrics.vision(true);
+    metrics.rspDir(millis() - g_lookStartMs);
+    vision.logSight(r.say);
+    g_lastSay = r.say; g_lastExpr = r.expr.length() ? r.expr : "curious";
+    g_chatReply = r.say; g_chatSeq++;                // 网页轮询取件闭环（受理→成品）
+    memory.logEvent("user", g_pendingUserText);
+    memory.logEvent("aris", r.say);
+    laapActivity();
+    Serial.printf("[Aris·看] %s\n", r.say.c_str());
+    display.drawFace("curious", false);
+    voice.speak(r.say, "curious");
+    g_replySpoken = true;                            // 已念过：调用方别再念
+    g_chatLookState = -1;
     return;
   }
   if (kind == LK_MONO) {                                          // 独白：失败保持安静，不本地兜底
