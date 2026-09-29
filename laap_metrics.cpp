@@ -6,40 +6,8 @@
 
 LaapMetrics metrics;
 
-// 就地清洗非法 UTF-8（历史文件里的半截汉字/坏字节）：合法序列原样保留，坏字节丢弃。
-// DeepSeek 对请求体做严格 UTF-8 校验，一个坏字节 = HTTP 400 invalid unicode code point。
-static String cleanUtf8(const String& s) {
-  String o; o.reserve(s.length());
-  for (unsigned int i = 0; i < s.length(); ) {
-    unsigned char c = (unsigned char)s[i];
-    int len = 1;
-    if (c >= 0xF0) len = 4;
-    else if (c >= 0xE0) len = 3;
-    else if (c >= 0xC0) len = 2;
-    else if (c >= 0x80) { i++; continue; }            // 孤立续字节：丢
-    if (i + len > s.length()) { i++; continue; }      // 尾部截断：丢
-    bool ok = true;
-    for (int k = 1; k < len; k++)
-      if (((unsigned char)s[i + k] & 0xC0) != 0x80) { ok = false; break; }
-    if (!ok) { i++; continue; }
-    for (int k = 0; k < len; k++) o += s[i + k];
-    i += len;
-  }
-  return o;
-}
-
-// JSON 字符串转义（问答原文里什么都有：引号/换行/表情）
-static void escTo(String& o, const String& s) {
-  for (unsigned int i = 0; i < s.length(); i++) {
-    char c = s[i];
-    if (c == '"' || c == '\\') { o += '\\'; o += c; }
-    else if (c == '\n') o += "\\n";
-    else if (c == '\r') o += "";
-    else if (c == '\t') o += ' ';
-    else if ((unsigned char)c < 0x20) { char b[8]; snprintf(b, sizeof(b), "\\u%04X", (unsigned char)c); o += b; }   // 其余控制字符：JSONL 合法性（v3.51）
-    else o += c;
-  }
-}
+// 就地清洗非法 UTF-8 与 JSON 转义统一走 laap_llm 的公共实现（v3.55 收敛：原来这里
+// 各有一份 cleanUtf8/escTo，且转义的 \t 语义与别处漂移）
 
 // 单条反馈一行 JSONL。文件封顶 ~24KB，超了就重写保留最近 80 条：
 // 反馈是给"夜间反思当素材 / 人工复盘"用的，留最近的比留全部更有用。
@@ -50,8 +18,8 @@ bool LaapMetrics::feedback(int v, const String& user, const String& reply) {
   time_t now = time(nullptr);
   String line = String("{\"t\":") + (now > 1600000000 ? String((long)now) : String("-1")) +
                 ",\"v\":" + v +
-                ",\"u\":\"";  escTo(line, cleanUtf8(utf8Cut(user, 120)));
-  line += "\",\"a\":\""; escTo(line, cleanUtf8(utf8Cut(reply, 240)));
+                ",\"u\":\"" + LlmClient::jsonEscape(sanitizeUtf8(utf8Cut(user, 120)));
+  line += "\",\"a\":\"" + LlmClient::jsonEscape(sanitizeUtf8(utf8Cut(reply, 240)));
   line += "\"}\n";
   bool ok = f.print(line) == line.length();
   f.close();
@@ -137,7 +105,7 @@ String LaapMetrics::feedbackDigest(int maxLines) {
     String ln = f.readStringUntil('\n');
     ln.trim();
     if (!ln.length()) continue;
-    ring[idx] = cleanUtf8(ln);   // 老文件里可能有半截汉字：读取时就地清洗（否则请求体 400）
+    ring[idx] = sanitizeUtf8(ln);   // 老文件里可能有半截汉字：读取时就地清洗（否则请求体 400）
     idx = (idx + 1) % maxLines;
     if (cnt < maxLines) cnt++;
   }
@@ -211,7 +179,7 @@ void LaapMetrics::loadPrev() {
     String s;
     s.concat((const char*)(buf + o), len);
     o += len;
-    m->_failRing[i] = cleanUtf8(s);
+    m->_failRing[i] = sanitizeUtf8(s);
     m->_failIdx = (i + 1) % 6;
     m->_failCnt = i + 1;
   }

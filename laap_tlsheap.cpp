@@ -37,4 +37,3 @@ void laapTlsHeapInit() {
 }
 
 uint32_t laapTlsHeapRouteKb() { return s_routeBytes / 1024; }
-uint32_t laapTlsHeapRouteCount() { return s_routeCount; }

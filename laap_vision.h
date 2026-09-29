@@ -23,7 +23,6 @@ public:
 private:
   String lookLocked(const String& question);   // look() 的无锁真身
   bool _ok = false;
-  String _lastDesc;
 };
 
 extern LaapVision vision;

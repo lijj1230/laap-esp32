@@ -10,7 +10,6 @@
 #define LTP_ADDR 0x38
 
 bool touchInit();                    // 探活 + 置工作模式；返回 false=无触摸芯片
-bool touchPresent();
 bool touchRead(int& x, int& y);      // true=当前有触点（含持续按住），xy=面板原始坐标
 void touchReadRaw(uint8_t* buf5);    // 诊断：直接吐 0x02 起的 5 个寄存器
 uint8_t touchReg(uint8_t reg);       // 诊断：读单寄存器

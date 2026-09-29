@@ -1,5 +1,4 @@
 #include "laap_ws.h"
-#include <mbedtls/sha1.h>
 #include <mbedtls/base64.h>
 
 static String wsKey() {
@@ -54,7 +53,6 @@ hdrDone:
   return true;
 }
 
-bool WsClient::connected() { return _nc && _nc->connected(); }
 void WsClient::stop() { if (_nc) _nc->stop(); _nc = nullptr; }
 
 bool WsClient::sendFrame(uint8_t opcode, const uint8_t* data, size_t len) {
@@ -89,7 +87,6 @@ bool WsClient::sendFrame(uint8_t opcode, const uint8_t* data, size_t len) {
 }
 
 bool WsClient::sendText(const String& t) { return sendFrame(0x1, (const uint8_t*)t.c_str(), t.length()); }
-bool WsClient::sendBinary(const uint8_t* d, size_t n) { return sendFrame(0x2, d, n); }
 
 bool WsClient::ensureBin(size_t n) {
   if (_binCap >= n) return true;

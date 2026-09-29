@@ -19,4 +19,3 @@
 
 void laapTlsHeapInit();             // setup 最早处调用一次（任何 TLS 之前）
 uint32_t laapTlsHeapRouteKb();      // 已路由 PSRAM 的累计 KB（诊断）
-uint32_t laapTlsHeapRouteCount();   // 已路由 PSRAM 的分配笔数

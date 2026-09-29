@@ -31,8 +31,6 @@ bool touchInit() {
   return true;
 }
 
-bool touchPresent() { return s_ok; }
-
 bool touchRead(int& x, int& y) {
   if (!s_ok) return false;
   uint8_t st[5];

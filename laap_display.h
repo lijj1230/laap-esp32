@@ -1,6 +1,5 @@
 #pragma once
 #include <Arduino.h>
-#include <SPI.h>
 #include <Wire.h>
 
 // ===== 立创·实战派 ESP32-S3 板载 ST7789 320x240 屏 =====
@@ -19,8 +18,6 @@
 
 // RGB565 常用色
 #define RGB565(r,g,b) ((((r)&0xF8)<<8)|(((g)&0xFC)<<3)|((b)>>3))
-#define CLR_BLACK 0x0000
-#define CLR_WHITE 0xFFFF
 #define CLR_BG    RGB565(12, 14, 24)
 #define CLR_EYE   RGB565(120, 220, 255)
 #define CLR_PUPIL RGB565(8, 10, 18)
@@ -62,7 +59,6 @@ private:
   // ---- 底层 ST7789 ----
   void lcdCmd(uint8_t c);
   void lcdData(const uint8_t* d, int n);
-  void setWindow(int x0, int y0, int x1, int y1);
   void fillRect(int x, int y, int w, int h, uint16_t c);
   void fillCircle(int cx, int cy, int r, uint16_t c);
   void pca9557Write(uint8_t reg, uint8_t val);

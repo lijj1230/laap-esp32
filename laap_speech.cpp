@@ -1,6 +1,7 @@
 #include "laap_speech.h"
 #include "laap_config.h"
 #include "laap_audio.h"
+#include "laap_llm.h"   // laapHttpRead（HTTP 响应按帧精确读取）
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <mbedtls/base64.h>
@@ -60,13 +61,11 @@ void AsrClient::warmup() {
   if (dp < 0) { warmUnlock(); return; }   // 畸形 asrBase（少打 https://）：持锁早退=永久死锁整个主循环（v3.51 审计）
   int hp = url.indexOf('/', dp + 3);
   g_warmHost = (hp < 0) ? url.substring(dp + 3) : url.substring(dp + 3, hp);
-  String path = url.substring(hp);
   g_warmPort = 443;
   if (g_warmHost.indexOf(':') >= 0) {
     g_warmPort = g_warmHost.substring(g_warmHost.indexOf(':') + 1).toInt();
     g_warmHost = g_warmHost.substring(0, g_warmHost.indexOf(':'));
   }
-  (void)path;
   g_warmOk = false;
   g_warm.setTimeout(8);
   g_warm.setInsecure();   // 缺这句 WiFiClientSecure 无证书配置 connect() 恒败（预热曾是死代码）
@@ -130,37 +129,14 @@ static int httpsPost(const String& url, const String& contentType, const uint8_t
     }
     sent += n;
   }
-  String resp;
-  uint32_t t0ms = millis();
-  while (c->connected() && millis() - t0ms < 40000) {  // 差值比较：回绕安全
-    while (c->available()) { resp += (char)c->read(); if (resp.length() > 200000) break; }
-    if (resp.length() > 200000) break;
-    delay(2);
-  }
+  String hdrs, payload;
+  laapHttpRead(c, 40000, hdrs, payload, 200000);
   c->stop();
-  int sp = resp.indexOf(' ');
-  int code = sp > 0 ? resp.substring(sp + 1, sp + 4).toInt() : 0;
+  int sp = hdrs.indexOf(' ');
+  int code = sp > 0 ? hdrs.substring(sp + 1, sp + 4).toInt() : 0;
   if (code != 200 && code > 0) {
-    // 非 200 打印原始响应（头+正文前 220 字符），服务端错误正文一看便知
-    Serial.printf("[NET] %s → HTTP %d\n%.220s\n", path.c_str(), code, resp.c_str());
-  }
-  int bs = resp.indexOf("\r\n\r\n");
-  // chunked 简单拼接（复用 LLM 客户端同款逻辑）
-  String payload = bs > 0 ? resp.substring(bs + 4) : resp;
-  if (payload.indexOf("{\"") < 0 && payload.length() > 0) {
-    String clean; int pos = 0;
-    while (pos < (int)payload.length()) {
-      int nl = payload.indexOf('\n', pos);
-      String line = (nl < 0) ? payload.substring(pos) : payload.substring(pos, nl);
-      line.trim();
-      bool allHex = line.length() > 0;
-      for (unsigned int ci = 0; ci < line.length() && allHex; ci++)
-        if (!isHexadecimalDigit(line[ci])) allHex = false;
-      if (!allHex) clean += line;
-      if (nl < 0) break;
-      pos = nl + 1;
-    }
-    payload = clean;
+    // 非 200 打印响应头+正文前 220 字符，服务端错误正文一看便知
+    Serial.printf("[NET] %s → HTTP %d\n%.220s\n", path.c_str(), code, (hdrs + payload).c_str());
   }
   respOut = payload;
   return code;

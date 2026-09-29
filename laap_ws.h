@@ -12,11 +12,9 @@ class WsClient {
 public:
   // extraHeaders: 每行 "Key: value\r\n"
   bool connect(const char* host, int port, const char* path, const char* extraHeaders, uint32_t timeoutMs = 15000);
-  bool connected();
   void stop();
 
   bool sendText(const String& text);
-  bool sendBinary(const uint8_t* data, size_t len);
 
   // 收一帧。返回: 1=文本 2=二进制 0=无数据/超时 -1=错误/关闭
   int poll(uint32_t timeoutMs);

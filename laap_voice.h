@@ -39,7 +39,6 @@ public:
   uint32_t cooldownDur() const { return _cooldownDur; }
   float vadMul() const { return _vadMul; }
 
-  bool busy() const { return _busy; }
   String lastError;
 
   // VAD 自动聆听的暂停/恢复（BOOT 短按 / Web 均可控制）

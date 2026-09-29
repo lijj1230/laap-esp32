@@ -39,17 +39,6 @@ void LaapDisplay::lcdData(const uint8_t* d, int n) {
   if (g_laapPanelIO) esp_lcd_panel_io_tx_param(g_laapPanelIO, 0x40, d, n);    // 0x40=数据（DC 置 1 的伪命令位）
 }
 
-void LaapDisplay::setWindow(int x0, int y0, int x1, int y1) {
-  uint8_t buf[4];
-  lcdCmd(0x2A); // CASET
-  buf[0] = x0 >> 8; buf[1] = x0 & 0xFF; buf[2] = x1 >> 8; buf[3] = x1 & 0xFF;
-  lcdData(buf, 4);
-  lcdCmd(0x2B); // RASET
-  buf[0] = y0 >> 8; buf[1] = y0 & 0xFF; buf[2] = y1 >> 8; buf[3] = y1 & 0xFF;
-  lcdData(buf, 4);
-  lcdCmd(0x2C); // RAMWR
-}
-
 void LaapDisplay::fillRect(int x, int y, int w, int h, uint16_t c) {
   if (x < 0) { w += x; x = 0; }
   if (y < 0) { h += y; y = 0; }

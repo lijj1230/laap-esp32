@@ -45,7 +45,6 @@ bool toolMatchSentence(const VoiceTool& t, const String& text, ToolMatch& m) {
   if (m.extreme) { m.value = t.maxV; act = true; }
   else if (minside) { m.value = t.minV; act = true; }
   if (!act) return false;
-  m.hit = true;
   return true;
 }
 
@@ -88,11 +87,6 @@ static VoiceTool kTools[] = {
 };
 static const int kToolN = sizeof(kTools) / sizeof(kTools[0]);
 
-void laapToolsInit() {
-  // 应用持久化值（setup 里 audio/display 已各自应用，这里只兜日志）
-  Serial.printf("[TOOLS] %d 个语音工具就绪（音量/亮度）\n", kToolN);
-}
-
 // ================= 天气快问（联网，不经过大模型） =================
 // 根因备注：让大模型从搜索结果里"自己得出天气"时，它常因自身人设（无联网能力的生命体）
 // 回答"我查不到/我没有联网能力"。端侧直接取一行纯文本天气更稳更快（2026-09-26）。
@@ -106,41 +100,17 @@ static String httpGetText(const String& host, const String& path, int timeoutMs)
   if (!cli.connect(host.c_str(), 443)) { laapNetUnlock(); return ""; }
   cli.print(String("GET ") + path + " HTTP/1.1\r\nHost: " + host +
             "\r\nUser-Agent: curl/8.0\r\nAccept: */*\r\nConnection: close\r\n\r\n");
-  String resp; resp.reserve(2048);
-  uint32_t deadline = millis() + timeoutMs;
-  while (cli.connected() && millis() < deadline) {
-    while (cli.available()) { resp += (char)cli.read(); if (resp.length() > 6000) break; }
-    if (resp.length() > 6000) break;
-    delay(2);
-  }
+  String hdrs, payload;
+  laapHttpRead(&cli, timeoutMs, hdrs, payload, 6000);
   cli.stop();
-  int sp = resp.indexOf(' ');
-  int status = (sp > 0) ? resp.substring(sp + 1, sp + 4).toInt() : 0;
+  int sp = hdrs.indexOf(' ');
+  int status = (sp > 0) ? hdrs.substring(sp + 1, sp + 4).toInt() : 0;
   if (status != 200) { Serial.printf("[WEA] HTTP %d\n", status); laapNetUnlock(); return ""; }
-  int bs = resp.indexOf("\r\n\r\n");
   laapNetUnlock();
-  return (bs > 0) ? resp.substring(bs + 4) : String("");
+  return payload;
 }
 
 // wttr.in 可能用 chunked；把分块壳剥掉（首行是纯十六进制长度才算）
-static String dechunk(const String& in) {
-  int nl = in.indexOf("\r\n");
-  if (nl <= 0) return in;
-  String first = in.substring(0, nl);
-  for (unsigned int i = 0; i < first.length(); i++)
-    if (!isHexadecimalDigit(first[i])) return in;
-  String out; int pos = 0;
-  while (pos < (int)in.length()) {
-    int e = in.indexOf("\r\n", pos);
-    if (e < 0) break;
-    long n = strtol(in.substring(pos, e).c_str(), nullptr, 16);
-    if (n <= 0) break;
-    int s = e + 2;
-    out += in.substring(s, s + n);
-    pos = s + n + 2;
-  }
-  return out.length() ? out : in;
-}
 
 // 从"北京今天天气怎么样"里抠城市名（剥掉问句壳与天气词），空=按出口 IP 定位。
 // "市"不能进无条件剥离表：它会把"你们城市"啃成"你们城"这种假城市名——只在结尾时剥一次
@@ -253,8 +223,8 @@ static bool weatherOpenMeteo(const String& city, String& out) {
   if (s_omFailCity == city && s_omFailMs && millis() - s_omFailMs < 60000UL) return false;
   float lat, lon;
   if (g_geoCity != city || g_geoLat > 900) {
-    String body = dechunk(httpGetText("geocoding-api.open-meteo.com",
-                    "/v1/search?name=" + urlEncQuery(city) + "&count=1&language=zh&format=json", 6000));
+    String body = httpGetText("geocoding-api.open-meteo.com",
+                    "/v1/search?name=" + urlEncQuery(city) + "&count=1&language=zh&format=json", 6000);
     if (!jsonNum(body, "latitude", lat) || !jsonNum(body, "longitude", lon)) {
       s_omFailMs = millis(); s_omFailCity = city;   // 失败留底：60s 内不重打三发
       return false;
@@ -264,7 +234,7 @@ static bool weatherOpenMeteo(const String& city, String& out) {
   lat = g_geoLat; lon = g_geoLon;
   char p[176];
   snprintf(p, sizeof(p), "/v1/forecast?latitude=%.4f&longitude=%.4f&current=temperature_2m,weather_code&timezone=auto", lat, lon);
-  String body = dechunk(httpGetText("api.open-meteo.com", p, 6000));
+  String body = httpGetText("api.open-meteo.com", p, 6000);
   float tempC = 0, code = 0;
   if (!jsonNum(body, "temperature_2m", tempC) || !jsonNum(body, "weather_code", code)) {
     s_omFailMs = millis(); s_omFailCity = city;
@@ -288,7 +258,7 @@ static String weatherReport(const String& city, String& resolvedLoc) {
     if (isalnum((unsigned char)c) || strchr("-_.~/?=&+", c)) enc += c;   // "+" 是 wttr 格式串分隔符，不能转义
     else { snprintf(buf, sizeof(buf), "%%%02X", (unsigned char)c); enc += buf; }
   }
-  String body = dechunk(httpGetText("wttr.in", enc, 6000));
+  String body = httpGetText("wttr.in", enc, 6000);
   body.trim();
   int nl = body.indexOf('\n');
   if (nl > 0) body = body.substring(0, nl);

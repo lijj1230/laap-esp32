@@ -6,7 +6,6 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Wire.h>
-#include <base64.h>
 #include <mbedtls/base64.h>   // 直接编码进 PSRAM 缓冲（核心库的 base64::encode 只返回 String，205KB 会挤爆内部堆）
 
 LaapVision vision;
@@ -87,21 +86,6 @@ bool LaapVision::begin() {
 }
 
 // 去 chunked 传输的行间块头（纯十六进制行），与 laap_llm 同法
-static String deChunk(const String& payload) {
-  String clean; int pos = 0;
-  while (pos < (int)payload.length()) {
-    int nl = payload.indexOf('\n', pos);
-    String line = (nl < 0) ? payload.substring(pos) : payload.substring(pos, nl);
-    line.trim();
-    bool allHex = line.length() > 0;
-    for (unsigned int ci = 0; ci < line.length() && allHex; ci++)
-      if (!isHexadecimalDigit(line[ci])) allHex = false;
-    if (!allHex) clean += line;
-    if (nl < 0) break;
-    pos = nl + 1;
-  }
-  return clean;
-}
 
 // ============================================================
 //  RGB565 帧 → 标准 PNG（zlib 用 stored 块，不需要压缩库）
@@ -257,7 +241,7 @@ String LaapVision::debugPngB64(size_t& outLen) {
 }
 
 // 跨任务互斥：后台独白"起意前看一眼"与主线程的聊天/CLI 会用同一个 vision 对象
-// （lastError/_lastDesc 是 String，并发写=撕裂）。拿不到锁就当这次没看成。
+// （lastError 是 String，并发写=撕裂）。拿不到锁就当这次没看成。
 String LaapVision::look(const String& question) {
   if (!laapNetLock()) { lastError = "视觉正忙（后台独白占用）"; return ""; }
   String r = lookLocked(question);
@@ -345,20 +329,12 @@ String LaapVision::lookLocked(const String& question) {
   cli->print(b64);       // PSRAM 里的 205KB，直接按 NUL 结尾整段发出
   cli->print(suffix);
   free(b64);
-  String resp; resp.reserve(4096);
-  uint32_t dl = millis() + 45000;
-  while (cli->connected() && millis() < dl) {
-    while (cli->available()) { resp += (char)cli->read(); if (resp.length() > 40000) break; }
-    if (resp.length() > 40000) break;
-    delay(2);
-  }
+  String hdrs, payload;
+  laapHttpRead(cli, 45000, hdrs, payload, 40000);
   cli->stop(); delete cli;
 
-  int bs = resp.indexOf("\r\n\r\n");
-  String payload = (bs > 0) ? resp.substring(bs + 4) : "";
-  if (resp.indexOf("chunked") >= 0) payload = deChunk(payload);
-  int st = 0, sp2 = resp.indexOf(' ');
-  if (sp2 > 0) st = resp.substring(sp2 + 1, sp2 + 4).toInt();
+  int st = 0, sp2 = hdrs.indexOf(' ');
+  if (sp2 > 0) st = hdrs.substring(sp2 + 1, sp2 + 4).toInt();
   if (st != 200) {
     String emsg;
     if (LlmClient::extractStringField(payload, "message", emsg) && emsg.length())
@@ -376,7 +352,6 @@ String LaapVision::lookLocked(const String& question) {
     }
     out.trim();
   }
-  _lastDesc = out;
   return out;
 }
 

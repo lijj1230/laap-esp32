@@ -10,13 +10,11 @@
 
 // 参数解析结果（从语句中抠数字；无数字时用步进推算）
 struct ToolMatch {
-  bool    hit = false;       // 语句命中本意图
   bool    hasValue = false;  // 语句带具体数值（音量50/亮度调到30）
   int     value = 0;         // 数值本身
   bool    up = false;        // 方向词：大/亮/高 → true，小/暗/低 → false
   bool    fine = false;      // "一点/稍微" → 步进减半
   bool    extreme = false;   // "最大/最亮" 或 "静音/最暗" → 取端点
-  int     extremeVal = 0;    // 端点值
 };
 
 // 一个可被语音声控的设备能力
@@ -34,5 +32,4 @@ struct VoiceTool {
 bool toolMatchSentence(const VoiceTool& t, const String& text, ToolMatch& m);
 
 // 注册表（laap_tools.cpp 定义），loop 前缀入口
-void laapToolsInit();
 String laapToolsDispatch(const String& text);   // 命中执行返回确认语，否则空串

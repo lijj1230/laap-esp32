@@ -6,8 +6,6 @@
 
 LlmClient llm;
 
-String LlmClient::endpoint() const { return buildUrl(); }
-
 String LlmClient::buildUrl() const {
   String base(cfg.s.llmBase);
   base.trim();
@@ -42,8 +40,9 @@ String LlmClient::jsonEscape(const String& s) {
   return o;
 }
 
-// \uXXXX 解码辅助（v3.51）：网关以 ensure_ascii 返回中文时，旧代码整段跳过=缺字/空回复
-static unsigned llmHex4(const String& s, int i) {
+// \uXXXX 解码辅助（v3.51）：网关以 ensure_ascii 返回中文时，旧代码整段跳过=缺字/空回复。
+// v3.55 起为全仓唯一实现（web 的 jsonField 也用），声明在 laap_llm.h
+unsigned laapHex4(const String& s, int i) {
   unsigned v = 0;
   for (int k = 0; k < 4 && i + k < (int)s.length(); k++) {
     char c = s[i + k]; v <<= 4;
@@ -53,7 +52,7 @@ static unsigned llmHex4(const String& s, int i) {
   }
   return v;
 }
-static void llmAppendUtf8(String& o, unsigned cp) {
+void laapAppendUtf8(String& o, unsigned cp) {
   if (cp < 0x80) o += (char)cp;
   else if (cp < 0x800) { o += (char)(0xC0 | (cp >> 6)); o += (char)(0x80 | (cp & 0x3F)); }
   else if (cp < 0x10000) { o += (char)(0xE0 | (cp >> 12)); o += (char)(0x80 | ((cp >> 6) & 0x3F)); o += (char)(0x80 | (cp & 0x3F)); }
@@ -78,13 +77,13 @@ bool LlmClient::extractStringField(const String& json, const char* key, String& 
           else if (n == 't') v += '\t';
           else if (n == 'u' && j + 5 < (int)json.length()) {
             // \uXXXX 解码（v3.51）：含代理对
-            unsigned cp = llmHex4(json, j + 2);
+            unsigned cp = laapHex4(json, j + 2);
             if (cp >= 0xD800 && cp <= 0xDBFF && j + 11 < (int)json.length() &&
                 json[j + 6] == '\\' && json[j + 7] == 'u') {
-              unsigned lo = llmHex4(json, j + 8);
+              unsigned lo = laapHex4(json, j + 8);
               if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); j += 6; }
             }
-            llmAppendUtf8(v, cp);
+            laapAppendUtf8(v, cp);
             j += 4;
           } else v += n; // \" \\ \/ \b \f
           j += 2;
@@ -178,10 +177,11 @@ static void connFinish(LlmKeepConn& slot, WiFiClient* c, bool clean,
   if (!keep) { c->stop(); delete c; }
 }
 
-// 按 HTTP 响应帧精确读取（keep-alive 的前提是知道"体到哪结束"，不能靠"服务器关闭"收尾）。
-// 返回 true = 按帧干净结束（连接可复用）；false = 超时/断连/帧不完整/超上限（必须丢弃）。
-// chunked 在读取时逐块剥离（精确替代旧的"全 hex 行删除"启发式）。
-static bool llmReadResponse(WiFiClient* c, uint32_t timeoutMs, String& hdrs, String& payload) {
+// HTTP 响应按帧精确读取（全仓唯一实现：v3.55 的 chat/embed 读法推广到 search/vision/
+// tools/speech，替代各自"读到关闭再启发式剥壳"的旧路径）。
+// 返回 true = 按帧干净结束（keep-alive 连接可复用的判据）；false = 超时/断连/帧不完整/
+// 超 maxBody（Connection:close 的调用方忽略返回值即可）。chunked 在读取时逐块精确剥离。
+bool laapHttpRead(WiFiClient* c, uint32_t timeoutMs, String& hdrs, String& payload, int maxBody) {
   uint32_t t0 = millis();                              // 差值比较：49.7 天回绕安全
   hdrs = ""; hdrs.reserve(1024);
   while (millis() - t0 < timeoutMs) {                  // 阶段一：读到头结束 \r\n\r\n
@@ -217,7 +217,7 @@ static bool llmReadResponse(WiFiClient* c, uint32_t timeoutMs, String& hdrs, Str
         else if (sl >= 0 && sl < 15) sz[sl++] = (char)ch;
       } else if (st == 1) {                            // 块数据
         payload += (char)ch;
-        if (payload.length() > 40000) return false;
+        if (payload.length() > (unsigned int)maxBody) return false;
         if (--remain == 0) st = 2;
       } else if (st == 2) {                            // 块尾 \r\n
         if (ch == '\n') st = 0;
@@ -235,7 +235,7 @@ static bool llmReadResponse(WiFiClient* c, uint32_t timeoutMs, String& hdrs, Str
         int ch = c->read();
         if (ch < 0) { if (!c->connected()) break; delay(2); continue; }
         payload += (char)ch; got++;
-        if (payload.length() > 40000) break;
+        if (payload.length() > (unsigned int)maxBody) break;
       }
       framedDone = (got == cl);
     } else {
@@ -244,7 +244,7 @@ static bool llmReadResponse(WiFiClient* c, uint32_t timeoutMs, String& hdrs, Str
         int ch = c->read();
         if (ch < 0) { if (!c->connected()) break; delay(2); continue; }
         payload += (char)ch;
-        if (payload.length() > 40000) break;
+        if (payload.length() > (unsigned int)maxBody) break;
       }
     }
   }
@@ -345,7 +345,7 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
   }
 
   String hdrs, payload;
-  bool clean = llmReadResponse(client, 30000, hdrs, payload);
+  bool clean = laapHttpRead(client, 30000, hdrs, payload, 40000);
   connFinish(s_chatConn, client, clean, host, port, useTls);
   if (!clean) Serial.println("[LLM] 连接未按帧干净结束，已丢弃");
 
@@ -558,7 +558,7 @@ String laapEmbed(const String& text, bool& ok) {
     return "";
   }
   String hdrs, payload;
-  bool clean = llmReadResponse(client, 20000, hdrs, payload);
+  bool clean = laapHttpRead(client, 20000, hdrs, payload, 40000);
   connFinish(s_embConn, client, clean, host, port, true);
   int sp = hdrs.indexOf(' ');
   int code = sp > 0 ? hdrs.substring(sp + 1, sp + 4).toInt() : 0;

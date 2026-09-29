@@ -21,7 +21,6 @@
 class LaapAudio {
 public:
   bool begin();
-  bool ok() const { return _ok; }
   bool spkOk = false, micOk = false;
 
   // ---- 录音（16kHz 16bit 单声道，PSRAM 缓冲） ----
@@ -90,7 +89,7 @@ private:
   float _vadThMul = 1.0f;                      // 触发阈值乘数（自调优，钳位 1.0~1.6）
   uint16_t _vadStopMs = 5000;                  // 说完静音判停（v3.33 起后台可配，默认 5s 宁等勿截）
   bool _vadSpeech = false;
-  uint32_t _speechStartMs = 0, _silenceMs = 0;
+  uint32_t _silenceMs = 0;
   bool _interrupted = false, _bargeEn = false;   // 默认关：播放期间不收麦（防回环/自触发）
   uint32_t _paOffMs = 0;                       // PA 空闲关断时刻（0=无需关）
 };

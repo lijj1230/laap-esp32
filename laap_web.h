@@ -14,10 +14,8 @@ public:
   void beginAP();
   void handleClient();
   bool inAP() const { return _ap; }
-  String apSsid() const { return _apSsid; }
 
 private:
-  friend class LaapOtaHelper;   // F1 OTA 写入回调访问成员
   bool otaPending = false;
   String otaErr;
   void registerRoutes();
@@ -37,7 +35,6 @@ private:
   void handleReset();
   void handleReboot();
   void handleVoiceTest();
-  void handleSpeak();
   void handleListenToggle();
   void handleMetrics();       // 评估埋点（RSI 闭环的评估端）
   void handleFeedback();      // 网页 👍/👎 反馈

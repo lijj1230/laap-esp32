@@ -62,14 +62,12 @@ public:
   bool save();
   void saveTrust();             // 只落 trust 一个键（轻量，供心跳周期调用，不整盘重写）
   void reset();                 // 恢复出厂（清空 NVS + 记忆文件）
-  bool provisioned() const { return _provisioned; }
   LaapSettings s;
   // 累计运行时长（跨重启）：开机读回 base，运行中周期性 base+本机 millis() 落盘
   uint32_t uptimeBase() const { return _uptimeBaseMin; }
   void saveUptime(uint32_t totalMin);
 private:
   Preferences prefs;
-  bool _provisioned = false;
   uint32_t _uptimeBaseMin = 0;
 };
 

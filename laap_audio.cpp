@@ -1,5 +1,4 @@
 #include "laap_audio.h"
-#include "laap_display.h"
 #include <Wire.h>
 #include <ESP_I2S.h>
 #include "src/vendor/es8311/es8311.h"
@@ -168,7 +167,7 @@ void LaapAudio::pump() {
   // 旧阈值 344+ 时好时坏，600ms 持续判经常攒不满 → "要凑很近才理人"
   float th = (_slowRms * 1.8f + 80) * _vadThMul;
   if (_fastRms > th) {
-    if (!_vadSpeech) { _vadSpeech = true; _speechStartMs = millis(); }
+    if (!_vadSpeech) { _vadSpeech = true; }
     _silenceMs = 0;
   } else if (_vadSpeech) {
     _silenceMs += n * 1000UL / AUD_I2S_RATE;

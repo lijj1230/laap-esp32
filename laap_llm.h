@@ -37,7 +37,6 @@ public:
   // 后台"测试连接"用
   bool ping(String& reply);
   String lastError;
-  String endpoint() const;
   // JSON 工具（laap_vision 直连视觉模型时复用）
   static String jsonEscape(const String& s);
   static bool extractStringField(const String& json, const char* key, String& out);
@@ -45,11 +44,20 @@ private:
   String buildUrl() const;
 };
 
+// \uXXXX 解码对（全仓唯一实现，web 的 jsonField 共用）
+unsigned laapHex4(const String& s, int i);
+void laapAppendUtf8(String& o, unsigned cp);
 // UTF-8 安全截断（laap_llm.cpp 实现，全局可用）：len 字节上限处回退到字符边界
 String utf8Cut(const String& s, int len);
 // UTF-8 兜底清洗：丢掉非法字节（历史遗留的"切半汉字"）。写盘与出 JSON 前过一遍，
 // 否则半个汉字会让整个 JSON 或 LLM 请求体非法（/api/memory 曾因此吐不出合法 JSON）
 String sanitizeUtf8(const String& s);
+
+// HTTP 响应按帧精确读取（全仓唯一实现）：状态行+头 → hdrs，体 → payload（chunked
+// 读取时精确去壳）。返回值 = 按帧干净结束（keep-alive 复用判据）；
+// Connection:close 的调用方忽略返回值即可。maxBody=响应体上限（防失控）。
+#include <WiFi.h>
+bool laapHttpRead(WiFiClient* c, uint32_t timeoutMs, String& hdrs, String& payload, int maxBody = 40000);
 
 // 跨任务网络客户端互斥（搜索/视觉/连通性测试共用）：后台独白任务与主线程
 // 都会用同一批客户端对象，而它们的 lastError 等成员是 String——

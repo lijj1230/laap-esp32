@@ -23,7 +23,6 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <ESPmDNS.h>
 #include <time.h>
 #include <esp_ota_ops.h>   // 运行槽位诊断（OTA 后确认新固件在跑）
 #include <esp_heap_caps.h> // 最大连续块（TLS 握手要一整块，总空闲量会骗人）
@@ -128,14 +127,14 @@ String laapInteractSearch(const String& userText);   // 带联网搜索的交互
 void llmHarvest();                                   // F4: 收割后台 LLM 结果
 struct LlmRequest;
 bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
-               const String& userText, uint8_t kind = 0, const String& searchQ = String(),
+               uint8_t kind = 0, const String& searchQ = String(),
                const String& lookQ = String());
 bool arisIdleMonologue();       // 返回是否真的提交成功（失败不推进"已独白"状态）
 void laapResetIdleClock();      // 主人交互后重置独白计时（它自己说话不重置）
 String laapIdleInfo();          // 独白计时诊断（/api/status）
 String associativeRecall(const String& currentUserText, const String& preRecalled = "");
 String buildSystemPrompt();
-String buildUserPrompt(const String& userText, const String& trigger);
+String buildUserPrompt(const String& userText);
 void consolidateMemory();
 String offlineFallbackSay();
 void connectWifi();
@@ -206,7 +205,7 @@ void arisExpress(bool forced, const String& trigger) {
   s_lastExpressMs = millis();                    // 受理即计时（失败也已占用这一轮）
   // R2+R3（v3.48）：表达输出契约扩展——三候选自选 + 类别化预期。写在 user 消息里
   // 而非共享系统提示词（聊天/独白共用后者，不能动）。全部行可缺省，解析失败回退旧契约
-  String up = buildUserPrompt("", trigger);
+  String up = buildUserPrompt("");
   up += "\n\n[本次输出格式] 恰好如下：\n"
         "第一行：情绪词（happy/curious/excited/lonely/anxious/tired/calm 之一）\n"
         "第二~四行：A|、B|、C| 开头的三种不同说法（各≤40字，角度或措辞不同）\n"
@@ -216,7 +215,7 @@ void arisExpress(bool forced, const String& trigger) {
   LlmMsg m[2] = {
     {"system", buildSystemPrompt()},
     {"user", up} };
-  if (llmSubmit(m, 2, cfg.s.llmMaxTokens < 80 ? 80 : cfg.s.llmMaxTokens, 0.95f, "", LK_EXPRESS))
+  if (llmSubmit(m, 2, cfg.s.llmMaxTokens < 80 ? 80 : cfg.s.llmMaxTokens, 0.95f, LK_EXPRESS))
     display.drawFace("curious", true);           // 起意表情（后台思考中）
 }
 
@@ -267,7 +266,6 @@ struct LlmRequest {
   int nm;
   int maxTokens;
   float temperature;
-  String userText;          // 原始用户话（空=后台类请求）
   String searchQ;           // v3.53：非空=聊天阶段一先在后台搜索，结果注入第二条 system
   String lookQ;             // v3.54：非空=先在后台看一眼（直答；失败自动转普通聊天兜底）
   uint8_t kind;             // LlmKind
@@ -552,7 +550,7 @@ static void llmTaskFunc(void*) {
 
 // 受理一个 LLM 请求（立即返回 true=已入队，false=忙/队满）
 bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
-               const String& userText, uint8_t kind, const String& searchQ, const String& lookQ) {
+               uint8_t kind, const String& searchQ, const String& lookQ) {
   // ASR 预热连接会占住内部堆最大的一块，堆紧时先请它让位。v3.55 起 TLS 收发缓冲
   // 走 PSRAM（tlsheap 钩子），LLM 对内部堆的需求从 ~36KB 降到 ~10KB——门槛同步下调，
   // 不再无谓杀掉预热连接（杀一次 = 下次录音要多等一次完整 TLS 握手）
@@ -566,7 +564,7 @@ bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
   req->nm = (nm > 14) ? 14 : nm;
   for (int i = 0; i < req->nm; i++) req->msgs[i] = { msgs[i].role, msgs[i].content };
   req->maxTokens = maxTokens; req->temperature = temperature;
-  req->userText = userText; req->kind = kind; req->searchQ = searchQ; req->lookQ = lookQ;
+  req->kind = kind; req->searchQ = searchQ; req->lookQ = lookQ;
   // 请求结构摘要（/api/status 的 llm_ctx + 串口）：正常聊天最后一段必须是 u(本次提问)
   String shape = String("n=") + req->nm + " [";
   for (int i = 0; i < req->nm; i++) {
@@ -665,11 +663,11 @@ String laapInteractSearch(const String& userText) {
         int start = (nt > 10) ? nt - 10 : 0;
         while (start < nt && roles[start] == 1) start++;
         for (int i = start; i < nt && nm < 13; i++) msgs[nm++] = { roles[i] ? "assistant" : "user", turns[i] }; }
-      msgs[nm++] = {"user", buildUserPrompt(userText, "主人找你说话")};
+      msgs[nm++] = {"user", buildUserPrompt(userText)};
       g_pendingUserText = userText;              // 兜底聊天结算用（清空记忆等路径不碰它）
       g_chatStartMs = millis(); g_lookStartMs = g_chatStartMs;
       g_chatLookState = -1; g_chatLookErr = "";
-      if (llmSubmit(msgs, nm, cfg.s.llmMaxTokens, 0.85f, userText, LK_LOOK, String(), userText)) {
+      if (llmSubmit(msgs, nm, cfg.s.llmMaxTokens, 0.85f, LK_LOOK, String(), userText)) {
         g_chatPending = true;                    // 受理即回：收割侧直答并念出（网页轮询取件闭环）
         return "";
       }
@@ -730,12 +728,12 @@ String laapInteractSearch(const String& userText) {
     }
     Serial.printf("[LLM] 历史%d条(跳过%d): %s\n", nt, start, hist.c_str());
   }
-  msgs[nm++] = {"user", buildUserPrompt(userText, "主人找你说话")};
+  msgs[nm++] = {"user", buildUserPrompt(userText)};
 
   memory.logEvent("user", userText);   // 记事：此刻快照已取完，本次提问只出现在队尾一次
   skills.hit(userText);                // 口令技能命中计数（热度用于淘汰与展示）
   // F4: 丢给后台 LLM 任务，立即返回"思考中"；loop 里 llmHarvest() 收割
-  if (llmSubmit(msgs, nm, cfg.s.llmMaxTokens, 0.85f, userText, LK_CHAT, searchQ)) {
+  if (llmSubmit(msgs, nm, cfg.s.llmMaxTokens, 0.85f, LK_CHAT, searchQ)) {
     g_pendingUserText = userText;
     g_chatStartMs = millis();                     // 端到端延迟计时起点（llmHarvest 里收割）
     g_chatPending = true;                         // 网页据此改为轮询 /api/chat/reply
@@ -754,7 +752,7 @@ void maybeTeachExtract() {
                       "触发词=2到6个字、主人以后说话时会带上的词；指令=要它做什么，不超过25字。"
                       "若这句话不是在教技能（没有「以后/每当/下次…就…」的意思），只输出 NO。")},
     {"user", g_teachText} };
-  if (llmSubmit(m, 2, 240, 0.2f, "", LK_SKILL)) {
+  if (llmSubmit(m, 2, 240, 0.2f, LK_SKILL)) {
     g_teachText = ""; g_teachRetry = 0;
     return;
   }
@@ -1079,7 +1077,7 @@ bool arisIdleMonologue() {
   g_monoCtx = memory.recentContextExcluding(300, "【自发】");
   g_monoSys = buildSystemPrompt();
   g_monoTopics = g_recentTopics;
-  if (!llmSubmit(m, 1, 40, 0.95f, "", LK_MONO)) {
+  if (!llmSubmit(m, 1, 40, 0.95f, LK_MONO)) {
     Serial.println("[LAAP·独白] LLM 忙，本轮放弃");
     return false;
   }
@@ -1181,7 +1179,7 @@ String buildSystemPrompt() {
   // 需求只染语气、不当话题：低于 0.6 一律算平静（原来无条件点"最强烈的渴望"，
   // 31% 的平静水位也被演成"我电量低"复读——实测几乎每句回复都挂电量）；
   // 高时也明说边界，防止模型把状态当内容讲
-  if (vals[top] < 0.60f) {
+  if (vals[top] < 60) {
     p += "内心平静，没有特别强烈的渴望，语气自然就好。\n";
   } else {
     p += String("当前最强烈的渴望是「") + names[top] + "」。让它影响你说话的节奏和语气"
@@ -1220,7 +1218,7 @@ String buildSystemPrompt() {
   return p;
 }
 
-String buildUserPrompt(const String& userText, const String& trigger) {
+String buildUserPrompt(const String& userText) {
   String ctx = memory.recentContext(500);
   String recall = userText.length() ? memory.recallSmart(utf8Cut(userText, 12), 200) : "";
   // 下面的 associativeRecall 复用同一份 recall（原实现再查一次 = 每条消息 2 次串行 embedding）
@@ -1261,7 +1259,6 @@ String buildUserPrompt(const String& userText, const String& trigger) {
     if (g_lastSay.length()) p += String("你最近一次开口说的是：「") + g_lastSay +
                                 "」。换个角度或换件事说，不要复读。";
   }
-  (void)trigger;
   return p;
 }
 
@@ -1332,7 +1329,7 @@ void consolidateMemory() {
                "只沉淀稳定的事：性格变化、经历、学到的偏好。只输出摘要本身。";
   String usr = "它过去的自我认知：" + memory.semantic() + "\n它最近的经历：\n" + recent;
   LlmMsg m[2] = { {"system", sys}, {"user", usr} };
-  llmSubmit(m, 2, 240, 0.3f, "", LK_CONSOLIDATE); // 忙就跳过这轮（下个周期再来）
+  llmSubmit(m, 2, 240, 0.3f, LK_CONSOLIDATE); // 忙就跳过这轮（下个周期再来）
 }
 
 // ============================================================
@@ -1387,7 +1384,7 @@ void nightlyReflect(bool force) {
   // 反思要"想清楚再写"，思考型模型（v4 系）在小预算下会把额度全花在推理上、正文返回空
   // （实测 160/320/640 全空）。起步就给足，再靠 llm 内部的翻倍重试兜底。
   int cap = cfg.s.llmMaxTokens > 1000 ? cfg.s.llmMaxTokens : 1000;
-  if (!llmSubmit(m, 2, cap, 0.8f, "", LK_REFLECT))   // 忙就放弃（明天再说）
+  if (!llmSubmit(m, 2, cap, 0.8f, LK_REFLECT))   // 忙就放弃（明天再说）
     Serial.println("[LAAP·反思] LLM 正忙，本次放弃");
 }
 
@@ -1435,7 +1432,7 @@ void rulesReflect(bool force) {
                "\n\n请输出更新后的规则集。";
   LlmMsg m[2] = { {"system", sys}, {"user", usr} };
   int cap = cfg.s.llmMaxTokens > 1000 ? cfg.s.llmMaxTokens : 1000;   // 同反思：预算小了思考型模型只想不答
-  if (!llmSubmit(m, 2, cap, 0.4f, "", LK_RULES))                     // 规则要准，温度调低
+  if (!llmSubmit(m, 2, cap, 0.4f, LK_RULES))                     // 规则要准，温度调低
     Serial.println("[LAAP·规则] LLM 正忙，下个心跳再试");
   else if (!force) g_lastRulesDay = day;             // 提交成功才吃日闸（原在提交前消费，忙时当晚静默跳过）
 }
@@ -1471,7 +1468,7 @@ void relationsReflect(bool force) {
                "没有值得记的就只输出 NO。只输出清单，禁止任何解释。";
   LlmMsg m[2] = { {"system", sys}, {"user", "最近经历：\n" + mat} };
   int cap = cfg.s.llmMaxTokens > 1000 ? cfg.s.llmMaxTokens : 1000;   // 同规则归纳：预算小了思考型模型只想不答
-  if (!llmSubmit(m, 2, cap, 0.4f, "", LK_RELATION))
+  if (!llmSubmit(m, 2, cap, 0.4f, LK_RELATION))
     Serial.println("[LAAP·关系] LLM 正忙，下个心跳再试");
   else if (!force) g_lastRelDay = day;               // 提交成功才吃日闸（同规则归纳）
 }
@@ -1508,7 +1505,7 @@ void moodRelabel(bool force) {
                "每行一条，格式「行号|情绪」，只输出清单，禁止任何解释。";
   LlmMsg m[2] = { {"system", sys}, {"user", "记忆条目：\n" + mat} };
   int cap = cfg.s.llmMaxTokens > 1000 ? cfg.s.llmMaxTokens : 1000;   // 同其它夜间任务：预算小了思考型模型只想不答
-  if (!llmSubmit(m, 2, cap, 0.2f, "", LK_MOOD))                      // 分类任务，温度压最低
+  if (!llmSubmit(m, 2, cap, 0.2f, LK_MOOD))                      // 分类任务，温度压最低
     Serial.println("[LAAP·情绪] LLM 正忙，下个心跳再试");
   else if (!force) g_lastMoodDay = day;               // 提交成功才吃日闸（同规则归纳）
 }
@@ -1542,7 +1539,7 @@ void dreamReflect(bool force) {
                "像真梦一样不合逻辑却带着最近的情绪。三句话以内，第一人称，只输出梦本身，禁止解释。";
   LlmMsg m[2] = { {"system", sys}, {"user", "记忆碎片：\n" + mat} };
   int cap = cfg.s.llmMaxTokens > 300 ? cfg.s.llmMaxTokens : 300;
-  if (!llmSubmit(m, 2, cap, 0.95f, "", LK_DREAM))                     // 梦要发散，温度拉高
+  if (!llmSubmit(m, 2, cap, 0.95f, LK_DREAM))                     // 梦要发散，温度拉高
     Serial.println("[LAAP·梦] LLM 正忙，下个心跳再试");
   else if (!force) g_lastDreamDay = day;               // 提交成功才吃日闸（同规则归纳）
 }
@@ -1565,7 +1562,7 @@ void intentSpawnTick() {
                 "只输出目标本身；若最近经历没有任何素材能形成目标，只输出 NO。"},
     {"user", "最近经历（与主人的交流为主）：\n" + memory.recentContextExcluding(400, "【自发】") +
              "\n已有的目标：" + (mind.intentsLine().length() ? mind.intentsLine() : String("无"))} };
-  if (llmSubmit(m, 2, 240, 0.8f, "", LK_INTENT))
+  if (llmSubmit(m, 2, 240, 0.8f, LK_INTENT))
     s_lastIntentMs = millis();                        // 失败不计时，下个心跳还能试
 }
 
@@ -1601,7 +1598,7 @@ void memoryTidy(bool force) {
                 "关于主人的记忆和它的感受，绝不删。"
                 "只输出 JSON 数组，最多 12 条：[{\"n\":行号,\"op\":\"del\"}]；没有可删的输出 []。禁止解释。"},
     {"user", mat} };
-  if (!llmSubmit(m, 2, 600, 0.2f, "", LK_TIDY))
+  if (!llmSubmit(m, 2, 600, 0.2f, LK_TIDY))
     Serial.println("[TIDY] LLM 正忙，下个心跳再试");
   else if (!force) g_lastTidyDay = day;               // 提交成功才吃日闸
 }

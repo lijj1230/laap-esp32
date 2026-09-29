@@ -19,7 +19,6 @@ public:
   // F3: 工作记忆原始条目（近→远顺序, 最多 max 条, 只含 user|aris 角色）
   // 近 max 轮对话（远→近），roles 并行输出说话人：0=主人 1=它自己（调用方据此标 role，别再靠奇偶猜）
   int recentTurns(String* out, uint8_t* roles, int max) const;
-  String searchEpisodic(const String& query, int maxChars = 300); // 关键词回忆
   // 智能回忆（Mem0 式多信号）：语义向量为主，权重/新鲜度/心里目标/情绪同色调加权；无向量退关键词
   String recallSmart(const String& query, int maxChars = 300);
   void   rememberBoost(const String& fragment);   // 用户问起=该记忆重要（升级权重）
@@ -32,7 +31,6 @@ public:
   int  moodApply(const String& llmText);
   // 语义向量（bge-m3 经硅基流动；异步缓存，无向量时 recallSmart 自动退关键词）
   void   embedTick();                              // loop 调用：给未嵌入的记忆补向量（限速）
-  bool   embedOk() const { return _embFail < 3; }  // 连败3次后本轮停用（退关键词）
   bool   embedFused() const { return _embFail >= 3; } // 语义通道熔断中（/api/status 暴露）
   uint32_t embedCount() const { return _embCount; }   // 已有向量的记忆条数（与 emb.bin 行数一致）
   String semantic() const;
@@ -57,7 +55,6 @@ public:
 private:
   void appendEpisodic(const char* role, const String& text);
   void rewriteEpisodicByScore();                   // 淘汰：按 (权重,时间) 排序丢低分
-  float* embVec(const String& line);                // 该记忆行的向量缓存（无则nullptr）
   // 工作记忆环：40 条×单条 160 字上限 ≈ 最坏 25KB 堆（常驻）。
   // 槽位复用（assign 覆写）避免 40 个 String 反复分配/析构造成堆碎片。
   static const int WORK_MAX = 40;

@@ -14,7 +14,6 @@ class LaapSkills {
 public:
   String promptLine();                 // 注入段（空表返回空串）
   String text();                       // 人读文本（串口 /skills、网页）
-  int count() const { return _n; }
   // 教学落库：触发词 2~10 字、指令 ≤30 字；同触发词=替换；满 12 条淘汰 hits 最低
   bool teach(const String& trigger, const String& instruction);
   void hit(const String& userText);    // userText 含某触发词 → 该技能 hits+1（落盘）

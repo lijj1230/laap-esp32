@@ -66,7 +66,6 @@ void LaapConfig::load() {
   prefs.getString("vkey", s.visionKey, sizeof(s.visionKey));
   prefs.getString("vmodel", s.visionModel, sizeof(s.visionModel));
 
-  _provisioned = (s.wifiSsid[0] != 0) && (s.llmKey[0] != 0);
 }
 
 bool LaapConfig::save() {
@@ -119,7 +118,6 @@ bool LaapConfig::save() {
   prefs.putString("vlbase", s.visionLlmBase);
   prefs.putString("vkey", s.visionKey);
   prefs.putString("vmodel", s.visionModel);
-  _provisioned = (s.wifiSsid[0] != 0) && (s.llmKey[0] != 0);
   return ok;
 }
 

@@ -52,21 +52,6 @@ static String tagInner(const String& html, const char* tag, int from) {
 }
 
 // 去 chunked 传输的行间块头（纯十六进制行），与 laap_llm 同法
-static String deChunkHtml(const String& payload) {
-  String clean; int pos = 0;
-  while (pos < (int)payload.length()) {
-    int nl = payload.indexOf('\n', pos);
-    String line = (nl < 0) ? payload.substring(pos) : payload.substring(pos, nl);
-    line.trim();
-    bool allHex = line.length() > 0;
-    for (unsigned int ci = 0; ci < line.length() && allHex; ci++)
-      if (!isHexadecimalDigit(line[ci])) allHex = false;
-    if (!allHex) clean += line;
-    if (nl < 0) break;
-    pos = nl + 1;
-  }
-  return clean;
-}
 
 // 从 DDG JSON 里宽松抠出 "Text":"..." 字段（不做通用 JSON 解析）
 static String extractTexts(const String& json, int maxHit) {
@@ -106,23 +91,12 @@ String LaapSearch::searchDdg(const String& q, int maxHit, int maxLen) {
   cli.print(String("GET ") + path + " HTTP/1.1\r\nHost: " + host +
             "\r\nUser-Agent: laap-esp32/2.1\r\nConnection: close\r\n\r\n");
 
-  String resp; resp.reserve(8192);
-  uint32_t deadline = millis() + 6000;
-  while (cli.connected() && millis() < deadline) {
-    while (cli.available()) {
-      resp += (char)cli.read();
-      if (resp.length() > 24000) break;
-    }
-    if (resp.length() > 24000) break;
-    delay(2);
-  }
+  String hdrs, payload;
+  laapHttpRead(&cli, 6000, hdrs, payload, 24000);
   cli.stop();
 
-  int status = 0;
-  int sp = resp.indexOf(' ');
-  if (sp > 0) status = resp.substring(sp + 1, sp + 4).toInt();
-  int bs = resp.indexOf("\r\n\r\n");
-  String payload = (bs > 0) ? resp.substring(bs + 4) : "";
+  int sp = hdrs.indexOf(' ');
+  int status = (sp > 0) ? hdrs.substring(sp + 1, sp + 4).toInt() : 0;
   if (status != 200) { lastError = "DDG HTTP " + String(status); return ""; }
 
   // AbstractText 优先（DDG 精选摘要），再补 RelatedTopics
@@ -164,25 +138,13 @@ String LaapSearch::searchBing(const String& q, int maxHit, int maxLen) {
             "\r\nConnection: close\r\n\r\n");
 
   // 结果块（b_algo）出现在页面前段：有界缓冲 80KB，够取 maxHit 条
-  String resp; resp.reserve(16384);
-  uint32_t deadline = millis() + 12000;
-  while (cli.connected() && millis() < deadline) {
-    while (cli.available()) {
-      resp += (char)cli.read();
-      if (resp.length() > 80000) break;
-    }
-    if (resp.length() > 80000) break;
-    delay(2);
-  }
+  String hdrs, payload;
+  laapHttpRead(&cli, 12000, hdrs, payload, 80000);
   cli.stop();
 
-  int status = 0;
-  int sp = resp.indexOf(' ');
-  if (sp > 0) status = resp.substring(sp + 1, sp + 4).toInt();
-  int bs = resp.indexOf("\r\n\r\n");
-  String payload = (bs > 0) ? resp.substring(bs + 4) : "";
+  int sp = hdrs.indexOf(' ');
+  int status = (sp > 0) ? hdrs.substring(sp + 1, sp + 4).toInt() : 0;
   if (status != 200) { lastError = "Bing HTTP " + String(status); return ""; }
-  if (resp.indexOf("chunked") >= 0) payload = deChunkHtml(payload);
 
   String out; int hit = 0, pos = 0;
   while (hit < maxHit) {
@@ -219,25 +181,13 @@ String LaapSearch::searchRss(const String& q, int maxHit, int maxLen) {
             "\r\nAccept-Language: zh-CN,zh;q=0.9"
             "\r\nConnection: close\r\n\r\n");
 
-  String resp; resp.reserve(4096);
-  uint32_t deadline = millis() + 10000;
-  while (cli.connected() && millis() < deadline) {
-    while (cli.available()) {
-      resp += (char)cli.read();
-      if (resp.length() > 16384) break;   // RSS 实测 3-4KB，16KB 上限宽裕
-    }
-    if (resp.length() > 16384) break;
-    delay(2);
-  }
+  String hdrs, payload;
+  laapHttpRead(&cli, 10000, hdrs, payload, 16384);
   cli.stop();
 
-  int status = 0;
-  int sp = resp.indexOf(' ');
-  if (sp > 0) status = resp.substring(sp + 1, sp + 4).toInt();
-  int bs = resp.indexOf("\r\n\r\n");
-  String payload = (bs > 0) ? resp.substring(bs + 4) : "";
+  int sp = hdrs.indexOf(' ');
+  int status = (sp > 0) ? hdrs.substring(sp + 1, sp + 4).toInt() : 0;
   if (status != 200) { lastError = "RSS HTTP " + String(status); return ""; }
-  if (resp.indexOf("chunked") >= 0) payload = deChunkHtml(payload);
   if (payload.indexOf("<rss") < 0) { lastError = "RSS 非RSS响应"; return ""; }
 
   String out; int hit = 0, pos = 0;
@@ -292,25 +242,13 @@ String LaapSearch::searchCustom(const String& q, int maxHit, int maxLen) {
             "\r\nAccept-Language: zh-CN,zh;q=0.9"
             "\r\nConnection: close\r\n\r\n");
 
-  String resp; resp.reserve(4096);
-  uint32_t deadline = millis() + 10000;
-  while (cli.connected() && millis() < deadline) {
-    while (cli.available()) {
-      resp += (char)cli.read();
-      if (resp.length() > 16384) break;
-    }
-    if (resp.length() > 16384) break;
-    delay(2);
-  }
+  String hdrs, payload;
+  laapHttpRead(&cli, 10000, hdrs, payload, 16384);
   cli.stop();
 
-  int status = 0;
-  int spx = resp.indexOf(' ');
-  if (spx > 0) status = resp.substring(spx + 1, spx + 4).toInt();
-  int bs = resp.indexOf("\r\n\r\n");
-  String payload = (bs > 0) ? resp.substring(bs + 4) : "";
+  int spx = hdrs.indexOf(' ');
+  int status = (spx > 0) ? hdrs.substring(spx + 1, spx + 4).toInt() : 0;
   if (status != 200) { lastError = "主源 HTTP " + String(status); return ""; }
-  if (resp.indexOf("chunked") >= 0) payload = deChunkHtml(payload);
 
   // 响应自动识别：RSS/XML 走条目解析，否则按必应 HTML b_algo 块
   bool isRss = (payload.indexOf("<rss") >= 0 || payload.indexOf("<item>") >= 0 ||

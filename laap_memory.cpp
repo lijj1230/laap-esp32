@@ -80,16 +80,9 @@ void MemorySystem::appendEpisodic(const char* role, const String& rawText) {
   time_t now = time(nullptr);
   // 时钟未同步时 t=0（区别于"开机后秒数"——那会被 decay 当成 5 万天前而最先淘汰）
   uint32_t t = (now > 1700000000) ? (uint32_t)now : 0;
-  // JSON 行，手动转义；w=重要度权重（Mem0 式分层：新记忆 1.0 起步）
-  String esc; esc.reserve(text.length() + 8);
-  for (unsigned int i = 0; i < text.length(); i++) {
-    char c = text[i];
-    if (c == '"' || c == '\\') { esc += '\\'; esc += c; }
-    else if (c == '\n') esc += "\\n";
-    else if (c == '\r') continue;              // \r 裸进 JSONL = 行非法（浏览器 JSON.parse 报错）
-    else if (c == '\t') esc += ' ';
-    else esc += c;
-  }
+  // JSON 行转义统一走 LlmClient::jsonEscape（v3.55 收敛，顺带补上 <0x20 控制字符
+  // → \uXXXX 的缺口：裸控制字符进 JSONL = 行非法）；w=重要度权重（Mem0 式分层：新记忆 1.0 起步）
+  String esc = LlmClient::jsonEscape(text);
   // m=写入那一刻的情绪（手稿"情绪权重"的落点）：当时的心情就是这段经历的色彩。
   // 放 x 之前——正文里万一出现字面 "m":" 也不会干扰键定位；embedding 只抽 x，向量不受污染
   f.printf("{\"t\":%lu,\"r\":\"%s\",\"w\":1.0,\"m\":\"%s\",\"x\":\"%s\"}\n",
@@ -214,23 +207,6 @@ int MemorySystem::recentTurns(String* out, uint8_t* roles, int max) const {
   return n;
 }
 
-String MemorySystem::searchEpisodic(const String& query, int maxChars) {
-  // 取 query 中 >=2 字符的 CJK/词片段做包含匹配（简单召回）
-  String out;
-  File f = LittleFS.open(EP_PATH, "r");
-  if (!f) return out;
-  std::vector<String> hits;
-  while (f.available()) {
-    String l = f.readStringUntil('\n');
-    if (l.length() && l.indexOf(query) >= 0 && query.length() >= 2) hits.push_back(l);
-  }
-  f.close();
-  for (int i = (int)hits.size() - 1; i >= 0 && (int)out.length() < maxChars; i--) {
-    out = hits[i] + "\n" + out;
-  }
-  return out;
-}
-
 // ================= 语义向量（B: bge-m3 双通道召回） =================
 // 向量缓存文件 /mem/emb.bin：每条 1024×float=4KB，与 episodes.jsonl 行序一一对应。
 // 新行缺向量 → embedTick 限速补（每 15s 最多 1 条）；失败连 3 次停用（退关键词通道）。
@@ -302,8 +278,6 @@ void MemorySystem::embedTick() {
   if (ef) { ef.write((uint8_t*)vec, EMB_DIM * 4); ef.close(); _embCount++; }
   free(vec);
 }
-
-float* MemorySystem::embVec(const String& line) { (void)line; return nullptr; }  // 检索内联于 recallSmart
 
 // 余弦相似度
 static float cosineOf(const float* a, const float* b, int n) {
@@ -496,19 +470,6 @@ String MemorySystem::recallSmart(const String& query, int maxChars) {
 //  夜间从最近经历抽取（ino relationsReflect → LK_RELATION → relationsApply），
 //  召回时与提问/心里目标相关的条目一并浮上来——"答应过的事"不用等主人翻旧账。
 // ============================================================
-static String relJsonEsc(const String& s) {
-  String o; o.reserve(s.length() + 8);
-  for (unsigned int i = 0; i < s.length(); i++) {
-    char c = s[i];
-    if (c == '"' || c == '\\') { o += '\\'; o += c; }
-    else if (c == '\n') o += "\\n";
-    else if (c == '\r') continue;
-    else if (c == '\t') o += ' ';
-    else o += c;
-  }
-  return o;
-}
-
 // 轻量解析自己写的关系行 {"t":..,"k":"..","x":".."}（indexOf 足够，不必上 JSON 库）
 static bool relParseLine(const String& l, String& k, String& x) {
   int xp = l.indexOf("\"x\":\"");
@@ -592,11 +553,11 @@ int MemorySystem::relationsApply(const String& llmText) {
     x = utf8Cut(x, 80);
     // 类型宽容匹配（模型可能输出 "1.偏好" / "-偏好" 这类前缀）
     if (k.indexOf("偏好") < 0 && k.indexOf("承诺") < 0 && k.indexOf("边界") < 0) continue;
-    if (x.length() < 6 || existing.indexOf(relJsonEsc(x)) >= 0) continue;   // 太短/已知的不记（比转义形态，含引号条目也能去重）
+    if (x.length() < 6 || existing.indexOf(LlmClient::jsonEscape(x)) >= 0) continue;   // 太短/已知的不记（比转义形态，含引号条目也能去重）
     time_t now = time(nullptr);
     f.printf("{\"t\":%lu,\"k\":\"%s\",\"x\":\"%s\"}\n",
-             (unsigned long)(now > 1700000000 ? (uint32_t)now : 0), relJsonEsc(k).c_str(), relJsonEsc(x).c_str());
-    existing += relJsonEsc(x) + "\n";    // 本轮后面的行也照常去重（与比较的转义形态一致）
+             (unsigned long)(now > 1700000000 ? (uint32_t)now : 0), LlmClient::jsonEscape(k).c_str(), LlmClient::jsonEscape(x).c_str());
+    existing += LlmClient::jsonEscape(x) + "\n";    // 本轮后面的行也照常去重（与比较的转义形态一致）
     lines++; added++;
   }
   f.close();

@@ -67,22 +67,6 @@ LaapWeb webui;
 // 早期只匹配无空格的 "k":" 形式：遇到带空格 JSON 会解析成空串，配上 _set 哨兵会静默清空配置。
 // \uXXXX 解码辅助（v3.51）：浏览器 JSON.stringify 把换行/控制字符/emoji 编成转义序列，
 // 旧解码把 \n 还原成字母 'n'——多行人设落库即坏
-static unsigned hex4(const String& s, int i) {
-  unsigned v = 0;
-  for (int k = 0; k < 4 && i + k < (int)s.length(); k++) {
-    char c = s[i + k]; v <<= 4;
-    if (c >= '0' && c <= '9') v |= (unsigned)(c - '0');
-    else if (c >= 'a' && c <= 'f') v |= (unsigned)(c - 'a' + 10);
-    else if (c >= 'A' && c <= 'F') v |= (unsigned)(c - 'A' + 10);
-  }
-  return v;
-}
-static void appendUtf8(String& o, unsigned cp) {
-  if (cp < 0x80) o += (char)cp;
-  else if (cp < 0x800) { o += (char)(0xC0 | (cp >> 6)); o += (char)(0x80 | (cp & 0x3F)); }
-  else if (cp < 0x10000) { o += (char)(0xE0 | (cp >> 12)); o += (char)(0x80 | ((cp >> 6) & 0x3F)); o += (char)(0x80 | (cp & 0x3F)); }
-  else { o += (char)(0xF0 | (cp >> 18)); o += (char)(0x80 | ((cp >> 12) & 0x3F)); o += (char)(0x80 | ((cp >> 6) & 0x3F)); o += (char)(0x80 | (cp & 0x3F)); }
-}
 static String jsonField(const String& b, const char* k) {
   String pat = String("\"") + k + "\":";
   int i = b.indexOf(pat);
@@ -103,13 +87,13 @@ static String jsonField(const String& b, const char* k) {
     if (c == '\\' && j + 1 < (int)b.length()) {
       char e = b[j + 1];
       if (e == 'u' && j + 5 < (int)b.length()) {          // \uXXXX（含代理对，v3.51）
-        unsigned cp = hex4(b, j + 2);
+        unsigned cp = laapHex4(b, j + 2);
         j += 6;
         if (cp >= 0xD800 && cp <= 0xDBFF && j + 5 < (int)b.length() && b[j] == '\\' && b[j + 1] == 'u') {
-          unsigned lo = hex4(b, j + 2);
+          unsigned lo = laapHex4(b, j + 2);
           if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); j += 6; }
         }
-        appendUtf8(v, cp);
+        laapAppendUtf8(v, cp);
         continue;
       }
       switch (e) {                                        // \n \t \r 等还原成真实字符（v3.51：旧代码字母化）
@@ -129,21 +113,9 @@ static String jsonField(const String& b, const char* k) {
   return v;
 }
 
-// 本地小工具：JSON 字符串转义
+// 本地小工具：JSON 字符串转义（v3.55 收敛：实现只有 LlmClient::jsonEscape 一份）
 static String jsonEsc(const String& s) {
-  String o; o.reserve(s.length() + 8);
-  for (unsigned int i = 0; i < s.length(); i++) {
-    char c = s[i];
-    if (c == '"' || c == '\\') { o += '\\'; o += c; }
-    else if (c == '\n') o += "\\n";
-    else if (c == '\r') o += "";
-    else if (c == '\t') o += "\\t";
-    else if (c == '\b') o += "\\b";
-    else if (c == '\f') o += "\\f";
-    else if ((unsigned char)c < 0x20) { char b[8]; snprintf(b, sizeof(b), "\\u%04X", c); o += b; }
-    else o += c;
-  }
-  return o;
+  return LlmClient::jsonEscape(s);
 }
 
 // ============ 前端页面（PROGMEM，中文 UTF-8） ============
@@ -325,7 +297,6 @@ void LaapWeb::registerRoutes() {
       }
     });
   server.on("/api/voice/test", HTTP_POST, [this]() { handleVoiceTest(); });
-  server.on("/api/speak", HTTP_POST, [this]() { handleSpeak(); });
   server.on("/api/listen", HTTP_POST, [this]() { handleListenToggle(); });
   server.on("/api/metrics", HTTP_GET, [this]() { handleMetrics(); });
   server.on("/api/feedback", HTTP_POST, [this]() { handleFeedback(); });
@@ -1008,14 +979,6 @@ void LaapWeb::handleListenToggle() {
   voice.setVadPaused(!voice.vadPaused());
   server.send(200, "application/json",
       String("{\"ok\":true,\"paused\":") + (voice.vadPaused() ? "true" : "false") + "}");
-}
-
-void LaapWeb::handleSpeak() {
-  String b = server.arg("plain");
-  String text = jsonField(b, "text");
-  if (!text.length()) { server.send(400, "application/json", "{\"ok\":false}"); return; }
-  voice.speak(text, "calm");
-  server.send(200, "application/json", "{\"ok\":true}");
 }
 
 // ---- 评估埋点 / 反馈 / 快照（RSI 闭环：评估端 + 回滚安全网） ----

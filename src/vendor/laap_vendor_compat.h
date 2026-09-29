@@ -8,14 +8,9 @@
 #define BIT(x) (1UL << (x))
 extern void delay(uint32_t ms);
 #define ESP_LOGE(tag, fmt, ...) ((void)0)
-#define ESP_LOGW(tag, fmt, ...) ((void)0)
 #define ESP_LOGI(tag, fmt, ...) ((void)0)
-#define ESP_LOGD(tag, fmt, ...) ((void)0)
-#define ESP_LOGV(tag, fmt, ...) ((void)0)
 #define ESP_RETURN_ON_ERROR(x, tag, ...) do { esp_err_t _e_ = (x); if (_e_ != ESP_OK) return _e_; } while (0)
 #define ESP_RETURN_ON_FALSE(x, ret, tag, ...) do { if (!(x)) return ret; } while (0)
-#define ESP_GOTO_ON_ERROR(x, got, tag, ...) do { esp_err_t _e_ = (x); if (_e_ != ESP_OK) { ret = _e_; goto got; } } while (0)
-#define ESP_GOTO_ON_FALSE(x, retv, got, tag, ...) do { if (!(x)) { ret = retv; goto got; } } while (0)
 
 #ifdef __cplusplus
 extern "C" {

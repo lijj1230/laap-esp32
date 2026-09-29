@@ -2,7 +2,6 @@
 #include "laap_ws.h"
 #include "laap_audio.h"
 uint32_t laapI2sBytes();   // 诊断：I2S 实写字节（laap_audio.cpp）
-#include "laap_display.h"   // 仅用于眨眼刷新保持
 #include <WiFiClientSecure.h>
 #include <esp_heap_caps.h>   // PSRAM 缓冲（别把内部堆切碎）
 #include <mbedtls/sha256.h>
