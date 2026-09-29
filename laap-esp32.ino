@@ -2296,6 +2296,14 @@ void setup() {
   metrics.loadPrev();  // 读回上一段会话的指标快照（崩溃/自愈重启的事故现场不丢）
   r0.begin();          // R0 微型循环处理器：储备池固定重建
   r0.loadNvs();        // 恢复读出层学习进度（打盹/断电不清零"身体直觉"，v3.50）
+  {   // C5 预期置信度 EMA 恢复（10B，laapmtr/expema；判定次数打满才可信赖）
+    Preferences pe;
+    if (pe.begin("laapmtr", true)) {
+      uint8_t blob[10];
+      if (pe.getBytes("expema", blob, sizeof(blob)) == sizeof(blob)) mind.expectEmaLoad(blob);
+      pe.end();
+    }
+  }
   // 音量 0：以前"部分保存会把音量写成 0"（哨兵 bug，已修），所以开机要钳回 30；
   // 现在 0 只可能来自明确设置（网页/CLI），再改写就等于吞掉用户的静音选择——
   // 改为只提示一句，并告诉怎么恢复（"没声音"最常见的原因就是这里被写成 0）
@@ -2487,7 +2495,15 @@ void loop() {
 
   // 累计运行时长：每 5 分钟落盘一次（单键写入，NVS 磨损可忽略）
   { static uint32_t s_lastUpSave = 0;
-    if (millis() - s_lastUpSave > 300000UL) { s_lastUpSave = millis(); laapUptimePersist(); metrics.persist(); r0.saveNvs(); } }
+    if (millis() - s_lastUpSave > 300000UL) { s_lastUpSave = millis(); laapUptimePersist(); metrics.persist(); r0.saveNvs();
+      Preferences pe;   // C5：预期 EMA 同拍批量落盘（零额外磨损节拍）
+      if (pe.begin("laapmtr", false)) {
+        uint8_t blob[10];
+        mind.expectEmaBlob(blob);
+        pe.putBytes("expema", blob, sizeof(blob));
+        pe.end();
+      }
+    } }
 
   // BOOT 键: 短按=主动表达 长按4s=配置热点 长按10s=格式化
   bool pressed = (digitalRead(BTN_PIN) == LOW);

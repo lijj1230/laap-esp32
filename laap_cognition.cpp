@@ -357,18 +357,56 @@ void Cognition::setExpectation(uint8_t cat) {
   _expAtMs = millis();
 }
 
+float Cognition::expectPrecision(uint8_t cat) const {
+  if (cat == EXP_NONE || cat > EXP_WORLD_QUIET) return 1.0f;
+  // 判定次数越少越向 0.5 收（冷启动别让一两次样本定终身）；EMA 本身钳 0.05~1
+  float prior = 0.5f;
+  float w = _expN[cat] < 4 ? _expN[cat] / 4.0f : 1.0f;
+  float p = prior * (1 - w) + _expEma[cat] * w;
+  if (p < 0.05f) p = 0.05f;
+  return p;
+}
+
+void Cognition::expectEmaLoad(const uint8_t* blob) {
+  for (int i = 0; i < 5; i++) {
+    _expEma[i] = blob[i] / 200.0f;                   // 定点 /200：0~1.275 覆盖 0~1
+    _expN[i] = blob[5 + i * 2] | (blob[6 + i * 2] << 8);
+    if (_expEma[i] <= 0.001f && _expN[i] == 0) _expEma[i] = 0.5f;   // 全零=无数据
+    if (_expEma[i] < 0.05f) _expEma[i] = 0.05f;
+    if (_expEma[i] > 1) _expEma[i] = 1;
+  }
+}
+
+void Cognition::expectEmaBlob(uint8_t* out) {
+  for (int i = 0; i < 5; i++) {
+    float e = _expEma[i] * 200.0f;
+    out[i] = (uint8_t)(e > 255 ? 255 : e);
+    out[5 + i * 2] = _expN[i] & 0xFF;
+    out[6 + i * 2] = (_expN[i] >> 8) & 0xFF;
+  }
+}
+
 void Cognition::expectOutcome(bool fulfilled) {
   _expLastTxt = String(kExpectCn[_expCat]) + (fulfilled ? "——应验了" : "——落空了");
-  // 误差回注：预测错了才需要学——按类别把惊讶写进对应需求（小幅，稳态环自己消化）
+  // C5：命中 EMA 更新（α=0.3 平滑）——常落空的类别精度下滑，下一拍仲裁自动降权
+  if (_expCat != EXP_NONE && _expCat <= EXP_WORLD_QUIET) {
+    _expEma[_expCat] += 0.3f * ((fulfilled ? 1.0f : 0.0f) - _expEma[_expCat]);
+    if (_expN[_expCat] < 65535) _expN[_expCat]++;
+  }
+  // 误差回注：预测错了才需要学——按类别把惊讶写进对应需求（小幅，稳态环自己消化）。
+  // C5 精度加权：该类预测一直很准时，偶发落空更值得惊讶（全量回注）；
+  // 一直不准的类别落空是常态（回注打折），避免"常落空的预期反复推高需求=假情绪"
+  float prec = expectPrecision(_expCat);
+  float missGain = (1.0f - prec) + 0.1f;           // 精度 1→全量；精度 0.05→0.95×回注
   if (_expCat == EXP_OWNER_COME) {
-    _n.social += (fulfilled ? -0.08f : 0.05f);    // 来了=念想落地；落空=更想念
+    _n.social += (fulfilled ? -0.08f : 0.05f * missGain);    // 来了=念想落地；落空=更想念
     if (_n.social < 0.05f) _n.social = 0.05f;     // 双侧钳（单侧 min 会瞬时出负需求）
     if (_n.social > 1) _n.social = 1;
     if (fulfilled) trustUpdate(1, 0);
   } else if (_expCat == EXP_OWNER_AWAY) {
-    if (!fulfilled) _n.social = min(1.0f, _n.social + 0.06f);   // 意外来人=意外之喜激发交流欲（想多聊）
+    if (!fulfilled) _n.social = min(1.0f, _n.social + 0.06f * missGain);
   } else if (_expCat == EXP_WORLD_ACTIVE || _expCat == EXP_WORLD_QUIET) {
-    if (!fulfilled) _n.curiosity = min(1.0f, _n.curiosity + 0.05f);   // 世界不按预想走=好奇
+    if (!fulfilled) _n.curiosity = min(1.0f, _n.curiosity + 0.05f * missGain);
   }
   _expCat = EXP_NONE;                            // 评估完清空，等下次自发行为再立
 }

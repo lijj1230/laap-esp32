@@ -41,6 +41,12 @@ public:
   void expectOutcome(bool fulfilled); // 固件判定结果：误差回注需求 + 留档给下一拍提示词
   uint8_t expectation() const { return _expCat; }
   uint32_t expectAtMs() const { return _expAtMs; }
+  // C5 置信度校准（v3.59）：五类预期的命中 EMA（精度加权）。0.5=无先验，常落空→趋 0
+  void  expectEmaLoad(const uint8_t* blob);          // NVS 恢复（10B：5×EMA 定点/10 + 判定次数×2）
+  void  expectEmaBlob(uint8_t* out);                 // 序列化落盘（外部按 5 分钟批量写 NVS）
+  float expectPrecision(uint8_t cat) const;          // 该类精度 0.05~1.0（NONE 恒 1）
+  float _expEma[5] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f}; // [0]=NONE 占位不用；公开供序列化直读
+  uint16_t _expN[5] = {0, 0, 0, 0, 0};               // 各类已判定次数（EMA 冷启动权重）
   String expectLine() const;          // 世界模型 JSON 片段（含上次应验/落空）
   void noteSurprise(float s01);       // R0 循环处理器的世界预测误差（0..1）→ 好奇微抬
 
