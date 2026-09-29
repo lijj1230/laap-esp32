@@ -12,6 +12,7 @@
 #include "laap_audio.h"
 #include "laap_metrics.h"
 #include "laap_r0.h"       // R0 微型循环处理器（状态暴露）
+#include "laap_tlsheap.h"  // tlsroute_kb（mbedtls→PSRAM 路由计数，v3.55）
 #include "laap_snap.h"
 #include "laap_rules.h"
 #include "laap_skills.h"
@@ -767,8 +768,10 @@ void LaapWeb::handleStatus() {
     ",\"heap_kb\":" + String(ESP.getFreeHeap() / 1024) +
     // 环任务栈历史最低余量（字节）：TTS 的 TLS 握手最吃栈，低于 2-3KB 就该警惕
     ",\"stack_min\":" + String((unsigned)uxTaskGetStackHighWaterMark(NULL)) +   // 已是字节（旧代码 ×sizeof(StackType_t) 虚高 4 倍，v3.51）
-    // 最大连续块：TLS 握手要一整块 ~40KB，碎片多时"总空闲够"也会连不上（排障关键指标）
+    // 最大连续块：TLS 握手要一整块，碎片多时"总空闲够"也会连不上（排障关键指标）
+    // v3.55 起 TLS 收发缓冲走 PSRAM，此值不再被握手大幅拉低；tlsroute_kb=0 说明钩子未生效
     ",\"heap_max_kb\":" + String((unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024)) +
+    ",\"tlsroute_kb\":" + String(laapTlsHeapRouteKb()) +
     ",\"wifi_rssi\":" + (WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) : String("0")) +
     ",\"chip_temp\":" + String(temperatureRead(), 1) +
     ",\"needs\":" + needs +

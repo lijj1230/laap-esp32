@@ -99,6 +99,160 @@ bool LlmClient::extractStringField(const String& json, const char* key, String& 
   return false;
 }
 
+// ================= 连接保活复用（v3.55）=================
+// 每次 TLS 握手 = 1-2s 延时 + 一次内部堆峰值。聊天与向量各有一个保活槽位：
+// 响应"按帧干净结束"（Content-Length 读满 / chunked 终结块完整）且服务器没说
+// close 才保留连接；超时、断连、帧不完整一律丢弃，绝不带着脏状态复用。
+// 并发纪律：llmTask 与网页连通性测试可能同时进 chatMsgsContinue——槽位由
+// s_connMtx 保护，同一槽位同时只被一个任务持有（inUse 标志在锁内置位）。
+struct LlmKeepConn {
+  WiFiClient* c = nullptr;
+  String host; int port = 0; bool tls = false;
+  uint32_t lastUse = 0;
+  bool inUse = false;
+};
+static LlmKeepConn s_chatConn, s_embConn;
+static SemaphoreHandle_t s_connMtx = nullptr;   // laapNetInit 里创建（setup 早于一切网络）
+static const uint32_t LLM_KEEPALIVE_MS = 180000; // 闲置 3 分钟以上的连接不复用（服务商回收更短也无妨，connected() 已死会被丢弃）
+
+// 新建连接（带 3 次退避重试）：connect 失败不花 token（请求还没发出去），
+// 碎片多时等几百毫秒回收往往就通了，比让上层收到一个"连接失败"有用得多
+static WiFiClient* llmFreshConnect(bool useTls, const String& host, int port, String& lastError) {
+  for (int attempt = 0; attempt < 3; attempt++) {
+    WiFiClient* c = useTls ? (WiFiClient*)(new WiFiClientSecure) : new WiFiClient;
+    if (useTls) ((WiFiClientSecure*)c)->setInsecure(); // 端侧自签策略见 README
+    c->setTimeout(15000); // Stream 超时单位为 ms
+    if (c->connect(host.c_str(), port)) return c;
+    delete c;
+    Serial.printf("[LLM] 连接失败（第 %d 次），最大连续块 %uKB，%dms 后重试\n",
+                  attempt + 1,
+                  (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024),
+                  600 + attempt * 700);
+    if (attempt < 2) vTaskDelay(pdMS_TO_TICKS(600 + attempt * 700));   // 最后一次失败不必再白等 2s（v3.51）
+  }
+  lastError = "连接失败:" + host;
+  return nullptr;
+}
+
+static WiFiClient* connAcquire(LlmKeepConn& slot, const String& host, int port,
+                               bool tls, bool& reused) {
+  reused = false;
+  if (!s_connMtx || xSemaphoreTake(s_connMtx, pdMS_TO_TICKS(100)) != pdTRUE) return nullptr;
+  if (slot.c && !slot.inUse) {
+    if (slot.host != host || slot.port != port || slot.tls != tls ||
+        millis() - slot.lastUse > LLM_KEEPALIVE_MS) {
+      slot.c->stop(); delete slot.c; slot.c = nullptr;      // 过期/不匹配：丢弃
+    } else {
+      // 存活探测：connected() 内部会拉取下一条 TLS 记录，闲置连接上会一路阻塞到
+      // SO_RCVTIMEO——先压到 10ms 探一次：EOF=服务器已关（丢弃），读超时=仍活着。
+      // 探测后由调用方 setTimeout 恢复正常读超时（复用成功路径必须恢复）
+      slot.c->setTimeout(10);
+      if (!slot.c->connected()) { slot.c->stop(); delete slot.c; slot.c = nullptr; }
+    }
+  }
+  WiFiClient* c = nullptr;
+  if (slot.c && !slot.inUse) { slot.inUse = true; reused = true; c = slot.c; }
+  xSemaphoreGive(s_connMtx);
+  return c;
+}
+
+// 归还连接：clean=本次响应按帧干净结束。新建连接干净结束且槽位空 → 收养供下次复用
+static void connFinish(LlmKeepConn& slot, WiFiClient* c, bool clean,
+                       const String& host, int port, bool tls) {
+  if (!c) return;
+  bool keep = false;
+  if (s_connMtx && xSemaphoreTake(s_connMtx, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (c == slot.c) {                       // 复用的那条
+      slot.inUse = false;
+      if (clean) slot.lastUse = millis();
+      else { slot.c->stop(); delete slot.c; slot.c = nullptr; }
+      keep = clean;
+    } else if (clean && !slot.c && !slot.inUse) {   // 新建干净 + 槽位空 → 收养
+      slot.c = c; slot.inUse = false;
+      slot.host = host; slot.port = port; slot.tls = tls;
+      slot.lastUse = millis();
+      keep = true;
+    }
+    xSemaphoreGive(s_connMtx);
+  }
+  if (!keep) { c->stop(); delete c; }
+}
+
+// 按 HTTP 响应帧精确读取（keep-alive 的前提是知道"体到哪结束"，不能靠"服务器关闭"收尾）。
+// 返回 true = 按帧干净结束（连接可复用）；false = 超时/断连/帧不完整/超上限（必须丢弃）。
+// chunked 在读取时逐块剥离（精确替代旧的"全 hex 行删除"启发式）。
+static bool llmReadResponse(WiFiClient* c, uint32_t timeoutMs, String& hdrs, String& payload) {
+  uint32_t t0 = millis();                              // 差值比较：49.7 天回绕安全
+  hdrs = ""; hdrs.reserve(1024);
+  while (millis() - t0 < timeoutMs) {                  // 阶段一：读到头结束 \r\n\r\n
+    int ch = c->read();
+    if (ch < 0) { if (!c->connected()) return false; delay(2); continue; }
+    hdrs += (char)ch;
+    if (hdrs.endsWith("\r\n\r\n")) break;
+    if (hdrs.length() > 8192) return false;            // 头异常：当坏连接处理
+  }
+  if (!hdrs.endsWith("\r\n\r\n")) return false;
+
+  String low = hdrs; low.toLowerCase();                // 头字段统一小写后检索（锚定行首，防 X-Content-Length 之类误匹配）
+  bool srvClose = low.indexOf("\nconnection: close") >= 0;
+  bool chunked = false;
+  { int i = low.indexOf("\ntransfer-encoding:");
+    if (i >= 0 && low.indexOf("chunked", i) >= 0) chunked = true; }
+
+  payload = ""; payload.reserve(12288);   // 与旧口径一致：聊天响应常 5-20KB，预分配免翻倍再分配链
+  bool framedDone = false;
+  if (chunked) {
+    // <hex>[;ext]\r\n <data> \r\n ... 0\r\n [尾随头行...] \r\n
+    int st = 0; long remain = 0; char sz[16]; int sl = 0;
+    while (!framedDone && millis() - t0 < timeoutMs) {
+      int ch = c->read();
+      if (ch < 0) { if (!c->connected()) break; delay(2); continue; }
+      if (st == 0) {                                   // 块大小行
+        if (ch == '\n') {
+          if (sl >= 0) sz[sl] = 0;                     // ';' 处已终止时 sz 原样可用
+          remain = strtol(sz, nullptr, 16);
+          sl = 0; st = (remain == 0) ? 3 : 1;
+        } else if (ch == '\r') { /* 行尾 */ }
+        else if (ch == ';') { if (sl >= 0) sz[sl] = 0; sl = -1; }  // 块扩展：hex 已定，后续不收集
+        else if (sl >= 0 && sl < 15) sz[sl++] = (char)ch;
+      } else if (st == 1) {                            // 块数据
+        payload += (char)ch;
+        if (payload.length() > 40000) return false;
+        if (--remain == 0) st = 2;
+      } else if (st == 2) {                            // 块尾 \r\n
+        if (ch == '\n') st = 0;
+      } else {                                         // 终结块后：尾随头直到空行
+        if (ch == '\n') { if (sl == 0) framedDone = true; sl = 0; }
+        else if (ch != '\r' && sl < 4096) sl++;
+      }
+    }
+  } else {
+    int i = low.indexOf("\ncontent-length:");
+    if (i >= 0) {
+      long cl = strtol(low.c_str() + i + 16, nullptr, 10);
+      long got = 0;
+      while (got < cl && millis() - t0 < timeoutMs) {
+        int ch = c->read();
+        if (ch < 0) { if (!c->connected()) break; delay(2); continue; }
+        payload += (char)ch; got++;
+        if (payload.length() > 40000) break;
+      }
+      framedDone = (got == cl);
+    } else {
+      // 无 Content-Length 也无 chunked：读到对端关闭为止（旧行为），连接不可复用
+      while (millis() - t0 < timeoutMs) {
+        int ch = c->read();
+        if (ch < 0) { if (!c->connected()) break; delay(2); continue; }
+        payload += (char)ch;
+        if (payload.length() > 40000) break;
+      }
+    }
+  }
+  // 不在这里调 connected()：它会拉取下一条 TLS 记录、闲置时阻塞到读超时（见 connAcquire
+  // 的探测注释）。服务器实际已关闭的情况，由下次 connAcquire 的 10ms 探测兜住
+  return framedDone && !srvClose;
+}
+
 LlmReply LlmClient::chat(const String& systemPrompt, const String& userPrompt,
                           int maxTokens, float temperature) {
   LlmMsg msgs[2] = { {"system", systemPrompt}, {"user", userPrompt} };
@@ -118,11 +272,12 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
   if (String(cfg.s.llmKey).length() == 0) { lastError = "API Key 未配置"; return r; }
   // 内存碎片：TLS 握手要一块连续内存，只看"总空闲"会被碎片骗（实测 heap 75KB、
   // 最大连续块只有 30 多 KB 时 connect 直接失败，而主线程新连接却能成）。
-  // 开机常态最大块就 ~39KB，所以门槛只拦"真的没救"的情况（24KB），
+  // v3.55 起 TLS 收发缓冲走 PSRAM（tlsheap 钩子），握手只需 ~8-10KB 内部块
+  // （mbedtls 上下文+握手临时量），门槛从 24KB 同步下调到 14KB；
   // 真正的兜底交给下面 connect 失败后的重试+退避。
-  for (int i = 0; i < 8 && heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 24000; i++)
+  for (int i = 0; i < 8 && heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 14000; i++)
     vTaskDelay(pdMS_TO_TICKS(250));
-  if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 24000) {
+  if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 14000) {
     lastError = String("内存碎片过多（最大连续块仅 ") +
                 String(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024) + "KB），稍后重试";
     return r;
@@ -153,72 +308,49 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
   if (cfg.s.llmNoThink) body += ",\"thinking\":{\"type\":\"disabled\"}";
   body += "}";
 
-  // 连接重试：connect 失败不花 token（请求还没发出去），值得带退避重试两次——
-  // 碎片多时等几百毫秒回收往往就通了，比让上层收到一个"连接失败"有用得多
-  WiFiClient *client = nullptr;
-  for (int attempt = 0; attempt < 3; attempt++) {
-    client = useTls ? (WiFiClient*)(new WiFiClientSecure) : new WiFiClient;
-    if (useTls) ((WiFiClientSecure*)client)->setInsecure(); // 端侧自签策略见 README
-    client->setTimeout(15000); // Stream 超时单位为 ms
-    if (client->connect(host.c_str(), port)) break;
-    delete client; client = nullptr;
-    Serial.printf("[LLM] 连接失败（第 %d 次），最大连续块 %uKB，%dms 后重试\n",
-                  attempt + 1,
-                  (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024),
-                  600 + attempt * 700);
-    if (attempt < 2) vTaskDelay(pdMS_TO_TICKS(600 + attempt * 700));   // 最后一次失败不必再白等 2s（v3.51）
+  // 连接获取：优先复用保活连接（省 1-2s 握手与一次内部堆峰值），没有再新建+退避重试
+  bool reused = false;
+  WiFiClient* client = connAcquire(s_chatConn, host, port, useTls, reused);
+  if (client) {
+    client->setTimeout(15000);   // 复用路径必须恢复读超时（探测把它压到了 10ms）
+    Serial.println("[LLM] 复用保活连接");
   }
-  if (!client) { lastError = "连接失败:" + host; return r; }
+  if (!client) {
+    client = llmFreshConnect(useTls, host, port, lastError);
+    if (!client) return r;
+  }
 
-  uint32_t t0 = millis();
   // Host 头必须带非默认端口（自建网关 https://gw.lan:8443/v1 是最典型填法，v3.51 审计）
   String hostHdr = (port == 443 || port == 80) ? host : host + ":" + String(port);
+  // keep-alive：服务器无视它直接关闭也没关系——读取侧按帧判断，关闭=不复用（v3.55）
   String req = String("POST ") + path + " HTTP/1.1\r\nHost: " + hostHdr +
     "\r\nAuthorization: Bearer " + cfg.s.llmKey +
     "\r\nContent-Type: application/json\r\nContent-Length: " + body.length() +
-    "\r\nConnection: close\r\n\r\n" + body;
-  client->print(req);
-
-  // 读响应
-  String resp; resp.reserve(12288);   // 与 laapEmbed 同口径：聊天响应常 5-20KB，预分配免翻倍再分配链
-  uint32_t t0ms = millis();
-  while (client->connected() && millis() - t0ms < 30000) {  // 差值比较：49.7 天回绕安全
-    while (client->available()) {
-      resp += (char)client->read();
-      if (resp.length() > 40000) break;
-    }
-    if (resp.length() > 40000) break;
-    delay(2);
+    "\r\nConnection: keep-alive\r\n\r\n" + body;
+  size_t sent = client->print(req);
+  if (sent != req.length() && reused && sent == 0) {
+    // 复用连接已死且一个字节都没发出去：新建连接重发是安全的（服务器什么都没收到）
+    connFinish(s_chatConn, client, false, host, port, useTls);
+    Serial.println("[LLM] 保活连接已失效，新建重发");
+    client = llmFreshConnect(useTls, host, port, lastError);
+    if (!client) return r;
+    reused = false;
+    sent = client->print(req);
   }
-  client->stop();
-  delete client;
-
-  int sp = resp.indexOf(' ');
-  r.httpStatus = (sp > 0) ? resp.substring(sp + 1, sp + 4).toInt() : 0;
-  int bodyStart = resp.indexOf("\r\n\r\n");
-  String payload = (bodyStart > 0) ? resp.substring(bodyStart + 4) : resp;
-  // chunked 只在响应头声明时才去壳（v3.51 审计）：旧实现嗅探 body——成功响应首字段恰是
-  // {"id" 导致最需要去壳时反而跳过；多行 JSON 里恰为纯 hex 的行还会被误删
-  bool chunked = false;
-  { int he = resp.indexOf("Transfer-Encoding");
-    if (he >= 0 && resp.indexOf("chunked", he) >= 0) chunked = true; }
-  if (chunked && payload.length() > 0) {
-    String clean; int pos = 0;
-    while (pos < (int)payload.length()) {
-      int nl = payload.indexOf('\n', pos);
-      String line = (nl < 0) ? payload.substring(pos) : payload.substring(pos, nl);
-      line.trim();
-      bool allHex = line.length() > 0;
-      for (unsigned int ci = 0; ci < line.length() && allHex; ci++) {
-        char ch = line[ci];
-        if (!isHexadecimalDigit(ch)) allHex = false;
-      }
-      if (!allHex) clean += line;
-      if (nl < 0) break;
-      pos = nl + 1;
-    }
-    payload = clean;
+  if (sent != req.length()) {
+    // 部分发出后写失败：不能盲重试（重发可能重复计费），如实报错
+    connFinish(s_chatConn, client, false, host, port, useTls);
+    lastError = "发送失败:" + host;
+    return r;
   }
+
+  String hdrs, payload;
+  bool clean = llmReadResponse(client, 30000, hdrs, payload);
+  connFinish(s_chatConn, client, clean, host, port, useTls);
+  if (!clean) Serial.println("[LLM] 连接未按帧干净结束，已丢弃");
+
+  int sp = hdrs.indexOf(' ');
+  r.httpStatus = (sp > 0) ? hdrs.substring(sp + 1, sp + 4).toInt() : 0;
 
   String content;
   if (r.httpStatus != 200) {
@@ -340,6 +472,7 @@ bool LlmClient::ping(String& reply) {
 static SemaphoreHandle_t s_netMtx = nullptr;
 void laapNetInit() {                            // setup 里显式建锁：懒创建的 check-then-create
   if (!s_netMtx) s_netMtx = xSemaphoreCreateMutex();   // 若两任务同时首进会各建一把=互斥失效+泄漏
+  if (!s_connMtx) s_connMtx = xSemaphoreCreateMutex(); // keep-alive 槽位元数据锁（v3.55，同上理由）
 }
 bool laapNetLock(uint32_t ms) {
   if (!s_netMtx) {
@@ -404,44 +537,32 @@ String laapEmbed(const String& text, bool& ok) {
   if (host.indexOf(':') >= 0) { port = host.substring(host.indexOf(':') + 1).toInt(); host = host.substring(0, host.indexOf(':')); }
 
   String body = String("{\"model\":\"") + model + "\",\"input\":[\"" + LlmClient::jsonEscape(text) + "\"]}";
-  WiFiClientSecure cli; cli.setInsecure(); cli.setTimeout(12000);
-  if (!cli.connect(host.c_str(), port)) return "";
+  // 保活复用（v3.55）：向量是最高频的 TLS 调用（每次记忆写入都要），复用收益最直接。
+  // 帧不干净/写失败一律丢弃连接——失败静默返回空（记忆层自动退关键词通道，与旧行为一致）
+  bool reused = false;
+  WiFiClient* client = connAcquire(s_embConn, host, port, true, reused);
+  if (client) client->setTimeout(12000);   // 复用路径必须恢复读超时（探测把它压到了 10ms）
+  (void)reused;   // embed 高频且静默：复用成功不打日志，这里只接收 out 参数
+  if (!client) {
+    client = new WiFiClientSecure;
+    ((WiFiClientSecure*)client)->setInsecure();
+    client->setTimeout(12000);
+    if (!client->connect(host.c_str(), port)) { delete client; return ""; }
+  }
   String req = String("POST ") + path + " HTTP/1.1\r\nHost: " + host +
     "\r\nAuthorization: Bearer " + key +
     "\r\nContent-Type: application/json\r\nContent-Length: " + body.length() +
-    "\r\nConnection: close\r\n\r\n" + body;
-  cli.print(req);
-  String resp; resp.reserve(12288);
-  uint32_t dl = millis() + 20000;
-  while (cli.connected() && millis() < dl) {
-    while (cli.available()) { resp += (char)cli.read(); if (resp.length() > 60000) break; }
-    if (resp.length() > 60000) break;
-    delay(2);
+    "\r\nConnection: keep-alive\r\n\r\n" + body;
+  if (client->print(req) != req.length()) {
+    connFinish(s_embConn, client, false, host, port, true);
+    return "";
   }
-  cli.stop();
-  int sp = resp.indexOf(' ');
-  int code = sp > 0 ? resp.substring(sp + 1, sp + 4).toInt() : 0;
-  int bs = resp.indexOf("\r\n\r\n");
-  String payload = bs > 0 ? resp.substring(bs + 4) : "";
+  String hdrs, payload;
+  bool clean = llmReadResponse(client, 20000, hdrs, payload);
+  connFinish(s_embConn, client, clean, host, port, true);
+  int sp = hdrs.indexOf(' ');
+  int code = sp > 0 ? hdrs.substring(sp + 1, sp + 4).toInt() : 0;
   if (code != 200) return "";
-
-  // chunked 块头去掉（与 chat 路径同法：纯十六进制行删）。原实现漏了这步，
-  // 块大小行的 hex 字母会让下面的解析游标卡死 → llmTask 死循环 → 看门狗复位
-  if (payload.indexOf('{') < 0 || payload.indexOf('\n') >= 0) {
-    String clean; int pos = 0;
-    while (pos < (int)payload.length()) {
-      int nl = payload.indexOf('\n', pos);
-      String line = (nl < 0) ? payload.substring(pos) : payload.substring(pos, nl);
-      line.trim();
-      bool allHex = line.length() > 0;
-      for (unsigned int ci = 0; ci < line.length() && allHex; ci++)
-        if (!isHexadecimalDigit(line[ci])) allHex = false;
-      if (!allHex) clean += line;
-      if (nl < 0) break;
-      pos = nl + 1;
-    }
-    payload = clean;
-  }
 
   // 解析 "embedding":[0.123,-0.456,...]（1024 个浮点）
   int epos = payload.indexOf("\"embedding\"");

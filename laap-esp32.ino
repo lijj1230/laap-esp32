@@ -47,6 +47,7 @@
 #include "laap_rules.h"     // 行为规则集（RSI 闭环的载体/注入）
 #include "laap_skills.h"    // 口令技能库（RSI④：主人教的 trigger→指令）
 #include "laap_r0.h"        // R0 微型循环处理器（ESN 世界预测，误差回注好奇）
+#include "laap_tlsheap.h"   // mbedtls 分配器钩子（TLS 大块路由 PSRAM，v3.55）
 
 // ---------- 全局（定义在各模块 .cpp，头文件已 extern） ----------
 
@@ -552,9 +553,10 @@ static void llmTaskFunc(void*) {
 // 受理一个 LLM 请求（立即返回 true=已入队，false=忙/队满）
 bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
                const String& userText, uint8_t kind, const String& searchQ, const String& lookQ) {
-  // TLS 握手要 ~31KB+ 连续内部内存；ASR 预热连接会占住最大的一块。
-  // 堆紧时先请它让位（实测 maxblk 30KB 时 LLM 三连"连接失败"的根因之一）
-  if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 36000)
+  // ASR 预热连接会占住内部堆最大的一块，堆紧时先请它让位。v3.55 起 TLS 收发缓冲
+  // 走 PSRAM（tlsheap 钩子），LLM 对内部堆的需求从 ~36KB 降到 ~10KB——门槛同步下调，
+  // 不再无谓杀掉预热连接（杀一次 = 下次录音要多等一次完整 TLS 握手）
+  if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 18000)
     asr.warmDrop();
   if (g_llmBusy || !g_llmQueue) return false;
   LlmRequest* req = new LlmRequest();
@@ -2231,6 +2233,9 @@ void setup() {
                 (unsigned)(ESP.getFreeHeap() / 1024),
                 (unsigned)(ESP.getFreePsram() / 1024),
                 (unsigned)uxTaskGetStackHighWaterMark(NULL));   // 已是字节：旧代码 ×sizeof(StackType_t) 虚高 4 倍（v3.51）
+
+  laapTlsHeapInit();   // 必须先于一切 TLS：mbedtls 大块分配路由 PSRAM（v3.55，一条 TLS 连接
+                       // 的内部堆峰值 ~42KB→~8KB，直接缓解自愈性打盹的碎片来源）
 
   if (!memory.begin())
     Serial.println("[LAAP] !! LittleFS 挂载失败：记忆/规则/技能/快照本次不可用（/reset 或检查分区）");
