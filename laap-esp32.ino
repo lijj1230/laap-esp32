@@ -1055,6 +1055,23 @@ void llmHarvest() {
       r.say = rest;   // 候选标记走样时至少把「选定/预期」元行剥掉再广播（v3.49 审计）
     }
     if (expCat != Cognition::EXP_NONE) mind.setExpectation(expCat);
+    // C4 内循环自评（v3.60，端侧零 LLM 版）：说完之前"想一下该不该说"。
+    // 抑制分 = C3 负反馈增益不足（近期被踩/被打断）+ 深夜 + 长篇，三者叠加过阈
+    // 就撤回这次表达（静默收场，当拍表达欲已由 C3 压低，下轮自然降温）。
+    // 高风险轮才触发——平时零成本直通。
+    {
+      float inhibit = 0;
+      if (mind.expressGain() < 0.7f) inhibit += (0.7f - mind.expressGain()) * 1.6f;   // 0.3→0.64
+      if (laapInQuietWindow()) inhibit += 0.25f;                                      // 静音窗边缘
+      if (r.say.length() > 150) inhibit += 0.15f;                                     // 长篇大论
+      if (inhibit >= 0.75f) {
+        Serial.printf("[C4] 自评抑制 %.2f≥0.75：撤回本次表达（想了想还是不说）\\n", inhibit);
+        display.drawFace("calm", false);
+        mind.onExpressed(true);          // 表达欲已消费（想了=说了的内部版）
+        g_lastSay = "";                  // 不留"上次说了什么"的痕迹
+        return;
+      }
+    }
   }
   String say;
   if (r.ok) {
