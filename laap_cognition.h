@@ -55,6 +55,22 @@ public:
   float lastBroadcastTh() const { return _bcTh; }
   String broadcastLine() const { return _bcText; }   // 空串=本拍无广播（提示词注入点自行跳过）
   void   broadcastClear() { _bcText = ""; }
+  // ---- C3 dominance 负反馈（v3.60）：双时间尺度。
+  // 快变量（分钟级可逆）：负反馈事件（👎/播报被打断/被叫安静）压表达欲与社交欲的
+  // 增长——表达欲平衡点 x*=g/(g+d) 里的 g 打折，自动收敛到更低的平衡点（学会安静，
+  // 不是硬钳制）。掉电归零（快策略本就不该固化）。
+  void onNegativeFeedback(const char* src);   // 事件入口：dislike/interrupt/told-quiet
+  void socNudge(float d) {                    // C3 慢变量：外向性受控微调（夜间守卫下探用）
+    _sociability += d;
+    _sociability += (0.5f - _sociability) * 0.05f;   // 锚点回归：偏 0.5 越远拉力越大
+    if (_sociability < 0.10f) _sociability = 0.10f;
+    if (_sociability > 0.95f) _sociability = 0.95f;
+    _evoDirty = true;
+  }
+  float expressGain() const { return _negGain; } // 表达需求增长项的有效增益 0.3~1
+  float _negGain = 1.0f;                       // 1=无抑制；每次负反馈 ×0.55，自然回中
+  uint32_t _negGainMs = 0;                     // 上次回中节拍
+  // 慢变量（天级持久）：夜间反思的守卫下探（证据+锚点+钳制三重），实现在 applySocNudge
   float _bcTh = 0;                                    // 最近一次判决阈值（诊断）
   String _bcText;                                     // 赢得广播的念头（1 拍有效）
   String expectLine() const;          // 世界模型 JSON 片段（含上次应验/落空）

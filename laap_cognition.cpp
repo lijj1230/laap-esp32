@@ -90,13 +90,18 @@ void Cognition::tick(float dtMin) {
   //  自我回补（独处/夜间回落）：线性衰减在低值区自然趋缓（×x 的比例式也一样），
   //  与上面的饱和增长构成完整稳态环。
   // ============================================================
+  // C3 快变量回中：~90 分钟半衰期向 1.0 恢复（无负反馈 2 小时后基本痊愈）
+  if (_negGain < 1.0f) {
+    _negGain += 0.004f * dtMin;                       // dtMin=心跳分钟数，30s 拍≈+0.002
+    if (_negGain > 1.0f) _negGain = 1.0f;
+  }
   float aloneMin = (millis() - lastUserMs) / 60000.0f;
   bool quiet = aloneMin > 5.0f;                       // 五分钟没人理 = 独处静息
   if (night)        _n.energy -= 0.020f * dtMin;      // 夜里睡下：平衡点 0.375
   else if (quiet)   _n.energy -= 0.009f * dtMin;      // 白天独处打盹：平衡点 0.31
   if (quiet) {                                        // 独处久了会自我调适（不调适就永远黏人）
     _n.social     -= 0.014f * dtMin;                  // 平衡点 0.42（<30min 时）
-    _n.expression -= 0.009f * dtMin;                  // 平衡点 0.44
+    _n.expression -= 0.009f * _negGain * dtMin;       // 平衡点 0.44（C3：负反馈期 g 打折→平衡点下移）
   }
   if (rssiDb == 0 || rssiDb > -70) _n.security -= 0.004f * dtMin;  // 环境稳定=安全感回落（平衡 0.33）
   if (rssiDb != 0 && rssiDb < -80) _n.security += 0.02f * dtMin;   // 信号差/断网 → 不安（原来的环境调制）
@@ -355,6 +360,16 @@ void Cognition::setExpectation(uint8_t cat) {
   if (cat > EXP_WORLD_QUIET) cat = EXP_NONE;
   _expCat = cat;
   _expAtMs = millis();
+}
+
+// C3 快变量：负反馈事件压表达/社交的增长增益。×0.55 一步，向 1.0 以 ~90 分钟半衰期
+// 回中（稳态环自己消化，无需显式恢复逻辑）；下限 0.3=再怎么踩也保留三成天性。
+// 事件源：网页👎/播报被打断/夜间规则里"求安静"类命中
+void Cognition::onNegativeFeedback(const char* src) {
+  _negGain *= 0.55f;
+  if (_negGain < 0.3f) _negGain = 0.3f;
+  _n.expression = min(_n.expression, 0.55f);   // 当拍表达欲直接压回阈下，止住连环输出
+  Serial.printf("[C3] 负反馈(%s) 表达增益→%.2f\\n", src, _negGain);
 }
 
 // C1：全局广播判决。salience 由调用方按事件源合成（需求/intent/惊讶），这里只做

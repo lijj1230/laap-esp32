@@ -822,6 +822,13 @@ void llmHarvest() {
       String sem = memory.semantic();
       memory.setSemantic((sem.length() ? sem + " " : "") + r.say);
       Serial.printf("[LAAP·反思] %s\n", r.say.c_str());
+      // C3 慢变量（天级，持久）：夜间做一次守卫下探评估——近 24h 👎≥3 且占比过半才
+      // 允许 sociability -0.01（外向性收敛），带向 0.5 的锚点回归（防"越教越自闭"
+      // 的单向漂移）。平时反向走 evolveAfterChat 的深聊+，双向都有通路=进化不失控
+      if (metrics.fbDown >= 3 && metrics.fbDown > metrics.fbUp) {
+        mind.socNudge(-0.01f);
+        Serial.println("[C3] 近期负反馈偏多：外向性微降（守卫下探）");
+      }
     }
     return;
   }

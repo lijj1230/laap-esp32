@@ -1009,7 +1009,7 @@ void LaapWeb::handleFeedback() {
   if (v != 1 && v != -1) { server.send(400, "application/json", "{\"ok\":false,\"msg\":\"v 须为 1 或 -1\"}"); return; }
   // 反馈直接进认知：👍=信任+，👎=失望+信任-（它会对"被踩的回答"表现出警觉/低落）
   if (v > 0) mind.trustUpdate(2, 0);
-  else { mind.trustUpdate(0, 1); mind.onLetdown(0.5f); }
+  else { mind.trustUpdate(0, 1); mind.onLetdown(0.5f); mind.onNegativeFeedback("dislike"); }   // C3
   bool ok = metrics.feedback(v, laapLastUserText(), laapChatReply());
   server.send(ok ? 200 : 500, "application/json",
               String("{\"ok\":") + (ok ? "true" : "false") + "}");
