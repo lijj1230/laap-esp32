@@ -945,6 +945,7 @@ void llmHarvest() {
       mind.onDiscovery(nov);
       Serial.printf("[Cognition] 新知新颖度 %.0f%% → 好奇额外消解\n", nov * 100);
     }
+    mind.broadcastClear();   // C1：节拍槽 1 拍有效，广播过的念头说完就下台
     display.drawFace(g_lastExpr.c_str());
     memory.logEvent("aris", "【自发】我刚才在想「" + g_monoTopic + "」：" + r.say);
     if (g_monoKnow.length()) memory.logEvent("world", g_monoTopic + " → " + utf8Cut(g_monoKnow, 80));  // 字节截断会切半汉字（曾污染 episodes.jsonl）
@@ -1087,11 +1088,38 @@ bool arisIdleMonologue() {
     g_monoGoal = mind.intent(0);
     s_goalStreak++;
   } else s_goalStreak = 0;
+  // C1 全局广播判决（v3.60）：到点+需求过线只是"可以想"，还要看这个念头能不能
+  // 赢下舞台——salience 取三类候选源的最大值：需求强度、意图驱动加成、R3/R0 惊讶。
+  // 未过阈=本拍让位（不白烧一次 LLM），计时已在门槛处重置，需求攒够自然再来
+  {
+    float dom = mind.dominance();
+    float salNeed = dom;
+    float salIntent = mind.intentCount() > 0 ? 0.15f + dom * 0.7f : 0;
+    float salSurprise = 0;
+    float r0err = r0.lastErr() - r0.rollingErr();       // 超出基线的惊讶才进意识
+    if (r0err > 0) salSurprise = 0.30f + r0err * 0.9f;
+    bool winIntent = salIntent >= salNeed && salIntent >= salSurprise;
+    bool winSurp = !winIntent && salSurprise >= salNeed;
+    float sal = winIntent ? salIntent : (winSurp ? salSurprise : salNeed);
+    const char* win = winIntent ? "intent" : (winSurp ? "surprise" : "need");
+    String txt;
+    if (winIntent) txt = String("心里惦记着目标：") + mind.intent(0);
+    else if (winSurp) txt = "世界刚才的动静让我很意外";
+    else txt = "一阵说不清的冲动，想自己念叨点什么";
+    float got = mind.broadcastSalience(win, txt, sal);
+    Serial.printf("[BC] 独白判决 need=%.2f intent=%.2f surprise=%.2f -> %s %.2f\n",
+                  salNeed, salIntent, salSurprise, win, got);
+    if (got < mind.lastBroadcastTh()) {
+      Serial.println("[LAAP·独白] 未赢得广播，本轮沉默（需求在攒，攒够再试）");
+      return false;
+    }
+  }
   // 提交侧拍快照：llmTask 里不再遍历 _work String 环 / mind / g_recentTopics
   // （这些都由 loopTask 并发改写，后台直接读=String 撕裂→堆损坏）
   // 素材排除自己的旧独白：断"自己喂自己"的主题自强化环（v3.27）
   g_monoCtx = memory.recentContextExcluding(300, "【自发】");
   g_monoSys = buildSystemPrompt();
+  if (mind.broadcastLine().length()) g_monoSys += "\n" + mind.broadcastLine();   // C1：赢得广播的念头注入
   g_monoTopics = g_recentTopics;
   if (!llmSubmit(m, 1, 40, 0.95f, LK_MONO)) {
     Serial.println("[LAAP·独白] LLM 忙，本轮放弃");

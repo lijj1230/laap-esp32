@@ -47,6 +47,16 @@ public:
   float expectPrecision(uint8_t cat) const;          // 该类精度 0.05~1.0（NONE 恒 1）
   float _expEma[5] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f}; // [0]=NONE 占位不用；公开供序列化直读
   uint16_t _expN[5] = {0, 0, 0, 0, 0};               // 各类已判定次数（EMA 冷启动权重）
+  // ---- C1 全局门控广播（v3.60）：意识课题②。每个候选拍事件算 salience 分，
+  // 冠军且分>阈值（阈随 dominance 反比=越"有欲"越容易被闯入念头占据舞台）才赢得
+  // 广播，写入节拍槽注入下一拍 system prompt——工作记忆环只存历史，这里决定"此刻
+  // 上舞台的是什么"。状态 <100B。
+  float broadcastSalience(const char* kind, const String& text, float salience); // 返回该次得分；过阈=赢得广播
+  float lastBroadcastTh() const { return _bcTh; }
+  String broadcastLine() const { return _bcText; }   // 空串=本拍无广播（提示词注入点自行跳过）
+  void   broadcastClear() { _bcText = ""; }
+  float _bcTh = 0;                                    // 最近一次判决阈值（诊断）
+  String _bcText;                                     // 赢得广播的念头（1 拍有效）
   String expectLine() const;          // 世界模型 JSON 片段（含上次应验/落空）
   void noteSurprise(float s01);       // R0 循环处理器的世界预测误差（0..1）→ 好奇微抬
 

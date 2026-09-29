@@ -357,6 +357,19 @@ void Cognition::setExpectation(uint8_t cat) {
   _expAtMs = millis();
 }
 
+// C1：全局广播判决。salience 由调用方按事件源合成（需求/intent/惊讶），这里只做
+// "冠军须过阈"的门控与节拍槽登记。阈=0.62，随 dominance 反比微调（0.5~0.72）：
+// 欲望越高，越小的声音也能抢到舞台；瘫平时只有强念头才上得了台
+float Cognition::broadcastSalience(const char* kind, const String& text, float salience) {
+  float dom = dominance();
+  float th = 0.62f - 0.12f * dom;                    // dom=1→0.50；dom=0→0.62
+  _bcTh = th;
+  if (salience < th) { Serial.printf("[BC] %s %.2f<%.2f 未赢得\n", kind, salience, th); return salience; }
+  _bcText = String("[当前心上最要紧的事] ") + text + "\n（这是你此刻真正在意的，可以围绕它说，也不必刻意）";
+  Serial.printf("[BC] %s %.2f>=%.2f 赢得广播\n", kind, salience, th);
+  return salience;
+}
+
 float Cognition::expectPrecision(uint8_t cat) const {
   if (cat == EXP_NONE || cat > EXP_WORLD_QUIET) return 1.0f;
   // 判定次数越少越向 0.5 收（冷启动别让一两次样本定终身）；EMA 本身钳 0.05~1
