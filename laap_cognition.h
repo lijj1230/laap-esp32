@@ -53,8 +53,13 @@ public:
   // 上舞台的是什么"。状态 <100B。
   float broadcastSalience(const char* kind, const String& text, float salience); // 返回该次得分；过阈=赢得广播
   float lastBroadcastTh() const { return _bcTh; }
-  String broadcastLine() const { return _bcText; }   // 空串=本拍无广播（提示词注入点自行跳过）
-  void   broadcastClear() { _bcText = ""; }
+  // A2 连续化（v3.61）：节拍槽 30 分钟保鲜——工作空间由事件持续刷新（预期落空/目标
+  // 完成/独白判决都写入），不再"一拍即焚"；过期自动失效
+  String broadcastLine() const {
+    return (_lastBcMs && millis() - _lastBcMs < 1800000UL) ? _bcText : String();
+  }
+  uint32_t bcCount() const { return _bcCount; }      // 仪表化：广播次数（/api/consc）
+  String metaLine() const;                           // A1 常驻元监控：认知状态一行自述
   // ---- C3 dominance 负反馈（v3.60）：双时间尺度。
   // 快变量（分钟级可逆）：负反馈事件（👎/播报被打断/被叫安静）压表达欲与社交欲的
   // 增长——表达欲平衡点 x*=g/(g+d) 里的 g 打折，自动收敛到更低的平衡点（学会安静，
@@ -77,7 +82,9 @@ public:
   uint32_t _negGainMs = 0;                     // 上次回中节拍
   // 慢变量（天级持久）：夜间反思的守卫下探（证据+单向下探守卫+快照兜底），见 socNudge
   float _bcTh = 0;                                    // 最近一次判决阈值（诊断）
-  String _bcText;                                     // 赢得广播的念头（1 拍有效）
+  String _bcText;                                     // 赢得广播的念头（30 分钟保鲜）
+  uint32_t _lastBcMs = 0;                             // 最近一次赢得广播的时刻
+  uint32_t _bcCount = 0;                              // 累计赢得广播次数
   String expectLine() const;          // 世界模型 JSON 片段（含上次应验/落空）
   void noteSurprise(float s01);       // R0 循环处理器的世界预测误差（0..1）→ 好奇微抬
 

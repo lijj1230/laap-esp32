@@ -153,9 +153,9 @@ struct ConscItem { const char* g; uint8_t s; const char* note; };
 static const ConscItem kConsTable[] = {
   {"循环处理(RPT)",          1, "8单元ESN逐拍预测下一拍传感（权重级循环h(t)←h(t-1)，v3.48），误差=惊讶回注需求；推理内仍前馈"},
   {"专用模块+有限带宽(GWT)",  2, "语音/视觉/搜索/记忆/认知各自成模块，提示词通道带宽有限"},
-  {"工作台竞争(GWT)",        1, "工作记忆环+需求门控=舞台；表达路径已一拍三候选自评审(v3.48)，两段式仲裁待做"},
-  {"全局广播(GWT)",          1, "世界模型每拍注入+类别化预期-误差回环闭合(v3.48)；无独立仲裁器"},
-  {"高阶自我监控(HOT)",      1, "自我报告+失败环+规则自进化；缺置信度自报与反馈校准"},
+  {"工作台竞争(GWT)",        2, "独白出题三候选念头+端侧 noveltyOf WTA 仲裁（v3.60）；表达一拍三候选自评审"},
+  {"全局广播(GWT)",          2, "C1 salience 判决+节拍槽注入（v3.60），事件驱动连续刷新（预期落空/目标完成，v3.61）"},
+  {"高阶自我监控(HOT)",      2, "常驻元监控注入+24h 反馈校准闭环（v3.61）；缺在线置信度自报"},
   {"统一自我模型(HOT)",      1, "世界模型+性格进化+情绪需求跨重启连续(v3.42)；非学习式自模型"},
   {"目标导向能动(Agency)",    2, "需求驱动自发行为+意图栈跨轮推进+口令技能+RSI闭环"},
   {"身体闭环(Embodiment)",   2, "体温/信号/IMU/触摸进需求情绪；语音动作闭环；v3.45 静音窗"},
@@ -170,7 +170,12 @@ String laapConscAudit() {   // JSON（/api/consc）
     j += String("{\"g\":\"") + it.g + "\",\"s\":" + it.s + ",\"note\":\"" + it.note + "\"}";
     score += it.s; maxs += 2;
   }
-  j += String("],\"score\":") + score + ",\"max\":" + maxs + "}";
+  float ema = 0; int en = 0;
+  for (int i = 1; i <= Cognition::EXP_WORLD_QUIET; i++) if (mind._expN[i]) { ema += mind._expEma[i]; en++; }
+  j += String("],\"score\":") + score + ",\"max\":" + maxs +
+       ",\"live\":{\"bc\":" + mind.bcCount() +
+       ",\"negGain\":" + String(mind.expressGain(), 2) +
+       ",\"exp_hit\":" + (en ? String(ema / en * 100, 0) : String("50")) + "}";
   return j;
 }
 
@@ -998,7 +1003,6 @@ void llmHarvest() {
       mind.onDiscovery(nov);
       Serial.printf("[Cognition] 新知新颖度 %.0f%% → 好奇额外消解\n", nov * 100);
     }
-    mind.broadcastClear();   // C1：节拍槽 1 拍有效，广播过的念头说完就下台
     display.drawFace(g_lastExpr.c_str());
     memory.logEvent("aris", "【自发】我刚才在想「" + g_monoTopic + "」：" + r.say);
     if (g_monoKnow.length()) memory.logEvent("world", g_monoTopic + " → " + utf8Cut(g_monoKnow, 80));  // 字节截断会切半汉字（曾污染 episodes.jsonl）
@@ -1011,6 +1015,7 @@ void llmHarvest() {
       if (mi >= 0) {
         mind.dropIntent(mi);
         mind.onDiscovery(1.0f);                // 达成目标 = 最强的确定性下降
+        mind.broadcastSalience("goal-done", String("目标弄明白了：") + g_monoGoal, 0.62f);   // A2
         memory.logEvent("event", "【达成】" + g_monoGoal);
         Serial.printf("[LAAP·意图] 目标已弄明白：「%s」（放下）\n", g_monoGoal.c_str());
       }
@@ -1298,6 +1303,14 @@ String buildSystemPrompt() {
     p += String("当前最强烈的渴望是「") + names[top] + "」。让它影响你说话的节奏和语气"
          "（如社交高就更黏人、好奇高就更爱问、能量低就慵懒短句），"
          "但绝不要主动把电量/体温/需求状态当话题说——主人问你的身体状态时才汇报。\n";
+  }
+  {   // A1 常驻元监控（v3.61）：在线高阶自模型——把认知状态说给自己听
+    String meta = mind.metaLine();
+    if (meta.length()) p += String("[自我监控] ") + meta + "（这是你自己的状态记录，影响语气即可，别当话题说）\n";
+  }
+  {   // A3 置信度校准闭环（v3.61）：24h 反馈滑窗 → 语气调制
+    if (metrics.fbUp24 + metrics.fbDown24 >= 2 && metrics.fbDown24 > metrics.fbUp24)
+      p += "[自我校准] 最近几条回复的反馈不太理想：宁可少而准，不确定就直说不确定。\n";
   }
   p += String("你刚才的情绪是「") + mind.moodCn() + "」，回复的情绪要与之连续，不要每次都元气满满。\n";
   // 小凌⑥⑤②: 关系温度/失望/身体负荷——让它们在语气里自然流露

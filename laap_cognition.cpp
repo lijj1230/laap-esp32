@@ -381,8 +381,30 @@ float Cognition::broadcastSalience(const char* kind, const String& text, float s
   _bcTh = th;
   if (salience < th) { Serial.printf("[BC] %s %.2f<%.2f 未赢得\n", kind, salience, th); return salience; }
   _bcText = String("[当前心上最要紧的事] ") + text + "\n（这是你此刻真正在意的，可以围绕它说，也不必刻意）";
+  _lastBcMs = millis(); _bcCount++;
   Serial.printf("[BC] %s %.2f>=%.2f 赢得广播\n", kind, salience, th);
   return salience;
+}
+
+// A1 常驻元监控（v3.61）：把自己此刻的认知状态汇总成一行说给自己听——在线高阶
+// 自模型的提示词化（HOT 族指标的工程落点）；注入点在 buildSystemPrompt
+String Cognition::metaLine() const {
+  String parts;
+  if (_lastBcMs) {
+    long age = (long)((millis() - _lastBcMs) / 60000UL);
+    parts += (age == 0) ? String("刚在心里过了一件事") : String("心上事龄 ") + age + " 分钟";
+  }
+  float ema = 0; int n = 0;
+  for (int i = 1; i <= EXP_WORLD_QUIET; i++) if (_expN[i]) { ema += _expEma[i]; n++; }
+  if (n) {
+    if (parts.length()) parts += "，";
+    parts += "预期命中率约 " + String((int)(ema / n * 100)) + "%";
+  }
+  if (_negGain < 0.9f) {
+    if (parts.length()) parts += "，";
+    parts += "近期被踩过（语气收敛中）";
+  }
+  return parts;
 }
 
 float Cognition::expectPrecision(uint8_t cat) const {
@@ -438,6 +460,9 @@ void Cognition::expectOutcome(bool fulfilled) {
   } else if (_expCat == EXP_WORLD_ACTIVE || _expCat == EXP_WORLD_QUIET) {
     if (!fulfilled) _n.curiosity = min(1.0f, _n.curiosity + 0.05f * missGain);
   }
+  // A2 广播连续化（v3.61）：落空事件参与节拍竞争——越意外的落空越可能占据舞台
+  if (!fulfilled && _expCat != EXP_NONE)
+    broadcastSalience("exp-miss", String("预期落空了：") + kExpectCn[_expCat], 0.45f + 0.4f * (1.0f - prec));
   _expCat = EXP_NONE;                            // 评估完清空，等下次自发行为再立
 }
 
