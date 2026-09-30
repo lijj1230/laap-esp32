@@ -175,7 +175,7 @@ String laapConscAudit() {   // JSON（/api/consc）
   j += String("],\"score\":") + score + ",\"max\":" + maxs +
        ",\"live\":{\"bc\":" + mind.bcCount() +
        ",\"negGain\":" + String(mind.expressGain(), 2) +
-       ",\"exp_hit\":" + (en ? String(ema / en * 100, 0) : String("50")) + "}";
+       ",\"exp_hit\":" + (en ? String(ema / en * 100, 0) : String("null")) + "}";
   return j;
 }
 
@@ -1180,7 +1180,7 @@ int arisIdleMonologue(bool force) {
     if (winIntent) txt = String("心里惦记着目标：") + mind.intent(0);
     else if (winSurp) txt = "世界刚才的动静让我很意外";
     else txt = "一阵说不清的冲动，想自己念叨点什么";
-    float got = mind.broadcastSalience(win, txt, sal);
+    float got = mind.broadcastSalience(win, txt, sal, winIntent || winSurp);   // v3.62：need 通道只判门不写槽
     Serial.printf("[BC] 独白判决 need=%.2f intent=%.2f surprise=%.2f -> %s %.2f\n",
                   salNeed, salIntent, salSurprise, win, got);
     if (got < mind.lastBroadcastTh()) {
@@ -2679,6 +2679,7 @@ void loop() {
         uint32_t retry = idleGap / 4;
         if (retry < 120000UL) retry = 120000UL;      // 至少 2 分钟
         if (retry > 900000UL) retry = 900000UL;      // 至多 15 分钟
+        if (retry > idleGap / 2) retry = idleGap / 2;   // v3.62：重试不超间隔一半（gap<4min 时防调度到未来=回绕刷屏）
         g_lastIdleMs = millis() - idleGap + retry;
       } else {
         g_lastIdleMs = millis() - idleGap + 30000UL;

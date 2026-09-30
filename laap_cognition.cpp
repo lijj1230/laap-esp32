@@ -375,13 +375,16 @@ void Cognition::onNegativeFeedback(const char* src) {
 // C1：全局广播判决。salience 由调用方按事件源合成（需求/intent/惊讶），这里只做
 // "冠军须过阈"的门控与节拍槽登记。阈=0.62，随 dominance 反比微调（0.5~0.72）：
 // 欲望越高，越小的声音也能抢到舞台；瘫平时只有强念头才上得了台
-float Cognition::broadcastSalience(const char* kind, const String& text, float salience) {
+float Cognition::broadcastSalience(const char* kind, const String& text, float salience, bool writeBeat) {
   float dom = dominance();
   float th = 0.62f - 0.12f * dom;                    // dom=1→0.50；dom=0→0.62
   _bcTh = th;
   if (salience < th) { Serial.printf("[BC] %s %.2f<%.2f 未赢得\n", kind, salience, th); return salience; }
-  _bcText = String("[当前心上最要紧的事] ") + text + "\n（这是你此刻真正在意的，可以围绕它说，也不必刻意）";
-  _lastBcMs = millis(); _bcCount++;
+  _bcCount++;
+  if (writeBeat) {   // v3.62：need 通道等"非事件"胜利只判门不写槽（防常量文本连场复读）
+    _bcText = String("[当前心上最要紧的事] ") + text + "\n（这是你此刻真正在意的，可以围绕它说，也不必刻意）";
+    _lastBcMs = millis();
+  }
   Serial.printf("[BC] %s %.2f>=%.2f 赢得广播\n", kind, salience, th);
   return salience;
 }
@@ -462,7 +465,7 @@ void Cognition::expectOutcome(bool fulfilled) {
   }
   // A2 广播连续化（v3.61）：落空事件参与节拍竞争——越意外的落空越可能占据舞台
   if (!fulfilled && _expCat != EXP_NONE)
-    broadcastSalience("exp-miss", String("预期落空了：") + kExpectCn[_expCat], 0.45f + 0.4f * (1.0f - prec));
+    broadcastSalience("exp-miss", String("预期落空了：") + kExpectCn[_expCat], 0.45f + 0.4f * prec);   // v3.62 修向：与 C5 同极性（越准的类别落空越意外）
   _expCat = EXP_NONE;                            // 评估完清空，等下次自发行为再立
 }
 

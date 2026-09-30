@@ -51,7 +51,8 @@ public:
   // 冠军且分>阈值（阈随 dominance 反比=越"有欲"越容易被闯入念头占据舞台）才赢得
   // 广播，写入节拍槽注入下一拍 system prompt——工作记忆环只存历史，这里决定"此刻
   // 上舞台的是什么"。状态 <100B。
-  float broadcastSalience(const char* kind, const String& text, float salience); // 返回该次得分；过阈=赢得广播
+  float broadcastSalience(const char* kind, const String& text, float salience, bool writeBeat = true);
+  // 返回该次得分；过阈=赢得广播。writeBeat=false 时只判门不占槽（常规需求胜利非"事件"）
   float lastBroadcastTh() const { return _bcTh; }
   // A2 连续化（v3.61）：节拍槽 30 分钟保鲜——工作空间由事件持续刷新（预期落空/目标
   // 完成/独白判决都写入），不再"一拍即焚"；过期自动失效
