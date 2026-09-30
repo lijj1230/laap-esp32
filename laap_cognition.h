@@ -60,7 +60,7 @@ public:
     return (_lastBcMs && millis() - _lastBcMs < 1800000UL) ? _bcText : String();
   }
   uint32_t bcCount() const { return _bcCount; }      // 仪表化：广播次数（/api/consc）
-  String metaLine() const;                           // A1 常驻元监控：认知状态一行自述
+  String metaLine(bool calm = false) const;          // A1 常驻元监控；calm=[自我校准]已在场，免双注入
   // ---- C3 dominance 负反馈（v3.60）：双时间尺度。
   // 快变量（分钟级可逆）：负反馈事件（👎/播报被打断/被叫安静）压表达欲与社交欲的
   // 增长——表达欲平衡点 x*=g/(g+d) 里的 g 打折，自动收敛到更低的平衡点（学会安静，

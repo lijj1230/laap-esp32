@@ -1157,10 +1157,9 @@ int arisIdleMonologue(bool force) {
   static uint8_t s_monoSeq = 0;
   static uint8_t s_goalStreak = 0;
   g_monoGoal = "";
-  if (mind.intentCount() > 0 && (s_monoSeq++ & 1) && s_goalStreak < 2) {
-    g_monoGoal = mind.intent(0);
-    s_goalStreak++;
-  } else s_goalStreak = 0;
+  // v3.62：交替节拍只在真正提交后推进——广播被拒的尝试不再消耗"隔一轮"名额
+  bool wantIntent = (mind.intentCount() > 0 && (s_monoSeq & 1) && s_goalStreak < 2);
+  if (wantIntent) g_monoGoal = mind.intent(0);
   // C1 全局广播判决（v3.61 修正）：广播负责选"此刻上舞台的是什么"，不叠加第二道
   // 频率门槛——需求通道用原始需求值（非性格加权 dominance，那会把配置节奏翻倍），
   // 意图驱动恒过门；被拒不烧整个间隔，由调用方安排短重试（节奏=后台配置说了算）。
@@ -1201,6 +1200,8 @@ int arisIdleMonologue(bool force) {
   }
   display.drawFace("curious", true);      // 起意表情（后台思考中）
   Serial.println("[LAAP·独白] 起意（后台思考中）");
+  s_monoSeq++;                            // 真正提交后才推进（被拒不占节拍，v3.62）
+  if (wantIntent) s_goalStreak++; else s_goalStreak = 0;
   return 0;
 }
 
@@ -1304,13 +1305,11 @@ String buildSystemPrompt() {
          "（如社交高就更黏人、好奇高就更爱问、能量低就慵懒短句），"
          "但绝不要主动把电量/体温/需求状态当话题说——主人问你的身体状态时才汇报。\n";
   }
-  {   // A1 常驻元监控（v3.61）：在线高阶自模型——把认知状态说给自己听
-    String meta = mind.metaLine();
+  {   // A1+A3（v3.62）：元监控 + 校准闭环——同帧只保留一处负反馈调制
+    bool calib = (metrics.fbUp24 + metrics.fbDown24 >= 2 && metrics.fbDown24 > metrics.fbUp24);
+    String meta = mind.metaLine(calib);
     if (meta.length()) p += String("[自我监控] ") + meta + "（这是你自己的状态记录，影响语气即可，别当话题说）\n";
-  }
-  {   // A3 置信度校准闭环（v3.61）：24h 反馈滑窗 → 语气调制
-    if (metrics.fbUp24 + metrics.fbDown24 >= 2 && metrics.fbDown24 > metrics.fbUp24)
-      p += "[自我校准] 最近几条回复的反馈不太理想：宁可少而准，不确定就直说不确定。\n";
+    if (calib) p += "[自我校准] 最近几条回复的反馈不太理想：宁可少而准，不确定就直说不确定。\n";
   }
   p += String("你刚才的情绪是「") + mind.moodCn() + "」，回复的情绪要与之连续，不要每次都元气满满。\n";
   // 小凌⑥⑤②: 关系温度/失望/身体负荷——让它们在语气里自然流露

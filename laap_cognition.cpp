@@ -382,7 +382,7 @@ float Cognition::broadcastSalience(const char* kind, const String& text, float s
   if (salience < th) { Serial.printf("[BC] %s %.2f<%.2f 未赢得\n", kind, salience, th); return salience; }
   _bcCount++;
   if (writeBeat) {   // v3.62：need 通道等"非事件"胜利只判门不写槽（防常量文本连场复读）
-    _bcText = String("[当前心上最要紧的事] ") + text + "\n（这是你此刻真正在意的，可以围绕它说，也不必刻意）";
+    _bcText = String("[此刻占据注意的事] ") + text + "\n（它刚赢得你的注意，可以自然影响此刻的语气与念头，不必刻意提起）";
     _lastBcMs = millis();
   }
   Serial.printf("[BC] %s %.2f>=%.2f 赢得广播\n", kind, salience, th);
@@ -391,19 +391,23 @@ float Cognition::broadcastSalience(const char* kind, const String& text, float s
 
 // A1 常驻元监控（v3.61）：把自己此刻的认知状态汇总成一行说给自己听——在线高阶
 // 自模型的提示词化（HOT 族指标的工程落点）；注入点在 buildSystemPrompt
-String Cognition::metaLine() const {
+String Cognition::metaLine(bool calm) const {
   String parts;
   if (_lastBcMs) {
     long age = (long)((millis() - _lastBcMs) / 60000UL);
-    parts += (age == 0) ? String("刚在心里过了一件事") : String("心上事龄 ") + age + " 分钟";
+    // v3.62：事龄封顶（安静数日后"3000 分钟"式观感）+ 定性化
+    if (age > 180) parts += "心里有件事放了挺久";
+    else parts += (age == 0) ? String("刚在心里过了一件事") : String("心上事龄 ") + age + " 分钟";
   }
   float ema = 0; int n = 0;
   for (int i = 1; i <= EXP_WORLD_QUIET; i++) if (_expN[i]) { ema += _expEma[i]; n++; }
   if (n) {
     if (parts.length()) parts += "，";
-    parts += "预期命中率约 " + String((int)(ema / n * 100)) + "%";
+    // v3.62：命中率定性分档——系统规则 2 禁止模型输出百分比，注入样例自带数字有被复读的风险
+    float hit = ema / n * 100;
+    parts += (hit < 40) ? String("预期最近常落空") : (hit < 70 ? String("预期时准时不准") : String("预期常能应验"));
   }
-  if (_negGain < 0.9f) {
+  if (_negGain < 0.9f && !calm) {   // calm=[自我校准]行已在场，免同帧双注入（v3.62）
     if (parts.length()) parts += "，";
     parts += "近期被踩过（语气收敛中）";
   }
