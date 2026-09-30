@@ -129,7 +129,7 @@ struct LlmRequest;
 bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
                uint8_t kind = 0, const String& searchQ = String(),
                const String& lookQ = String());
-bool arisIdleMonologue(bool force = false);  // 返回是否真的提交成功；force=跳过广播判决（/mono 诊断用，v3.61）
+int arisIdleMonologue(bool force = false);   // 0=已提交 1=广播未过（短重试） 2=忙/失败；force=/mono 诊断直通
 void laapResetIdleClock();      // 主人交互后重置独白计时（它自己说话不重置）
 String laapIdleInfo();          // 独白计时诊断（/api/status）
 String associativeRecall(const String& currentUserText, const String& preRecalled = "");
@@ -1130,17 +1130,17 @@ void llmHarvest() {
 //  自发独白 v3.2：主循环只做门槛判断+投递，全流程（出题→看→搜→成文）
 //  在后台 LLM 任务跑，思考期间身体（网页/串口/语音）不再冻结
 // ============================================================
-// 返回 true=这次真的提交出去了（调用方据此推进"已独白过一轮"）
-bool arisIdleMonologue(bool force) {
+// 返回 0=已提交（调用方计整个间隔） 1=广播未过（短重试，节奏由配置间隔决定） 2=忙/失败（30s 重试）
+int arisIdleMonologue(bool force) {
   if (g_llmFailStreak >= 2) {             // 连续失败让路（等效退避），本轮沉默
     Serial.println("[LAAP·独白] LLM 连败，本轮沉默");
-    return false;
+    return 2;
   }
   // 必须在清快照之前拦：上一轮 LK_MONO 还在后台跑时，llmTask 正在写 g_monoTopic/
   // g_monoKnow 这批 String——先清后查会构成跨任务写写竞争（String 撕裂=堆损坏）
   if (laapLlmBusy() || g_llmHasNew) {   // 未收割的上一代独白中间产物还等着收割侧读，不能清
     Serial.println("[LAAP·独白] LLM 忙，本轮不提交");
-    return false;
+    return 2;
   }
   LlmMsg m[1] = { {"user", ""} };
   // 提交侧（loopTask）清中间产物：清空这个动作必须在任务开始写之前、且只由主线程做，
@@ -1156,14 +1156,14 @@ bool arisIdleMonologue(bool force) {
     g_monoGoal = mind.intent(0);
     s_goalStreak++;
   } else s_goalStreak = 0;
-  // C1 全局广播判决（v3.60）：到点+需求过线只是"可以想"，还要看这个念头能不能
-  // 赢下舞台——salience 取三类候选源的最大值：需求强度、意图驱动加成、R3/R0 惊讶。
-  // 未过阈=本拍让位（不白烧一次 LLM），计时已在门槛处重置，需求攒够自然再来。
-  // force（/mono 诊断）直通不判决（v3.61：诊断命令不该被意识门误伤）
+  // C1 全局广播判决（v3.61 修正）：广播负责选"此刻上舞台的是什么"，不叠加第二道
+  // 频率门槛——需求通道用原始需求值（非性格加权 dominance，那会把配置节奏翻倍），
+  // 意图驱动恒过门；被拒不烧整个间隔，由调用方安排短重试（节奏=后台配置说了算）。
+  // force（/mono 诊断）直通不判决
   if (!force) {
-    float dom = mind.dominance();
-    float salNeed = dom;
-    float salIntent = mind.intentCount() > 0 ? 0.15f + dom * 0.7f : 0;
+    const Needs& nn = mind.needs();
+    float salNeed = fmaxf(nn.curiosity, nn.expression);
+    float salIntent = mind.intentCount() > 0 ? 0.66f : 0;
     float salSurprise = 0;
     float r0err = r0.lastErr() - r0.rollingErr();       // 超出基线的惊讶才进意识
     if (r0err > 0) salSurprise = 0.30f + r0err * 0.9f;
@@ -1179,8 +1179,8 @@ bool arisIdleMonologue(bool force) {
     Serial.printf("[BC] 独白判决 need=%.2f intent=%.2f surprise=%.2f -> %s %.2f\n",
                   salNeed, salIntent, salSurprise, win, got);
     if (got < mind.lastBroadcastTh()) {
-      Serial.println("[LAAP·独白] 未赢得广播，本轮沉默（需求在攒，攒够再试）");
-      return false;
+      Serial.println("[LAAP·独白] 未赢得广播，短间隔重试（需求在攒）");
+      return 1;
     }
   }
   // 提交侧拍快照：llmTask 里不再遍历 _work String 环 / mind / g_recentTopics
@@ -1192,11 +1192,11 @@ bool arisIdleMonologue(bool force) {
   g_monoTopics = g_recentTopics;
   if (!llmSubmit(m, 1, 40, 0.95f, LK_MONO)) {
     Serial.println("[LAAP·独白] LLM 忙，本轮放弃");
-    return false;
+    return 2;
   }
   display.drawFace("curious", true);      // 起意表情（后台思考中）
   Serial.println("[LAAP·独白] 起意（后台思考中）");
-  return true;
+  return 0;
 }
 
 
@@ -2199,7 +2199,8 @@ void serialCli() {
     } else if (line == "/mono") {
       // 手动触发一轮独白（忽略"静默满 N 分"与"深夜不冒泡"这两道门槛，方便随时验证）
       Serial.println("[LAAP·独白] 手动触发一轮（忽略静默/深夜门槛）");
-      if (arisIdleMonologue(true)) Serial.println("[LAAP·独白] 已提交，等后台出结果（约 10~30 秒）");
+      if (arisIdleMonologue(true) == 0) Serial.println("[LAAP·独白] 已提交，等后台出结果（约 10~30 秒）");
+      else Serial.println("[LAAP·独白] 未提交（LLM 忙/失败）");
     } else if (line.startsWith("/nothink")) {
       String a = line.substring(8); a.trim();
       bool digits = a.length() > 0;
@@ -2657,8 +2658,18 @@ void loop() {
     bool needDriven = mind.intentCount() > 0 ||
                       mind.needs().curiosity >= th || mind.needs().expression >= th;
     if (needDriven && millis() - g_lastIdleMs > idleGap) {
-      g_lastIdleMs = millis();
-      if (arisIdleMonologue()) g_idledOnce = true;   // 只有真的提交出去了才算"独白过一轮"
+      // v3.61：计时按结果调度——成功才计整个间隔；广播未过=短重试（节奏由配置的
+      // 间隔说了算，不因判决翻倍）；忙/失败=30 秒后重试（不因撞车跳过本轮节奏）
+      int res = arisIdleMonologue();
+      if (res == 0) { g_idledOnce = true; g_lastIdleMs = millis(); }
+      else if (res == 1) {
+        uint32_t retry = idleGap / 4;
+        if (retry < 120000UL) retry = 120000UL;      // 至少 2 分钟
+        if (retry > 900000UL) retry = 900000UL;      // 至多 15 分钟
+        g_lastIdleMs = millis() - idleGap + retry;
+      } else {
+        g_lastIdleMs = millis() - idleGap + 30000UL;
+      }
     }
   }
   // 独白计时只在"主人来找它"时重置（见 laapResetIdleClock 的调用点）。
