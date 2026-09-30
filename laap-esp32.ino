@@ -129,7 +129,7 @@ struct LlmRequest;
 bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
                uint8_t kind = 0, const String& searchQ = String(),
                const String& lookQ = String());
-bool arisIdleMonologue();       // 返回是否真的提交成功（失败不推进"已独白"状态）
+bool arisIdleMonologue(bool force = false);  // 返回是否真的提交成功；force=跳过广播判决（/mono 诊断用，v3.61）
 void laapResetIdleClock();      // 主人交互后重置独白计时（它自己说话不重置）
 String laapIdleInfo();          // 独白计时诊断（/api/status）
 String associativeRecall(const String& currentUserText, const String& preRecalled = "");
@@ -185,6 +185,7 @@ static bool laapInQuietWindow() {
   return (qs < qe) ? (h >= qs && h < qe) : (h >= qs || h < qe);
 }
 
+static bool g_expressForced = false;   // 本次 LK_EXPRESS 是否 forced（C4 自评豁免用，v3.61）
 // ============================================================
 //  主动表达（PSI 心跳触发）—— v3.3 起投递后台任务，主循环不冻结
 // ============================================================
@@ -205,6 +206,7 @@ void arisExpress(bool forced, const String& trigger) {
   // 静默期不计冷却、不消费需求——天亮 dominance 还在阈值上就自然开口
   if (!forced && laapInQuietWindow()) return;
   s_lastExpressMs = millis();                    // 受理即计时（失败也已占用这一轮）
+  g_expressForced = forced;   // C4 自评豁免依据（审计 P2：强制表达不可被自评否决）
   // R2+R3（v3.48）：表达输出契约扩展——三候选自选 + 类别化预期。写在 user 消息里
   // 而非共享系统提示词（聊天/独白共用后者，不能动）。全部行可缺省，解析失败回退旧契约
   String up = buildUserPrompt("");
@@ -422,56 +424,63 @@ static LlmReply monologueGenerate() {
   String topic = q.say, rest = q.say;
   topic.trim(); rest.trim();
   String query;
-  // 意图结算：模型多出的第三行【完成】= 这个目标已经弄明白了（收割侧 dropIntent）
-  if (topic.indexOf("【完成】") >= 0) { g_monoDone = true; topic.replace("【完成】", ""); rest.replace("【完成】", ""); topic.trim(); rest.trim(); }
-  int nl = rest.indexOf('\n');
-  if (nl > 0) {
-    topic = rest.substring(0, nl);
-    rest = rest.substring(nl + 1);
-    topic.trim(); rest.trim();
-  } else {
-    rest = "";                       // 没给查询词 → 整理函数会退回问题原文
-  }
-  query = tidySearchQuery(rest, topic);
-  // 注意别把空格替换成 '+'：laap_search 的编码器本来就把空格编成 '+'，
-  // 预替换的 '+' 会被二次编码成 %2B（字面加号），还让 bigram 覆盖率跨词必 miss
-  // C2 念头竞争仲裁（v3.60）：模型吐了多个候选（"——"分组）时端侧打分选冠军——
-  // 新颖度为主（noveltyOf 向量通道，无向量退 -1 不参与），叠加意图相关性微调。
-  // 主题从"规则直选"升级为"竞争胜出"（GWT winner-take-all 的选题层）
+  // C2 念头竞争仲裁（v3.61 重构）：先在全文上按"——"行切候选（每段=问题行+查询行），
+  // 端侧打分（noveltyOf 新颖度为主，意图相关 +0.15）选冠军，冠军的两行取代全文进入
+  // 后续解析。v3.60 版接在旧两行解析之后且只看第一行——分隔符不在场=仲裁死代码，
+  // 且查询词被全部候选污染（审计 P1，此处修正）。模型未按格式（nc<=1）时走旧解析。
+  bool c2split = false;
   {
-    String body = topic;
-    int sp1 = body.indexOf("\\n——");
-    if (sp1 < 0) sp1 = body.indexOf("——");
-    if (sp1 > 0) {
-      String cands[3]; int nc = 0;
-      int pos = 0;
-      while (nc < 3) {
-        int sep = body.indexOf("——", pos);
-        String seg = (sep < 0) ? body.substring(pos) : body.substring(pos, sep);
-        seg.trim();
-        // 段内第一行=问题；去掉可能混入的行
-        int snl = seg.indexOf('\\n');
-        if (snl > 0) seg = seg.substring(0, snl);
-        seg.trim();
-        if (seg.length() >= 4) cands[nc++] = seg;
-        if (sep < 0) break;
-        pos = sep + 2;
+    String cProb[3], cQuery[3];
+    int nc = 0, pos = 0;
+    String curP, curQ;
+    while (pos <= (int)q.say.length() && nc < 3) {
+      int e = q.say.indexOf('\n', pos);
+      String ln = (e < 0) ? q.say.substring(pos) : q.say.substring(pos, e);
+      pos = (e < 0) ? (int)q.say.length() + 1 : e + 1;
+      ln.trim();
+      if (!ln.length()) continue;
+      if (ln.startsWith("——")) {                     // 分隔行：结算当前候选
+        if (curP.length() && nc < 3) { cProb[nc] = curP; cQuery[nc] = curQ; nc++; }
+        curP = ""; curQ = "";
+        continue;
       }
-      if (nc > 1) {
-        int best = 0; float bestScore = -1;
-        for (int i = 0; i < nc; i++) {
-          float nov = memory.noveltyOf(cands[i]);
-          float score = (nov >= 0 ? nov : 0.5f);            // 无向量=中性分
-          if (g_monoGoal.length() && cands[i].indexOf(g_monoGoal.substring(0, min(4, (int)g_monoGoal.length()))) >= 0)
-            score += 0.15f;                                  // 意图相关微调
-          Serial.printf("[C2] 候选%d 「%s」 %.2f\\n", i + 1, cands[i].c_str(), score);
-          if (score > bestScore) { bestScore = score; best = i; }
-        }
-        topic = cands[best];
-        Serial.printf("[C2] 冠军: 「%s」（%d 候选竞争）\\n", topic.c_str(), nc);
+      if (!curP.length()) curP = ln;
+      else if (!curQ.length()) curQ = ln;             // 契约外第三行忽略
+    }
+    if (curP.length() && nc < 3) { cProb[nc] = curP; cQuery[nc] = curQ; nc++; }
+    if (nc > 1) {
+      int best = 0; float bestScore = -1;
+      for (int i = 0; i < nc; i++) {
+        float nov = memory.noveltyOf(cProb[i]);
+        float score = (nov >= 0 ? nov : 0.5f);        // 无向量=中性分
+        if (g_monoGoal.length() && cProb[i].indexOf(g_monoGoal.substring(0, min(4, (int)g_monoGoal.length()))) >= 0)
+          score += 0.15f;                              // 意图相关微调
+        Serial.printf("[C2] 候选%d 「%s」 %.2f\n", i + 1, cProb[i].c_str(), score);
+        if (score > bestScore) { bestScore = score; best = i; }
       }
+      Serial.printf("[C2] 冠军: 「%s」（%d 候选竞争）\n", cProb[best].c_str(), nc);
+      topic = cProb[best];
+      rest = cQuery[best];
+      c2split = true;
     }
   }
+    // 意图结算：模型在念头里标【完成】= 这个目标已经弄明白了（收割侧 dropIntent）
+  if (topic.indexOf("【完成】") >= 0) { g_monoDone = true; topic.replace("【完成】", ""); rest.replace("【完成】", ""); topic.trim(); rest.trim(); }
+  if (!c2split) {
+    int nl = rest.indexOf('\n');
+    if (nl > 0) {
+      topic = rest.substring(0, nl);
+      rest = rest.substring(nl + 1);
+      topic.trim(); rest.trim();
+    } else {
+      rest = "";                       // 没给查询词 → 整理函数会退回问题原文
+    }
+  } else {
+    rest.trim();                        // 冠军查询词已就位（可能空 → 整理函数退回问题原文）
+  }
+    query = tidySearchQuery(rest, topic);
+  // 注意别把空格替换成 '+'：laap_search 的编码器本来就把空格编成 '+'，
+  // 预替换的 '+' 会被二次编码成 %2B（字面加号），还让 bigram 覆盖率跨词必 miss
   g_monoTopic = topic;
 
   // 起意前看一眼世界——"看"是有成本的感知，按需求驱动（active inference）：
@@ -862,7 +871,7 @@ void llmHarvest() {
       // C3 慢变量（天级，持久）：夜间做一次守卫下探评估——近 24h 👎≥3 且占比过半才
       // 允许 sociability -0.01（外向性收敛），带向 0.5 的锚点回归（防"越教越自闭"
       // 的单向漂移）。平时反向走 evolveAfterChat 的深聊+，双向都有通路=进化不失控
-      if (metrics.fbDown >= 3 && metrics.fbDown > metrics.fbUp) {
+      if (metrics.fbDown24 >= 3 && metrics.fbDown24 > metrics.fbUp24) {   // 滑窗口径（12h 半衰；终身累计名不符实，v3.61）
         mind.socNudge(-0.01f);
         Serial.println("[C3] 近期负反馈偏多：外向性微降（守卫下探）");
       }
@@ -1054,24 +1063,22 @@ void llmHarvest() {
     } else if (rest.length()) {
       r.say = rest;   // 候选标记走样时至少把「选定/预期」元行剥掉再广播（v3.49 审计）
     }
-    if (expCat != Cognition::EXP_NONE) mind.setExpectation(expCat);
-    // C4 内循环自评（v3.60，端侧零 LLM 版）：说完之前"想一下该不该说"。
-    // 抑制分 = C3 负反馈增益不足（近期被踩/被打断）+ 深夜 + 长篇，三者叠加过阈
-    // 就撤回这次表达（静默收场，当拍表达欲已由 C3 压低，下轮自然降温）。
-    // 高风险轮才触发——平时零成本直通。
-    {
+    // C4 内循环自评（v3.61 修正）：说完之前"想一下该不该说"。forced（BOOT 键/开机
+    // 问候）不受自评约束（与表达开关同契约，审计 P2）；抑制分只由 C3 学习通路合成；
+    // 撤回结算发 onExpressSuppressed（不给愉悦，防强化沉默）；预期武装移到自评之后。
+    if (!g_expressForced) {
       float inhibit = 0;
       if (mind.expressGain() < 0.7f) inhibit += (0.7f - mind.expressGain()) * 1.6f;   // 0.3→0.64
       if (laapInQuietWindow()) inhibit += 0.25f;                                      // 静音窗边缘
-      if (r.say.length() > 150) inhibit += 0.15f;                                     // 长篇大论
       if (inhibit >= 0.75f) {
-        Serial.printf("[C4] 自评抑制 %.2f≥0.75：撤回本次表达（想了想还是不说）\\n", inhibit);
+        Serial.printf("[C4] 自评抑制 %.2f>=0.75：撤回本次表达（想了想还是不说）\n", inhibit);
         display.drawFace("calm", false);
-        mind.onExpressed(true);          // 表达欲已消费（想了=说了的内部版）
+        mind.onExpressSuppressed();      // 表达欲按"内部预演"消费，不发愉悦
         g_lastSay = "";                  // 不留"上次说了什么"的痕迹
         return;
       }
     }
+    if (expCat != Cognition::EXP_NONE) mind.setExpectation(expCat);   // 自评通过才立预期（撤回不武装）
   }
   String say;
   if (r.ok) {
@@ -1124,7 +1131,7 @@ void llmHarvest() {
 //  在后台 LLM 任务跑，思考期间身体（网页/串口/语音）不再冻结
 // ============================================================
 // 返回 true=这次真的提交出去了（调用方据此推进"已独白过一轮"）
-bool arisIdleMonologue() {
+bool arisIdleMonologue(bool force) {
   if (g_llmFailStreak >= 2) {             // 连续失败让路（等效退避），本轮沉默
     Serial.println("[LAAP·独白] LLM 连败，本轮沉默");
     return false;
@@ -1151,8 +1158,9 @@ bool arisIdleMonologue() {
   } else s_goalStreak = 0;
   // C1 全局广播判决（v3.60）：到点+需求过线只是"可以想"，还要看这个念头能不能
   // 赢下舞台——salience 取三类候选源的最大值：需求强度、意图驱动加成、R3/R0 惊讶。
-  // 未过阈=本拍让位（不白烧一次 LLM），计时已在门槛处重置，需求攒够自然再来
-  {
+  // 未过阈=本拍让位（不白烧一次 LLM），计时已在门槛处重置，需求攒够自然再来。
+  // force（/mono 诊断）直通不判决（v3.61：诊断命令不该被意识门误伤）
+  if (!force) {
     float dom = mind.dominance();
     float salNeed = dom;
     float salIntent = mind.intentCount() > 0 ? 0.15f + dom * 0.7f : 0;
@@ -2191,7 +2199,7 @@ void serialCli() {
     } else if (line == "/mono") {
       // 手动触发一轮独白（忽略"静默满 N 分"与"深夜不冒泡"这两道门槛，方便随时验证）
       Serial.println("[LAAP·独白] 手动触发一轮（忽略静默/深夜门槛）");
-      if (arisIdleMonologue()) Serial.println("[LAAP·独白] 已提交，等后台出结果（约 10~30 秒）");
+      if (arisIdleMonologue(true)) Serial.println("[LAAP·独白] 已提交，等后台出结果（约 10~30 秒）");
     } else if (line.startsWith("/nothink")) {
       String a = line.substring(8); a.trim();
       bool digits = a.length() > 0;
@@ -2389,7 +2397,8 @@ void setup() {
     Preferences pe;
     if (pe.begin("laapmtr", true)) {
       uint8_t blob[10];
-      if (pe.getBytes("expema", blob, sizeof(blob)) == sizeof(blob)) mind.expectEmaLoad(blob);
+      if (pe.getBytesLength("expema") == sizeof(blob) &&
+          pe.getBytes("expema", blob, sizeof(blob)) == sizeof(blob)) mind.expectEmaLoad(blob);
       pe.end();
     }
   }
@@ -2584,7 +2593,7 @@ void loop() {
 
   // 累计运行时长：每 5 分钟落盘一次（单键写入，NVS 磨损可忽略）
   { static uint32_t s_lastUpSave = 0;
-    if (millis() - s_lastUpSave > 300000UL) { s_lastUpSave = millis(); laapUptimePersist(); metrics.persist(); r0.saveNvs();
+    if (millis() - s_lastUpSave > 300000UL) { s_lastUpSave = millis(); laapUptimePersist(); metrics.persist(); metrics.decayFeedback24(); r0.saveNvs();
       Preferences pe;   // C5：预期 EMA 同拍批量落盘（零额外磨损节拍）
       if (pe.begin("laapmtr", false)) {
         uint8_t blob[10];

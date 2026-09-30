@@ -83,7 +83,7 @@ void Cognition::tick(float dtMin) {
   _n.energy     += (night ? 0.012f : 0.004f) * dtMin * (1.0f - _n.energy);
   _n.curiosity  += 0.008f * dtMin * (1.0f - _n.curiosity);
   _n.social     += 0.010f * dtMin * (1.0f - _n.social);
-  _n.expression += 0.007f * dtMin * (1.0f - _n.expression);
+  _n.expression += 0.007f * _negGain * dtMin * (1.0f - _n.expression);   // C3：负反馈压增长项 g→平衡点 x*=g/(g+d) 下移（v3.61 修正：原误乘衰减项=方向反转）
   _n.security   += 0.002f * dtMin * (1.0f - _n.security);
 
   // ============================================================
@@ -101,7 +101,7 @@ void Cognition::tick(float dtMin) {
   else if (quiet)   _n.energy -= 0.009f * dtMin;      // 白天独处打盹：平衡点 0.31
   if (quiet) {                                        // 独处久了会自我调适（不调适就永远黏人）
     _n.social     -= 0.014f * dtMin;                  // 平衡点 0.42（<30min 时）
-    _n.expression -= 0.009f * _negGain * dtMin;       // 平衡点 0.44（C3：负反馈期 g 打折→平衡点下移）
+    _n.expression -= 0.009f * dtMin;                  // 平衡点 0.44（g 侧已被 C3 调制，衰减保持常量）
   }
   if (rssiDb == 0 || rssiDb > -70) _n.security -= 0.004f * dtMin;  // 环境稳定=安全感回落（平衡 0.33）
   if (rssiDb != 0 && rssiDb < -80) _n.security += 0.02f * dtMin;   // 信号差/断网 → 不安（原来的环境调制）
@@ -368,8 +368,8 @@ void Cognition::setExpectation(uint8_t cat) {
 void Cognition::onNegativeFeedback(const char* src) {
   _negGain *= 0.55f;
   if (_negGain < 0.3f) _negGain = 0.3f;
-  _n.expression = min(_n.expression, 0.55f);   // 当拍表达欲直接压回阈下，止住连环输出
-  Serial.printf("[C3] 负反馈(%s) 表达增益→%.2f\\n", src, _negGain);
+  _n.expression = min(_n.expression, 0.5f);    // 当拍表达欲直接压回阈下（0.5<默认阈 0.55，v3.61 修正）
+  Serial.printf("[C3] 负反馈(%s) 表达增益→%.2f\n", src, _negGain);
 }
 
 // C1：全局广播判决。salience 由调用方按事件源合成（需求/intent/惊讶），这里只做
@@ -416,16 +416,18 @@ void Cognition::expectEmaBlob(uint8_t* out) {
 
 void Cognition::expectOutcome(bool fulfilled) {
   _expLastTxt = String(kExpectCn[_expCat]) + (fulfilled ? "——应验了" : "——落空了");
-  // C5：命中 EMA 更新（α=0.3 平滑）——常落空的类别精度下滑，下一拍仲裁自动降权
+  // C5：精度先验在 EMA 更新前取（当拍结果不得污染本次的惊讶增益）
+  float prec = expectPrecision(_expCat);
+  // 命中 EMA 更新（α=0.3 平滑，钳 0.05~1 与落盘钳位一致）
   if (_expCat != EXP_NONE && _expCat <= EXP_WORLD_QUIET) {
     _expEma[_expCat] += 0.3f * ((fulfilled ? 1.0f : 0.0f) - _expEma[_expCat]);
+    if (_expEma[_expCat] < 0.05f) _expEma[_expCat] = 0.05f;
     if (_expN[_expCat] < 65535) _expN[_expCat]++;
   }
   // 误差回注：预测错了才需要学——按类别把惊讶写进对应需求（小幅，稳态环自己消化）。
-  // C5 精度加权：该类预测一直很准时，偶发落空更值得惊讶（全量回注）；
-  // 一直不准的类别落空是常态（回注打折），避免"常落空的预期反复推高需求=假情绪"
-  float prec = expectPrecision(_expCat);
-  float missGain = (1.0f - prec) + 0.1f;           // 精度 1→全量；精度 0.05→0.95×回注
+  // C5 精度加权（v3.61 修向）：一直很准的类别偶发落空=真意外（全量回注 1.0）；
+  // 一直不准的类别落空是常态（打折 ~0.15），不再"常落空的预期反复推高需求=假情绪"
+  float missGain = 0.1f + 0.9f * prec;             // 精度 1→1.0 全量；精度 0.05→0.145 打折
   if (_expCat == EXP_OWNER_COME) {
     _n.social += (fulfilled ? -0.08f : 0.05f * missGain);    // 来了=念想落地；落空=更想念
     if (_n.social < 0.05f) _n.social = 0.05f;     // 双侧钳（单侧 min 会瞬时出负需求）

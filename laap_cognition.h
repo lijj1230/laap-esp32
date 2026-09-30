@@ -42,7 +42,7 @@ public:
   uint8_t expectation() const { return _expCat; }
   uint32_t expectAtMs() const { return _expAtMs; }
   // C5 置信度校准（v3.59）：五类预期的命中 EMA（精度加权）。0.5=无先验，常落空→趋 0
-  void  expectEmaLoad(const uint8_t* blob);          // NVS 恢复（10B：5×EMA 定点/10 + 判定次数×2）
+  void  expectEmaLoad(const uint8_t* blob);          // NVS 恢复（10B：5×EMA 定点/200 + 5×判定次数 u16）
   void  expectEmaBlob(uint8_t* out);                 // 序列化落盘（外部按 5 分钟批量写 NVS）
   float expectPrecision(uint8_t cat) const;          // 该类精度 0.05~1.0（NONE 恒 1）
   float _expEma[5] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f}; // [0]=NONE 占位不用；公开供序列化直读
@@ -61,16 +61,21 @@ public:
   // 不是硬钳制）。掉电归零（快策略本就不该固化）。
   void onNegativeFeedback(const char* src);   // 事件入口：dislike/interrupt/told-quiet
   void socNudge(float d) {                    // C3 慢变量：外向性受控微调（夜间守卫下探用）
+    // v3.61 修正：去掉"向 0.5 锚点回归"项——它对高外向人格是 -0.03/夜的加速下跌
+    // （不动点 0.3=越教越自闭）。改为单向下探守卫：负向推到 0.35 为止，正向不设限
+    if (d < 0 && _sociability <= 0.35f) return;
     _sociability += d;
-    _sociability += (0.5f - _sociability) * 0.05f;   // 锚点回归：偏 0.5 越远拉力越大
     if (_sociability < 0.10f) _sociability = 0.10f;
     if (_sociability > 0.95f) _sociability = 0.95f;
     _evoDirty = true;
   }
   float expressGain() const { return _negGain; } // 表达需求增长项的有效增益 0.3~1
+  void onExpressSuppressed() {                 // C4 撤回结算：表达欲按"内部预演"消费，不发愉悦
+    _n.expression *= 0.5f;                     // （愉悦奖励会强化沉默习惯，v3.61 审计）
+  }
   float _negGain = 1.0f;                       // 1=无抑制；每次负反馈 ×0.55，自然回中
   uint32_t _negGainMs = 0;                     // 上次回中节拍
-  // 慢变量（天级持久）：夜间反思的守卫下探（证据+锚点+钳制三重），实现在 applySocNudge
+  // 慢变量（天级持久）：夜间反思的守卫下探（证据+单向下探守卫+快照兜底），见 socNudge
   float _bcTh = 0;                                    // 最近一次判决阈值（诊断）
   String _bcText;                                     // 赢得广播的念头（1 拍有效）
   String expectLine() const;          // 世界模型 JSON 片段（含上次应验/落空）

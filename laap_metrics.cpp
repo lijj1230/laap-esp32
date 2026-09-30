@@ -11,6 +11,11 @@ LaapMetrics metrics;
 
 // 单条反馈一行 JSONL。文件封顶 ~24KB，超了就重写保留最近 80 条：
 // 反馈是给"夜间反思当素材 / 人工复盘"用的，留最近的比留全部更有用。
+void LaapMetrics::decayFeedback24() {         // 5 分钟拍：12h 半衰（0.5^(5/720)≈0.9952）
+  fbUp24 *= 0.9952f;
+  fbDown24 *= 0.9952f;
+}
+
 bool LaapMetrics::feedback(int v, const String& user, const String& reply) {
   File f = LittleFS.open("/mem/feedback.jsonl", "a");
   if (!f) { Serial.println("[METRICS] 反馈落盘失败（feedback.jsonl 打不开）"); return false; }
@@ -22,7 +27,9 @@ bool LaapMetrics::feedback(int v, const String& user, const String& reply) {
   line += "\"}\n";
   bool ok = f.print(line) == line.length();
   f.close();
-  if (ok) { if (v > 0) fbUp++; else fbDown++; }   // 计数在落盘成功后（v3.56 审计：代码与注释不符，写失败虚高）
+  if (ok) {
+    if (v > 0) { fbUp++; fbUp24 += 1.0f; } else { fbDown++; fbDown24 += 1.0f; }   // 计数在落盘成功后（v3.56 审计）
+  }
   if (ok && LittleFS.exists("/mem/feedback.jsonl")) {
     File s = LittleFS.open("/mem/feedback.jsonl", "r");
     size_t sz = s ? s.size() : 0;
