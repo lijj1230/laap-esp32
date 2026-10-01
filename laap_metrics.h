@@ -24,6 +24,7 @@ struct LaapMetrics {
   uint32_t visionOk = 0, visionFail = 0;
   uint32_t searchOk = 0, searchFail = 0;
   uint32_t llmOk = 0, llmFail = 0;            // 后台 LLM 任务成败（含独白/反思）
+  uint32_t webChats = 0;                      // 网页对话轮（handleChat 受理即计；旧 UI 的"对话N轮"只算语音VAD，网页聊天永不进账——v3.64 修复）
   uint32_t fbUp = 0, fbDown = 0;              // 网页 👍/👎（终身累计，NVS 持久）
   float fbUp24 = 0, fbDown24 = 0;             // 滑窗反馈（12h 半衰，夜反思守卫下探用，v3.61）
   void decayFeedback24();                     // 5 分钟拍调用一次

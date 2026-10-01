@@ -162,7 +162,7 @@ async function refresh(){
   document.getElementById('net').textContent=s.ap?'配置热点 '+s.ap_ssid:(s.wifi_ok?'WiFi 已连接 '+s.ip:'WiFi 断开');
   document.getElementById('model').textContent=s.llm_model+' @ '+s.llm_base;
   const m=s.metrics||{};
-  document.getElementById('metrics').textContent='对话 '+m.vad_triggers+' 轮 · ASR空识别 '+m.asr_fail+'/'+m.asr_try+' · 打断 '+m.interrupts+' · LLM失败 '+m.llm_fail+' · 回复均 '+(m.rsp_llm_ms||0)+'ms · 👍'+(m.fb_up||0)+' 👎'+(m.fb_down||0);
+  document.getElementById('metrics').textContent='语音对话 '+m.vad_triggers+' 轮 · 网页对话 '+(m.web_chats||0)+' 轮 · ASR空识别 '+m.asr_fail+'/'+m.asr_try+' · 打断 '+m.interrupts+' · LLM失败 '+m.llm_fail+' · 回复均 '+(m.rsp_llm_ms||0)+'ms · 👍'+(m.fb_up||0)+' 👎'+(m.fb_down||0);
   const vc=document.getElementById('voicecard');
   if(vc){if(s.voice_ready&&s.voice_mode==2){vc.style.display='block';
     document.getElementById('listenstate').textContent=s.vad_paused?'已暂停':'聆听中…';
@@ -765,6 +765,7 @@ void LaapWeb::handleChat() {
   String b = server.arg("plain");
   String text = jsonField(b, "text");   // 容错 "text":"…" / "text": "…"
   if (!text.length()) { server.send(400, "application/json", "{\"ok\":false,\"reply\":\"空消息\"}"); return; }
+  metrics.webChats++;   // 网页对话轮（v3.64：此前 UI 的"对话N轮"只算语音 VAD，网页聊天恒 0）
   String reply = laapInteractSearch(text);   // 带联网搜索；LLM 阶段是异步投递
   if (laapChatPending()) {
     // 只有受理回执（"……"）：真回复由后台 LLM 任务产出，网页轮询 /api/chat/reply 取。

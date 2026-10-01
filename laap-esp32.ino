@@ -2584,12 +2584,15 @@ void loop() {
     Serial.println("[LAAP] 静默息屏（交互即唤醒）");
   }
 
-  // 自愈性打盹：内部堆最大连续块跌破 TLS 底线（<31KB 时 LLM 必"连接失败"，且碎片
-  // 不可自行恢复）且闲置 ≥3 分钟、无任务在飞 → 重启换一块干净的堆。
-  // 重启前落盘累计时长；开机后一切照旧。把"死到主人手动重启"变成"打个盹自己缓过来"
+  // 自愈性打盹：内部堆最大连续块跌破 LLM 工作底线且闲置 ≥3 分钟、无任务在飞 →
+  // 重启换一块干净的堆。重启前落盘累计时长；开机后一切照旧。
+  // v3.64：阈值 26000→14000——v3.55 起 TLS 收发缓冲走 PSRAM，LLM 在 maxblk ~14KB
+  // 下照常工作（与 llmSubmit 门槛一致，E2E 实证 maxblk 30KB 全链正常）；旧线 26KB
+  // 是 PSRAM 迁移前的口径，叠加保活连接+聊天波动的 ~10KB 常驻占用后，正常聊几轮
+  // 就会误触打盹（实测）。14KB=llmSubmit 拒绝线：LLM 真跑不动了才值得打盹。
   static uint32_t s_tightSince = 0;
   { uint32_t maxblk = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (maxblk < 26000) {
+    if (maxblk < 14000) {
       if (!s_tightSince) s_tightSince = millis();
       if (millis() - s_tightSince > 30000UL && millis() - g_lastActivityMs > 180000UL &&
           !laapLlmBusy() && !laapChatPending()) {

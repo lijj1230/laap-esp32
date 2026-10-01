@@ -60,6 +60,7 @@ bool LaapMetrics::feedback(int v, const String& user, const String& reply) {
 
 String LaapMetrics::json() const {
   String j = String("\"vad_triggers\":") + vadTriggers +
+    ",\"web_chats\":" + webChats +
     ",\"no_speech\":" + noSpeech +
     ",\"asr_try\":" + asrTry +
     ",\"asr_fail\":" + asrFail +
