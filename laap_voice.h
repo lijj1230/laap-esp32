@@ -44,6 +44,8 @@ public:
   // VAD 自动聆听的暂停/恢复（BOOT 短按 / Web 均可控制）
   bool vadPaused() const { return _vadPaused; }
   void setVadPaused(bool paused);
+  // 正在播报中（唤醒词打断路径用：判定是否需要掐断 TTS）
+  bool speaking() const { return _busy; }
 
 private:
   bool listenAndTranscribe(String& heard);

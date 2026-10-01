@@ -39,16 +39,18 @@ if "%PORT%"=="" (
 )
 
 echo.
-echo 即将烧录 4 个分区到 %PORT% ...
+echo 即将烧录 5 个分区到 %PORT% ...
 echo 若一直等待 Connecting...：按住板上 BOOT 键，点按一下 RST，松开 RST，2 秒后再松开 BOOT
 echo.
-python -m esptool --chip esp32s3 --port "%PORT%" --baud 921600 --before default-reset --after hard-reset write-flash -z 0x0 firmware\laap-esp32.ino.bootloader.bin 0x8000 firmware\laap-esp32.ino.partitions.bin 0xe000 firmware\boot_app0.bin 0x10000 firmware\laap-esp32.ino.bin
+rem v3.75 阶段四：新增 model 分区 srmodels.bin@0xC10000（本地唤醒词 wn9_hiesp「Hi ESP」），
+rem 分区表已切换为 esp_sr_16（LittleFS 位置移动——刷完后记忆为空白，由日常对话/训练自动回补）
+python -m esptool --chip esp32s3 --port "%PORT%" --baud 921600 --before default-reset --after hard-reset write-flash -z 0x0 firmware\laap-esp32.ino.bootloader.bin 0x8000 firmware\laap-esp32.ino.partitions.bin 0xe000 firmware\boot_app0.bin 0x10000 firmware\laap-esp32.ino.bin 0xC10000 firmware\srmodels.bin
 if errorlevel 1 (
   echo.
   echo [失败] 分区烧录出错，改用整片镜像方式再试...
   echo [注意] 整片烧录会覆盖整颗 16MB，包含记忆区（LittleFS）——人格与记忆会清空。
   echo         刷完可在网页"记忆"页用"导入记忆"恢复此前的备份。
-  python -m esptool --chip esp32s3 --port "%PORT%" --baud 921600 write-flash 0x0 firmware\laap-lite-merged-16MB.bin
+  python -m esptool --chip esp32s3 --port "%PORT%" --baud 921600 write-flash 0x0 firmware\laap-v375-wake-merged-16MB.bin
   if errorlevel 1 (
     echo [失败] 烧录未完成，请把上面窗口里的报错文字截图/复制发回来
     pause

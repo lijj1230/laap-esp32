@@ -76,8 +76,8 @@ void LaapVoice::speak(const String& text, const char* expr) {
     if (expr) display.drawFace(expr, false);
   }
   if (audio.interrupted()) metrics.interruptedPlay();   // 播放被人声/按键打断（barge-in）。
-  // C3 打断事件源暂不接（v3.61 审计）：barge 默认关（自发声会误触发=自己吓自己），
-  // 打开需先有回声抑制；在此之前 C3 快变量只认网页👎这一个事件源
+  // v3.75 AEC 全双工：打断=真人在插话，冷却期照旧（等回声消散+清预滚防自听见）——
+  // 打断后紧接着就是 listenAndTranscribe，预滚里的回声残段绝不能进录音头
   // 播报冷却：等回声消散，避免 VAD 自触发（时长由自调优旋钮 A 控制）。
   // 同时清预滚——自家 TTS 尾音绝不能留在预滚里，否则下一轮录音会把"自己说的话"交给 ASR
   _cooldownMs = millis() + _cooldownDur;

@@ -5,6 +5,13 @@
 #include "src/vendor/es7210/es7210.h"
 #include <esp_heap_caps.h>
 
+// ---- AEC 全双工（v3.75） ----
+// esp-sr 的独立 AEC 是纯 DSP 自适应滤波（无神经网络、无需 srmodels 分区），
+// 符号在 libesp_audio_processor.a，Arduino 链接器全量 -Wl,--whole-archive 这些库时可用。
+extern "C" {
+#include "esp_aec.h"
+}
+
 LaapAudio audio;
 
 // C 桥：vendor 编解码器驱动的 I2C 访问（Wire 在此为 C++）
@@ -101,6 +108,23 @@ bool LaapAudio::begin() {
   paSet(false);
   _ok = spkOk;                                 // 麦克风缺失不阻塞 TTS
   Serial.printf("[AUD] I2S ok spk=%d mic=%d\n", spkOk, micOk);
+
+  // ---- AEC（v3.75 全双工打断的心脏）：16k 单麦+单参考，低耗档，PSRAM 不占内部堆 ----
+  // 失败只降级回"播放不收麦"（v3.74 前的旧行为），不阻塞启动
+  _aec = false;
+  if (micOk) {
+    _aecHandle = aec_create(16000, 4, 1, AEC_MODE_SR_LOW_COST);
+    if (_aecHandle) {
+      _aecChunk = aec_get_chunksize((aec_handle_t*)_aecHandle);   // 实际帧大小（应=160）
+      _aecRef48 = (int16_t*)heap_caps_malloc(480 * 8 * 2, MALLOC_CAP_SPIRAM);   // 80ms@48k
+      _aecMic48 = (int16_t*)heap_caps_malloc(480 * 8 * 2, MALLOC_CAP_SPIRAM);
+      _aec = _aecRef48 && _aecMic48;
+      if (!_aec) Serial.println("[AUD] AEC 缓冲分配失败，打断降级");
+    } else {
+      Serial.println("[AUD] aec_create 失败，打断降级");
+    }
+  }
+  Serial.printf("[AUD] AEC %s chunk=%d\n", _aec ? "ok" : "off", _aec ? _aecChunk : 0);
   return _ok;
 }
 
@@ -108,8 +132,7 @@ void LaapAudio::paSet(bool on) {
   // PCA9557 读-改-写 bit1(PA_EN)，保持 bit0(LCD_CS)=0
   // 幂等提速：已在目标态直接返回——逐帧流式播放时每帧 30ms 延时会拖到 0.6x 实时
   static bool s_paOn = false;
-  if (s_paOn == on) return;
-  Wire.beginTransmission(0x19); Wire.write(0x01);
+  if (s_paOn == on) return;  Wire.beginTransmission(0x19); Wire.write(0x01);
   if (Wire.endTransmission(false) != 0) return;
   uint8_t cur = 0;
   if (Wire.requestFrom((int)0x19, 1) == 1) cur = Wire.read();
@@ -178,7 +201,7 @@ void LaapAudio::pump() {
   // 3:1 降采样到 16k：录音期进录音缓冲；空闲期滚进预滚缓冲（供下次触发回填句首）。
   // 预滚满时丢老一半——按 pump 调用粒度整批搬（每次最多 24KB，约 4.5MB/s，PSRAM 无压力），
   // 千万别按样本搬，否则 16k 样本/s 全都要触发 memmove
-  if (!_recording && _preBuf) {
+  if (!_recording && _preBuf && !_aecEn) {   // AEC 模式下不走预滚（回声残留会污染下轮 ASR）
     size_t need = (n / 3 + 1) * 2;
     if (_preLen + need > kPreRollBytes) {
       size_t keep = kPreRollBytes / 2;
@@ -193,14 +216,77 @@ void LaapAudio::pump() {
       _dsAcc = 0; _dsCnt = 0;
       if (_recording) {
         if (_recLen + 2 <= _recCap) { _recBuf[_recLen / 2] = s; _recLen += 2; }
-      } else if (_preBuf) {
+      } else if (_preBuf && !_aecEn) {
         _preBuf[_preLen / 2] = s; _preLen += 2;
       }
     }
   }
+
+  // AEC 双流同步累积（v3.75）：参考信号由 playPcm 侧 aecFeedRef 写入（播放内容），
+  // 麦克风 48k 在此追加；两流字节数接近时逐帧消费（aecProcessTick 内对齐）
+  if (_aecEn && _aecMic48) {
+    size_t bytes = n * 2;
+    if (_aecMicLen + bytes <= 480 * 8 * 2) {
+      memcpy((uint8_t*)_aecMic48 + _aecMicLen, tmp, bytes);
+      _aecMicLen += bytes;
+    }
+    aecProcessTick();
+  }
+
+  // 唤醒词引擎喂食（v3.75）：按本批 48k 的每第 3 个样本直接取（与降采样取点规则一致）
+  if (_wakeFeed) {
+    static int16_t wk[96];
+    size_t wn = 0;
+    for (int i = 0; i < n && wn < 96; i += 3) wk[wn++] = tmp[i];
+    if (wn) _wakeFeed(wk, wn);
+  }
 }
 
 void LaapAudio::recordTick() { pump(); }
+
+// ---- AEC 帧处理（v3.75）：48k 同步流 → 降采样 → 16k 帧喂 AEC → 输出跑 VAD ----
+// 参考信号与麦克风采样同钟（都是 I2S 48k），字节数差=采录不同步的抖动，按字节数对齐消费
+void LaapAudio::aecFeedRef(const int16_t* pcm48, size_t samples) {
+  if (!_aecEn || !_aecRef48) return;
+  size_t bytes = samples * 2;
+  if (_aecRefLen + bytes > 480 * 8 * 2) return;   // 溢出丢弃（正常不会到：消费端每帧跟进）
+  memcpy((uint8_t*)_aecRef48 + _aecRefLen, pcm48, bytes);
+  _aecRefLen += bytes;
+}
+
+// 消费已对齐的 48k 双流：3:1 降到 16k 喂 AEC，输出过 VAD
+static int16_t s_aecIn[160], s_aecRef[160], s_aecOut[160];
+void LaapAudio::aecProcessTick() {
+  if (!_aec || !_aecEn) return;
+  const size_t chunkIn = _aecChunk;               // 16k 帧样本数（160=10ms）
+  const size_t need48 = chunkIn * 3 * 2;          // 对应 48k 每流字节数
+  while (_aecRefLen >= need48 && _aecMicLen >= need48) {
+    // 3:1 降采样（简单取每第 3 个，与主录音路径的平均法一致量级足够 VAD）
+    for (size_t i = 0; i < chunkIn; i++) {
+      s_aecIn[i] = _aecMic48[i * 3];
+      s_aecRef[i] = _aecRef48[i * 3];
+    }
+    memmove(_aecMic48, _aecMic48 + need48, _aecMicLen - need48);
+    memmove(_aecRef48, _aecRef48 + need48, _aecRefLen - need48);
+    _aecMicLen -= need48; _aecRefLen -= need48;
+
+    aec_process((aec_handle_t*)_aecHandle, s_aecIn, s_aecRef, s_aecOut);
+    // AEC 输出 RMS——这是"消掉自己回声后剩余的声音"，超阈值=真人插话
+    uint64_t sum = 0;
+    for (size_t i = 0; i < chunkIn; i++) { int32_t v = s_aecOut[i]; sum += (uint64_t)(v * v); }
+    float rms = sqrtf((float)(sum / chunkIn));
+    // 打断门限：回声已消，剩余能量主要是人声。600 遮底噪+残余（实测回声消后残余 ~100-200）。
+    // 连续 2 帧(20ms)超门限才置位（单帧毛刺防护）
+    static uint8_t s_hiCnt = 0;
+    if (rms > 600) {
+      if (++s_hiCnt >= 2) { _aecInterrupt = true; s_hiCnt = 2; }
+    } else if (rms > 350) {
+      s_hiCnt = s_hiCnt;   // 中间带：维持不涨不清（滞回）
+    } else {
+      s_hiCnt = 0;
+    }
+  }
+}
 
 void LaapAudio::vadCalibrate(uint32_t ms) {
   uint32_t t0 = millis();
@@ -215,14 +301,21 @@ bool LaapAudio::playPcm(const int16_t* data, size_t samples, uint32_t rate,
                         bool (*interruptCb)(void*), void* ctx) {
   if (!spkOk) return false;
   _interrupted = false;
+  _aecInterrupt = false;
   paSet(true);               // 起振等待已内置在 paSet 的开沿（逐帧流播不再每帧空转 30ms）
+
+  // v3.75 AEC 全双工：启用条件=算法可用+调用方开了打断+麦克在线。
+  // AEC 模式下播放期间持续收麦，回声被消掉，VAD 只对真人声音起反应
+  bool aec = _aec && _bargeEn && micOk;
+  _aecEn = aec;
+  if (aec) { _aecRefLen = 0; _aecMicLen = 0; }
 
   static int16_t out[2 * 480];   // 480 输出样本对(10ms@48k)
   double step = (double)rate / AUD_I2S_RATE;
   double pos = 0;
   size_t idx = 0;
 
-  // 播放漏音基线（前 300ms 采样，供打断判定参考）
+  // 播放漏音基线（前 300ms 采样，供打断判定参考）——AEC 模式下不用（AEC 输出已消回声）
   uint32_t leakT0 = millis();
   float leakRms = 0; int leakN = 0;
   int highCnt = 0;
@@ -241,12 +334,14 @@ bool LaapAudio::playPcm(const int16_t* data, size_t samples, uint32_t rate,
       idx = (size_t)pos;
     }
     if (m > 0) s_i2sBytes += i2s.write((uint8_t*)out, m * 4);   // 记账：I2S 实写字节（0=写不进去，硬件层问题）
+    if (aec) aecFeedRef(out, m);   // v3.75：刚写进喇叭的内容=参考信号（回声模板）
 
-    // 打断监测：仅在 barge-in 开启时才吸麦克风（默认关——播放时不动麦克风，
-    // 避免 I2S 全双工 RX/TX 竞争与"自己听见自己"的回环干扰）
+    // 打断监测：AEC 模式在 pump() 里判定（_aecInterrupt）；旧 RMS 基线法仅在非 AEC 时兜底
     if (_bargeEn) {
       pump();
-      if (millis() - leakT0 < 300) { leakRms += _fastRms; leakN++; }
+      if (aec) {
+        if (_aecInterrupt) _interrupted = true;
+      } else if (millis() - leakT0 < 300) { leakRms += _fastRms; leakN++; }
       else if (!interruptCb) {
         float leak = (leakN ? leakRms / leakN : 400) * 1.9f + 250;
         highCnt = (_fastRms > leak) ? highCnt + 1 : 0;
@@ -261,6 +356,7 @@ bool LaapAudio::playPcm(const int16_t* data, size_t samples, uint32_t rate,
   // 注意：这里绝不能"排空麦克风"——I2SClass::available() 返回常量而非真实字节数，
   // 逐帧排水会让每个 24ms 音频块阻塞数百毫秒（卡顿根因，2026-09-26 实测回归）。
   // 播放期间不读 RX：FIFO 溢出丢数据无害，陈旧回声由 speak 后的 1200ms 冷却期兜住。
+  _aecEn = false;              // 退出全双工：预滚恢复记账（AEC 缓冲里的回声残段不进预滚）
   _paOffMs = millis() + 400;
   return !_interrupted;
 }

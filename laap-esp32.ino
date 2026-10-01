@@ -47,6 +47,7 @@
 #include "laap_skills.h"    // 口令技能库（RSI④：主人教的 trigger→指令）
 #include "laap_r0.h"        // R0 微型循环处理器（ESN 世界预测，误差回注好奇）
 #include "laap_tlsheap.h"   // mbedtls 分配器钩子（TLS 大块路由 PSRAM，v3.55）
+#include "laap_wake.h"      // 本地唤醒词（esp-sr wakenet9，v3.75 阶段四）
 
 // ---------- 全局（定义在各模块 .cpp，头文件已 extern） ----------
 
@@ -2460,6 +2461,14 @@ void setup() {
   else if (String(cfg.s.wifiSsid).length() == 0) { webui.beginAP(); display.drawIpLine("", false); }
 
   voice.begin();   // 音频管线 + 编解码器 + VAD 校准
+#if defined(LAAP_WAKEWORD_AVAILABLE)
+  // v3.75 本地唤醒词：esp-sr model 分区里有 wn9_hiesp 才会成功（esp_sr_16 分区表）。
+  // 失败自动退回 VAD 模式（无唤醒词引擎，行为与 v3.74 一致）
+  audio.setWakeFeed([](const int16_t* s, size_t n) { laapWake.feed(s, n); });
+  laapWake.begin();
+  Serial.printf("[LAAP] 唤醒词 %s（累计命中 %u）\n",
+                laapWake.active() ? "启用「Hi ESP」" : "不可用→VAD 模式", laapWake.wakeCount());
+#endif
   laapNetInit();   // 显式建网络互斥锁（懒创建 check-then-create 在两任务同进时有竞态）
   metrics.loadPrev();  // 读回上一段会话的指标快照（崩溃/自愈重启的事故现场不丢）
   r0.begin();          // R0 微型循环处理器：储备池固定重建
@@ -2623,6 +2632,22 @@ void loop() {
     }
   }
   voice.loopTick();   // VAD 自动聆听模式
+
+#if defined(LAAP_WAKEWORD_AVAILABLE)
+  // v3.75 唤醒词事件消费：说「Hi ESP」→ 立即开新对话。
+  // ① 播报中：voice.speak 的 AEC 打断正在播放的音频（audio.interrupt()），
+  //    说完半截算成功，随后 converse() 直接听新指令
+  // ② 空闲/冷却：直接 converse()（manualOnce 授权绕过软件唤醒词门——本地唤醒词本身就是门）
+  if (laapWake.consumeWakeup()) {
+    laapActivity();
+    if (voice.speaking()) {
+      Serial.println("[WAKE] 播报中被打断 → 听新指令");
+      audio.forceInterrupt();
+    }
+    laapVoiceSetManualOnce();
+    voice.converse();
+  }
+#endif
   laapBBPhase(5);
   audio.paTick();     // 功放空闲关断（流式播放间隔中保持开启）
   laapBBPhase(6);

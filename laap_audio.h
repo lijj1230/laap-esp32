@@ -68,6 +68,20 @@ public:
   // 播放期间打断监测开关（默认开）
   void bargeInEnable(bool en) { _bargeEn = en; }
 
+  // ---- AEC 全双工（v3.75：播放中听真人说话打断，而不是听见自己） ----
+  // aecEn: 回声消除启用。参考信号=待写 I2S 的 48k 样本（播放内容），与 mic 采样按 10ms 帧对齐后
+  // 喂 esp-sr 纯 DSP AEC（不需要模型分区），输出跑 VAD——远端的人声才会推高 VAD
+  bool aecAvailable() const { return _aec; }
+  void aecEnable(bool en) { _aecEn = en; }
+  bool interruptedVoice() const { return _aecInterrupt; }
+  void aecFeedRef(const int16_t* pcm48, size_t samples);  // playPcm 写参考信号（播放内容）
+
+  // ---- 唤醒词喂食（v3.75）：pump 的 16k 降采样流转发给 laapWake（函数指针解耦） ----
+  void setWakeFeed(void (*cb)(const int16_t*, size_t)) { _wakeFeed = cb; }
+
+  // 播放中强制打断（唤醒词事件路径）：下一个 I2S 写块检查即停
+  void forceInterrupt() { if (_bargeEn) _interrupted = true; }
+
   // ---- 麦克风 PGA 增益（ES7210，0..37.5dB）----
   // 实测 30dB 时近场自响只有 RMS 200（底噪 102，仅 6dB 余量）→ 远场说话会被埋掉，
   // 默认提到 37.5dB（最大档）。用 /micgain 可在运行时逐档试。
@@ -75,6 +89,7 @@ public:
   int micGainDb() const { return _micGainDb; }
 
 private:
+  void aecProcessTick();   // 48k 双流对齐→16k 帧→AEC→VAD（pump 内调用）
   void pump();                       // 从 I2S 读数据→降采样→VAD/录音缓冲
   bool _ok = false;
   uint8_t _volume = 70;
@@ -91,6 +106,17 @@ private:
   bool _vadSpeech = false;
   uint32_t _silenceMs = 0;
   bool _interrupted = false, _bargeEn = false;   // 默认关：播放期间不收麦（防回环/自触发）
+  void (*_wakeFeed)(const int16_t*, size_t) = nullptr;  // 16k 样本转发回调（laap_wake）
+  // ---- AEC 全双工状态 ----
+  bool _aec = false;            // aec_create 成功
+  bool _aecEn = false;          // 本轮播放启用 AEC 打断
+  bool _aecInterrupt = false;   // AEC-VAD 判定真人插话
+  void* _aecHandle = nullptr;   // aec_handle_t*（void* 免头文件进 Arduino 公共面）
+  int _aecChunk = 160;          // AEC 帧大小（样本数，10ms@16k，aec_get_chunksize 实测回填）
+  int16_t* _aecRef48 = nullptr; // 参考信号累积（48k，与 mic 48k 采样同步钟）
+  int16_t* _aecMic48 = nullptr; // 麦克风 48k 采样累积
+  size_t _aecRefLen = 0, _aecMicLen = 0;  // 有效字节数
+  size_t _aecConsumed = 0;      // 已对齐消费的参考字节游标
   uint32_t _paOffMs = 0;                       // PA 空闲关断时刻（0=无需关）
 };
 
