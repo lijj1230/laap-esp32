@@ -2703,7 +2703,14 @@ void loop() {
 
   // BOOT 键: 短按=主动表达 长按4s=配置热点 长按10s=格式化
   bool pressed = (digitalRead(BTN_PIN) == LOW);
-  if (pressed && g_btnDown == 0) g_btnDown = millis();
+  if (pressed && g_btnDown == 0) { g_btnDown = millis();
+    // v3.73：按下**瞬间**就预热 ASR TLS（松开才 converse——录音的几秒里握手并行完成，
+    // ASR 上行时连接已就绪，省 2~4s 现场握手；堆≥40KB 才预热，防挤掉 LLM 起飞块）
+    if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 40000) {
+      xTaskCreate([](void*) { asr.warmup(); vTaskDelete(nullptr); },
+                  "asrwarm", 12288, nullptr, 1, nullptr);
+    }
+  }
   if (!pressed && g_btnDown > 0) {
     uint32_t held = millis() - g_btnDown;
     g_btnDown = 0;

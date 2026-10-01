@@ -46,8 +46,21 @@ void LaapVoice::speak(const String& text, const char* expr) {
 
   bool ok = false;
   // 通道: 0=Edge→火山回退(默认) 1=仅Edge 2=仅火山 3=静音(不出声)
+  // v3.73 情绪→语气：情绪词是控制信号，让"心情"以语气呈现而非词语——
+  // tired 慢 8%、excited 快 10%、anxious 略快略赶、lonely 放缓。基础 rate 来自配置。
   if (cfg.s.ttsChannel == 0 || cfg.s.ttsChannel == 1) {
-    ok = edgeTts.speak(text, String(cfg.s.ttsVoice), String(cfg.s.ttsRate));
+    int ratePct = cfg.s.ttsRate[0] ? atoi(cfg.s.ttsRate) : 0;   // 配置口径：如 "0" / "-10" / "+10"
+    if (expr) {
+      if      (!strcmp(expr, "tired"))   ratePct -= 8;
+      else if (!strcmp(expr, "excited")) ratePct += 10;
+      else if (!strcmp(expr, "anxious")) ratePct += 5;
+      else if (!strcmp(expr, "lonely"))  ratePct -= 5;
+      else if (!strcmp(expr, "happy"))   ratePct += 4;
+    }
+    if (ratePct > 50) ratePct = 50;
+    if (ratePct < -50) ratePct = -50;
+    String rateStr = (ratePct > 0 ? "+" : "") + String(ratePct) + "%";
+    ok = edgeTts.speak(text, String(cfg.s.ttsVoice), rateStr);
     if (!ok) Serial.printf("[VOICE] Edge TTS 失败: %s\n", edgeTts.lastError.c_str());
   }
   if (!ok && (cfg.s.ttsChannel == 0 || cfg.s.ttsChannel == 2)) {
@@ -89,11 +102,13 @@ bool LaapVoice::listenAndTranscribe(String& heard) {
   if ((VoiceMode)cfg.s.voiceMode != VoiceMode::Vad) audio.prerollFlush();
   if (!audio.recordStart(12)) { display.drawRecState(false); lastError = "录音缓冲分配失败"; return false; }
   uint32_t t0 = millis();
-  uint32_t waitCap = 8000UL + audio.vadStopMs();   // 起始静默 8s + 说完后的判停尾
+  // v3.73：起始静默 8s→3s（按键模式下主人刚按的键，正要开口，8s 白等是纯延迟）；
+  // 说话中刷新等待窗（t0=now-1200ms：说话期间再给 1.2s+判停尾，说完快速收音）
+  uint32_t waitCap = 3000UL + audio.vadStopMs();   // 起始静默 3s + 说完后的判停尾
   bool spoke = false;
   while (millis() - t0 < waitCap) {
     audio.recordTick();
-    if (audio.vadSpeaking()) { spoke = true; t0 = millis() - 4000; } // 说话中刷新等待窗（判停尾要留够）
+    if (audio.vadSpeaking()) { spoke = true; t0 = millis() - 1200; } // 说话中刷新等待窗（说完快速收音）
     else if (spoke) break;                                            // 说完静音（判停窗口到）
     if (audio.recordBytes() >= 12UL * 16000 * 2 - 1024) break;
     delay(5);
@@ -202,35 +217,33 @@ void LaapVoice::loopTick() {
     s_lastDrawn = wantListening;
   }
   if (_busy) return;
+  // v3.73 ASR 预热：挪到 vadMode 早退**之前**——原位置在 `if (!vadMode) return` 之后，
+  // 按键模式永远执行不到 → 按键对话每次都现场 TLS 握手（2~4s，按键延迟的主凶）。
+  // 触发条件放宽：任何模式、上次交互 15 分钟内、堆最大块 ≥40KB 即预热（用户按键
+  // 是确定性场景，握手要赶在说话期间完成）
+  {
+    static uint32_t s_warmMs = 0;
+    bool chatRecent = _lastChatMs && (millis() - _lastChatMs < 900000);
+    bool heapRoom = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 40000;
+    if (chatRecent && heapRoom && (int32_t)(millis() - _cooldownMs) >= 0 &&
+        millis() - s_warmMs > 20000) {
+      if (asr.warmAlive()) {
+        s_warmMs = millis();                    // 热连接还活着：不重握手
+      } else {
+        s_warmMs = millis();
+        // 栈 12KB：TLS 握手峰值 6KB+，首次真实运行（v3.36 前是死代码）曾疑似栈紧崩溃
+        if (xTaskCreate([](void*) { asr.warmup(); vTaskDelete(nullptr); },
+                        "asrwarm", 12288, nullptr, 1, nullptr) != pdPASS) {
+          asr.warmup();                         // 建任务失败：退化为主线程预热
+        }
+      }
+    }
+  }
   // 音频泵只在 VAD 模式常转（预滚缓冲+触发判定都靠它）。
   // 按键模式按下才录，平时不监测——v3.32 曾改成全模式常转，结果按键模式下
   // "听到人声=活动"的息屏信号被环境噪声反复点亮，屏幕永远息不了
   if (!vadMode) return;
   audio.recordTick();
-  // ASR 预热：仅"上次对话后 5 分钟内"的空闲期进行，且已有活连接就跳过——
-  // 防止长期无人时高频握手（服务商 WAF 可能盯上陌生 TLS 风暴）
-  static uint32_t s_warmMs = 0;
-  // "上次聊天"时间戳由 listenAndTranscribe 成功后写入 _lastChatMs——原来用
-  // `if (_busy) s_lastChatMs = millis();` 记录，但 loopTick 开头就 `if (_busy) return`，
-  // 这行永远执行不到 → chatRecent 恒 false → 整个 ASR 预热特性从 v3.18 起就是死代码
-  bool chatRecent = _lastChatMs && (millis() - _lastChatMs < 300000);
-  // 预热连接会占住内部堆最大的一块（TLS 缓冲）：堆不宽裕（<50KB 连续块）就不建，
-  // 否则 LLM 再要起飞时凑不出 31KB+ 连续块 → 连接失败（v3.36 修活后实测踩中）
-  bool heapRoom = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= 50000;
-  if (vadMode && !_vadPaused && chatRecent && heapRoom && (int32_t)(millis() - _cooldownMs) >= 0 &&
-      millis() - s_warmMs > 20000) {
-    if (asr.warmAlive()) {
-      s_warmMs = millis();                    // 热连接还活着：不重握手
-    } else {
-      s_warmMs = millis();
-      // 栈 12KB：TLS 握手峰值 6KB+，首次真实运行（v3.36 前是死代码）曾疑似栈紧崩溃
-      if (xTaskCreate([](void*) { asr.warmup(); vTaskDelete(nullptr); },
-                      "asrwarm", 12288, nullptr, 1, nullptr) != pdPASS) {
-        asr.warmup();                         // 建任务失败：退化为主线程预热
-      }
-    }
-  }
-  if (!vadMode) return;
   if (_vadPaused) return;                               // 暂停：只排水（上面已泵）不触发
   if ((int32_t)(millis() - _cooldownMs) < 0) return;    // 回绕安全
   // 检测持续人声（>600ms 才开麦，避免误触发）
