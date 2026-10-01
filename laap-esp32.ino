@@ -2542,9 +2542,12 @@ void touchGestures() {
 }
 
 void loop() {
+  laapBBPhase(0);
   webui.handleClient();
+  laapBBPhase(1);
   serialCli();
   memory.embedTick();   // 语义向量懒补（15s 限速，断网自动退关键词）
+  laapBBPhase(3);
   display.blinkTick();
   { // 顶栏（时间/需求数字/设备信息/IMU）每秒刷新
     static uint32_t s_lastStatus = 0;
@@ -2564,8 +2567,11 @@ void loop() {
     }
   }
   voice.loopTick();   // VAD 自动聆听模式
+  laapBBPhase(5);
   audio.paTick();     // 功放空闲关断（流式播放间隔中保持开启）
+  laapBBPhase(6);
   llmHarvest();       // F4: 收割后台 LLM 结果
+  laapBBPhase(7);
   touchGestures();    // F5: 摇晃/翻面触觉（每帧，内部自带节流）
 
   // F5b: 电容触摸屏——点一下=戳它。按下沿触发；息屏时第一次触摸只唤醒（防误触乱说话）
@@ -2585,6 +2591,7 @@ void loop() {
       }
     }
     s_wasTouch = nowTouch; }
+  laapBBPhase(8);
 
   // 有人对着麦克风说话 = 活动。须持续 ≥600ms（与触发对话的判定一致）——
   // 瞬时 VAD 沿会被环境噪声频繁触发，v3.32 提灵敏度后曾把静默息屏永远顶住
@@ -2597,21 +2604,23 @@ void loop() {
     s_wasSpeech = sp; }
 
   // 静默息屏：screenOffSec 秒无活动关背光；任何交互（说话/按键/摇晃/网页对话）立即点亮
+  laapBBPhase(9);
   if (cfg.s.screenOffSec > 0 && display.screenOn() &&
       millis() - g_lastActivityMs > (uint32_t)cfg.s.screenOffSec * 1000UL) {
     display.setScreenOn(false);
     Serial.println("[LAAP] 静默息屏（交互即唤醒）");
   }
 
-  // 自愈性打盹：内部堆最大连续块跌破 LLM 工作底线且闲置 ≥3 分钟、无任务在飞 →
+  // 自愈性打盹：内部堆最大连续块跌破警戒线且闲置 ≥3 分钟、无任务在飞 →
   // 重启换一块干净的堆。重启前落盘累计时长；开机后一切照旧。
-  // v3.64：阈值 26000→14000——v3.55 起 TLS 收发缓冲走 PSRAM，LLM 在 maxblk ~14KB
-  // 下照常工作（与 llmSubmit 门槛一致，E2E 实证 maxblk 30KB 全链正常）；旧线 26KB
-  // 是 PSRAM 迁移前的口径，叠加保活连接+聊天波动的 ~10KB 常驻占用后，正常聊几轮
-  // 就会误触打盹（实测）。14KB=llmSubmit 拒绝线：LLM 真跑不动了才值得打盹。
+  // v3.68：阈值 14000→24000。v3.64 降到 14KB（LLM 生存线）后，设备在 14-26KB 的
+  // 中间退化态硬撑——实测此态下 TLS 握手（TTS WS/LLM）内存 dip 到临界以下会
+  // 无声崩溃（复位码11，panic 打印被 USJ 复位吞掉，v3.64-67 四连实证）。24KB
+  // 在危险区之上：宁可持续自愈（干净软重启）也不无声崩溃。v3.65 修掉 _bin 泄漏
+  // 后退化速度已大幅放缓，打盹频率会远低于 v3.63 时代。
   static uint32_t s_tightSince = 0;
   { uint32_t maxblk = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (maxblk < 14000) {
+    if (maxblk < 24000) {
       if (!s_tightSince) s_tightSince = millis();
       if (millis() - s_tightSince > 30000UL && millis() - g_lastActivityMs > 180000UL &&
           !laapLlmBusy() && !laapChatPending()) {
@@ -2625,6 +2634,7 @@ void loop() {
       }
     } else s_tightSince = 0;
   }
+  laapBBPhase(10);
 
   // 累计运行时长：每 5 分钟落盘一次（单键写入，NVS 磨损可忽略）
   { static uint32_t s_lastUpSave = 0;
@@ -2639,6 +2649,7 @@ void loop() {
         pe.end();
       }
     } }
+  laapBBPhase(11);
 
   // BOOT 键: 短按=主动表达 长按4s=配置热点 长按10s=格式化
   bool pressed = (digitalRead(BTN_PIN) == LOW);
@@ -2663,6 +2674,7 @@ void loop() {
     }
   }
 
+  laapBBPhase(12);
   // WiFi 断线重连 + 底栏 IP 行跟随联网状态（只有真的断网才显示红感叹号，恢复后立刻变回绿天线+IP）
   static uint32_t lastReconnect = 0;
   static int8_t s_ipBarWifi = -1;
@@ -2677,8 +2689,10 @@ void loop() {
     mind.onError();
   }
 
+  laapBBPhase(13);
   // PSI 心跳
   if (millis() - g_lastTickMs > cfg.s.tickSec * 1000UL) psiTick();
+  laapBBPhase(14);
 
   // 自发独白：起始静默 idleSilenceMin 分，之后每 idleEveryMin 分一轮（0=关，后台可配）
   bool userTalking = voice.ready() &&
@@ -2713,6 +2727,7 @@ void loop() {
   // 旧实现盯着 g_lastSay 变化就重置——它自己说一句话也会重置，等于永远回到"等满静默"，
   // 后台配的 idleEveryMin 形同虚设（实测周期永远是 idleSilenceMin）。
 
+  laapBBPhase(16);   // v3.69：本轮 loop 完整走完
   delay(10);
 }
 

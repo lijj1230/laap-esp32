@@ -93,3 +93,6 @@ String laapBootReason();
 // 写入廉价（strlcpy+两次堆查询 ~10µs），只埋在慢路径（LLM/TTS/视觉/心跳），别放进每帧循环。
 void laapBlackBox(const char* tag);
 String laapBlackBoxText();
+// v3.69 微标签：loop() 各子阶段写一个 RTC 微相位（普通内存存储，零开销；~1ms 分辨率）。
+// 无声崩溃后 bb 显示的相位=死点所在子阶段，把排查从"整个 loop"缩到"某一段"。
+void laapBBPhase(uint8_t ph);

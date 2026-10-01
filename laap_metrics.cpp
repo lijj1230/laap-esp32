@@ -12,6 +12,12 @@ RTC_DATA_ATTR static char s_bbTag[48];
 RTC_DATA_ATTR static uint32_t s_bbMs;
 RTC_DATA_ATTR static uint32_t s_bbHeapKb;
 RTC_DATA_ATTR static uint32_t s_bbMaxKb;
+RTC_DATA_ATTR static uint32_t s_bbPhase;   // v3.69 loop 微相位
+static const char* kBBPhaseName[] = {
+  "loop头", "web", "cli", "embedTick", "显示", "voiceTick", "paTick", "harvest",
+  "触摸", "息屏", "打盹门", "落盘", "按键", "wifi", "psiTick", "独白调度", "loop尾"
+};
+void laapBBPhase(uint8_t ph) { s_bbPhase = ph; }
 
 void laapBlackBox(const char* tag) {
   strlcpy(s_bbTag, tag, sizeof(s_bbTag));
@@ -23,7 +29,8 @@ void laapBlackBox(const char* tag) {
 String laapBlackBoxText() {
   if (!s_bbTag[0]) return String("（本次上电还没有记录）");
   return String(s_bbTag) + " @T+" + String(s_bbMs / 1000UL) + "s（heap " +
-         String(s_bbHeapKb) + "KB/最大 " + String(s_bbMaxKb) + "KB）";
+         String(s_bbHeapKb) + "KB/最大 " + String(s_bbMaxKb) + "KB）loop相位=" +
+         String((s_bbPhase < 17) ? kBBPhaseName[s_bbPhase] : "?") + "(" + String(s_bbPhase) + ")";
 }
 
 // 就地清洗非法 UTF-8 与 JSON 转义统一走 laap_llm 的公共实现（v3.55 收敛：原来这里

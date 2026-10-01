@@ -21,6 +21,14 @@ void LaapVoice::begin() {
 
 void LaapVoice::speak(const String& text, const char* expr) {
   laapBlackBox("tts:start");   // v3.65 黑匣子：TTS 全链（WS-TLS+MP3 解码+I2S 播放）在此阻塞
+  // v3.68 堆量护栏：TTS 要新建一条 WS-TLS 连接（握手峰值吃内部堆），最大连续块
+  // 不足时握手深处分配失败会无声崩溃（v3.64-67 实证）——宁可不念，文字已上屏。
+  if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 16000) {
+    Serial.printf("[VOICE] 内部堆最大块不足 16KB，跳过播报（文字已显示）\n");
+    display.drawFace(expr ? expr : "calm", false);
+    _cooldownMs = millis() + 600;
+    return;
+  }
   if (!_ready || (VoiceMode)cfg.s.voiceMode == VoiceMode::Off) return;
   if (!text.length()) return;
   // 栈水位护栏：TTS 要过一次 TLS 握手。单位注意——本 IDF 的 uxTaskGetStackHighWaterMark
