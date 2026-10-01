@@ -175,7 +175,7 @@ String laapConscAudit() {   // JSON（/api/consc）
   j += String("],\"score\":") + score + ",\"max\":" + maxs +
        ",\"live\":{\"bc\":" + mind.bcCount() +
        ",\"negGain\":" + String(mind.expressGain(), 2) +
-       ",\"exp_hit\":" + (en ? String(ema / en * 100, 0) : String("null")) + "}";
+       ",\"exp_hit\":" + (en ? String(ema / en * 100, 0) : String("null")) + "}}";
   return j;
 }
 
