@@ -39,14 +39,53 @@ static String genSecMsGec() {
 }
 
 static String uuidNoDash() {
-  uint8_t b[16];
-  for (int i = 0; i < 16; i++) b[i] = esp_random() & 0xFF;
+  uint8_t b[16];  for (int i = 0; i < 16; i++) b[i] = esp_random() & 0xFF;
   b[6] = (b[6] & 0x0F) | 0x40;
   b[8] = (b[8] & 0x3F) | 0x80;
   char s[33];
   for (int i = 0; i < 16; i++) sprintf(s + i * 2, "%02x", b[i]);
   s[32] = 0;
   return String(s);
+}
+
+// ============================================================
+//  v3.74 TTS 连接预取：LLM 开始吐字的瞬间就并行发 WS-TLS 握手
+//  （握手 ~0.5s 与 LLM 生成重叠），首句入队时连接已就绪。
+//  预取连接带自己的 path（鉴权参数在 URL 里），speak() 优先收养：
+//  收养=省一次握手；过期(30s)/收养失败=照旧现场握手（行为与旧版一致）。
+// ============================================================
+static WsClient* s_preWs = nullptr;      // 预取的 WS（堆上，speak 收养后指针移交）
+static String s_prePath;                 // 该连接的握手 URL（SSML 请求要同 cid 鉴权）
+static bool s_preOk = false;
+static uint32_t s_preMs = 0;
+static SemaphoreHandle_t s_preMtx = nullptr;
+static void preLock()   { if (!s_preMtx) s_preMtx = xSemaphoreCreateMutex(); xSemaphoreTake(s_preMtx, portMAX_DELAY); }
+static void preUnlock() { xSemaphoreGive(s_preMtx); }
+
+void EdgeTts::preconnect() {
+  if (time(nullptr) < 1700000000) return;
+  preLock();
+  if (s_preOk && millis() - s_preMs < 30000) { preUnlock(); return; }   // 已有新的
+  if (s_preOk) { s_preWs->stop(); delete s_preWs; s_preWs = nullptr; s_preOk = false; }   // 过期：弃旧
+  preUnlock();
+  // 握手放在锁外（connect 阻塞数秒，持锁会拖死 speak 侧）
+  String cid = uuidNoDash();
+  String path = String("/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=") + TCT +
+    "&Sec-MS-GEC=" + genSecMsGec() + "&Sec-MS-GEC-Version=" + GEC_VER + "&ConnectionId=" + cid;
+  String cookie = "Cookie: muid=" + uuidNoDash() + ";\r\n";
+  String extra = String("Origin: chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold\r\n") +
+    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0\r\n" +
+    cookie;
+  WsClient* w = new WsClient();
+  if (!w->connect(EDGE_HOST, 443, path.c_str(), extra.c_str())) { delete w; return; }   // 失败静默：speak 照旧现场握手
+  preLock();
+  if (s_preOk) { s_preWs->stop(); delete s_preWs; }   // 竞态：有人先成功了，弃我这条
+  s_preWs = w;
+  s_prePath = path;
+  s_preOk = true;
+  s_preMs = millis();
+  preUnlock();
+  Serial.println("[TTS·预] WS-TLS 握手完成，等待收养");
 }
 
 static String jsDate() {
@@ -186,26 +225,42 @@ bool EdgeTts::speak(const String& text, const String& voice, const String& rate,
   time_t now = time(nullptr);
   if (now < 1700000000) { lastError = "NTP 未同步，无法生成鉴权"; return false; }
 
-  String cid = uuidNoDash();
-  String path = String("/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=") + TCT +
-    "&Sec-MS-GEC=" + genSecMsGec() + "&Sec-MS-GEC-Version=" + GEC_VER + "&ConnectionId=" + cid;
+  // v3.74 收养预取连接（握手已在 LLM 吐字期间并行完成）：收养成功省 ~0.5s 现场握手
+  WsClient* ws = nullptr;
+  String cid, path, ts;
+  preLock();
+  if (s_preOk && s_preWs && millis() - s_preMs < 30000) {
+    ws = s_preWs; path = s_prePath;                  // 指针移交（槽不再持有）
+    s_preWs = nullptr; s_preOk = false;
+    // 从 path 里取回本次握手的 ConnectionId（SSML 的 X-RequestId 与之同源）
+    int cp = path.indexOf("ConnectionId=");
+    if (cp >= 0) cid = path.substring(cp + 13);
+    Serial.println("[TTS·预] 收养预取连接（省一次 WS-TLS 握手）");
+  }
+  preUnlock();
 
-  WsClient ws;
-  String cookie = "Cookie: muid=" + uuidNoDash() + ";\r\n";
-  String extra = String("Origin: chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold\r\n") +
-    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0\r\n" +
-    cookie;
-  if (!ws.connect(EDGE_HOST, 443, path.c_str(), extra.c_str())) {
-    lastError = ws.lastError;
-    return false;
+  if (!ws) {                                          // 无预取：现场握手（旧行为）
+    cid = uuidNoDash();
+    path = String("/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=") + TCT +
+      "&Sec-MS-GEC=" + genSecMsGec() + "&Sec-MS-GEC-Version=" + GEC_VER + "&ConnectionId=" + cid;
+    ws = new WsClient();
+    String cookie = "Cookie: muid=" + uuidNoDash() + ";\r\n";
+    String extra = String("Origin: chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold\r\n") +
+      "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0\r\n" +
+      cookie;
+    if (!ws->connect(EDGE_HOST, 443, path.c_str(), extra.c_str())) {
+      lastError = ws->lastError;
+      delete ws;
+      return false;
+    }
   }
 
   // speech.config
-  String ts = jsDate();
+  ts = jsDate();
   String cfgmsg = "X-Timestamp:" + ts + "\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n"
     "{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"},"
     "\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}";
-  if (!ws.sendText(cfgmsg)) { lastError = "发送 speech.config 失败"; ws.stop(); return false; }
+  if (!ws->sendText(cfgmsg)) { lastError = "发送 speech.config 失败"; ws->stop(); delete ws; return false; }
 
   // SSML
   String esc;
@@ -221,7 +276,7 @@ bool EdgeTts::speak(const String& text, const String& voice, const String& rate,
     "Z\r\nPath:ssml\r\n\r\n<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='zh-CN'>"
     "<voice name='" + voice + "'><prosody pitch='+0Hz' rate='" + rate + "' volume='+0%'>" + esc +
     "</prosody></voice></speak>";
-  if (!ws.sendText(ssml)) { lastError = "发送 SSML 失败"; ws.stop(); return false; }
+  if (!ws->sendText(ssml)) { lastError = "发送 SSML 失败"; ws->stop(); delete ws; return false; }
 
   // 收音频：流式——到一个块喂一块，喂后立刻解码播放（首帧 ~100ms 出声，小智式流水线）
   mp3StreamReset();
@@ -230,15 +285,15 @@ bool EdgeTts::speak(const String& text, const String& voice, const String& rate,
   uint32_t lastProgress = millis();          // 收到音频/文本就续期：30s 只限制"无进展空闲"
   while (!turnEnd) {
     if (millis() - lastProgress > 30000) { lastError = "30s 无进展超时"; break; }
-    int fr = ws.poll(3000);
+    int fr = ws->poll(3000);
     if (fr < 0) { lastError = "连接中断"; break; }
     if (fr == 0) continue;
     if (fr == 1) {
       lastProgress = millis();
-      if (ws.textPayload().indexOf("Path:turn.end") >= 0) turnEnd = true;
+      if (ws->textPayload().indexOf("Path:turn.end") >= 0) turnEnd = true;
     } else {
-      const uint8_t* d = ws.binPayload();
-      size_t n = ws.binLen();
+      const uint8_t* d = ws->binPayload();
+      size_t n = ws->binLen();
       if (n < 2) continue;
       size_t hdrLen = ((size_t)d[0] << 8) | d[1];
       if (hdrLen + 2 > n) continue;
@@ -249,7 +304,7 @@ bool EdgeTts::speak(const String& text, const String& voice, const String& rate,
       if (audio.interrupted()) break;
     }
   }
-  ws.stop();
+  ws->stop(); delete ws;
   if (!audioRecv) {
     Serial.printf("[TTS] 没解出音频：收到 %uB / 解码 %u 帧（%s）\n",
                   (unsigned)s_ttsBytes, (unsigned)s_ttsFrames,

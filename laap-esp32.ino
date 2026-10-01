@@ -595,6 +595,13 @@ static void llmTaskFunc(void*) {
     { char bb[24]; snprintf(bb, sizeof(bb), "llmtask:%c go",
                             (req->kind < 13) ? "CEMoRrlmDLSit"[req->kind] : '?');
       laapBlackBox(bb); }   // v3.65 黑匣子：后台网络作业开始（TLS/搜索/视觉都在这）
+    // v3.74 TTS 连接预取：聊天要说话——LLM 生成的几秒里并行完成 TTS 的 WS-TLS 握手，
+    // 首句入队时连接已热（speak 收养省 ~0.5s）。独立小任务跑（握手阻塞数秒不能占 llmTask）
+    if (req->kind == LK_CHAT) {
+      if (xTaskCreate([](void*) { edgeTts.preconnect(); vTaskDelete(nullptr); },
+                      "ttspre", 12288, nullptr, 1, nullptr) != pdPASS)
+        edgeTts.preconnect();               // 建任务失败：退化为本任务内同步预取
+    }
     if (req->kind == LK_MONO) {
       rr = monologueGenerate();                  // 多步流水线也在后台跑
     } else if (req->kind == LK_LOOK) {

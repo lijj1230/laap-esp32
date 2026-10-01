@@ -13,6 +13,9 @@ public:
   // 成功播放返回 true。interruptible: 播放期间允许能量门打断
   // 默认 false：泄漏基线 ×1.9 的能量门会被语音自身的动态范围误触发，把 TTS 砍成"无声成功"
   bool speak(const String& text, const String& voice, const String& rate, bool interruptible = false);
+  // v3.74 连接预取：提前完成 WS-TLS 握手（LLM 吐字期间并行），speak 优先收养省 ~0.5s。
+  // 可在任意任务语境调用（内部自带互斥与竞态处置）；失败静默（speak 照旧现场握手）。
+  void preconnect();
   String lastError;
 };
 
