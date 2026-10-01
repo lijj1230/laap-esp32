@@ -52,25 +52,33 @@ static void onWakeEvent(void* arg, sr_event_t event, int command_id, int phrase_
 }
 
 bool LaapWake::begin() {
-  if (_active) return true;
+  if (_running) return true;   // 已在跑（_active 只表示"引擎可用过"，拆掉后要完整重启）
+  uint32_t h0 = ESP.getFreeHeap();
+  uint32_t m0 = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   // SR_MODE_WAKEWORD：只用唤醒词检测（不用 MultiNet 命令词，语义对话交给云端 LLM）
   // 数据格式 "M"=单通道麦克风；我们的 pump 是 48k 单声道流，降采样后正好 16k
   esp_err_t err = sr_start(wakeFillCb, nullptr,
                            SR_CHANNELS_MONO, SR_MODE_WAKEWORD, "M",
                            nullptr, 0,
                            onWakeEvent, nullptr);
+  uint32_t h1 = ESP.getFreeHeap();
+  uint32_t m1 = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  Serial.printf("[WAKE] sr_start 堆账：free %u→%u（差 %d）最大块 %u→%u（差 %d）\n",
+                h0, h1, (int)(h0 - h1), m0, m1, (int)(m0 - m1));
   if (err != ESP_OK) {
     Serial.printf("[WAKE] sr_start 失败 err=%d（退回 VAD 模式）\n", (int)err);
     return false;
   }
   _active = true;
+  _running = true;
   Serial.println("[WAKE] 唤醒词引擎就绪（wn9_hiesp「Hi ESP」）");
   return true;
 }
 
 void LaapWake::end() {
   if (!_active) return;
-  sr_stop();
+  if (_running) sr_stop();
+  _running = false;
   _active = false;
   s_rbW = s_rbR = 0;
   Serial.println("[WAKE] 唤醒词引擎停止");
@@ -92,7 +100,32 @@ void LaapWake::onWakeword() {
   Serial.println("[WAKE] 唤醒词命中（Hi ESP）");
 }
 
-bool LaapWake::consumeWakeup() {
+// ---- 窗口模式（v3.75c） ----
+void LaapWake::setWindow(bool on) {
+  if (on) {
+    if (_running) return;
+    begin();                 // 开窗即建（失败下次 setWindow(true) 再试）
+  } else if (_running) {
+    sr_stop();               // 关窗让路：47KB 全额释放
+    _running = false;
+    s_rbW = s_rbR = 0;
+    Serial.println("[WAKE] 窗口关闭，引擎让路");
+  }
+}
+
+void LaapWake::idleTick() {
+  if (_running) {
+    // 堆护栏：窗口内若最大块跌破 28KB（打盹线 24KB 之上）→ 立即让路（窗口照旧，
+    // 只是不再跑引擎）。wakenet9 与本固件共存就是紧，绝不把系统拖进打盹
+    uint32_t maxBlk = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (maxBlk < 28000) {
+      sr_stop();
+      _running = false;
+      s_rbW = s_rbR = 0;
+      Serial.printf("[WAKE] 堆护栏触发（最大块 %uB<28KB），引擎让路\n", (unsigned)maxBlk);
+    }
+  }
+}bool LaapWake::consumeWakeup() {
   if (!_wakeFlag) return false;
   _wakeFlag = false;
   return true;

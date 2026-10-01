@@ -35,11 +35,19 @@ public:
   // 唤醒计数（诊断误唤醒频率）
   uint32_t wakeCount() const { return _wakeCount; }
 
+  // ---- 窗口模式（v3.75c 定案）：wakenet9 常驻 47KB 与本固件共存放不下
+  // （建引擎后最大块 3.5KB，堆护栏每次必触发）。改为按键/唤醒后窗口期在线：
+  // 人在设备旁刚交互完，最可能连续语音；窗口关闭时引擎全额释放 47KB
+  void setWindow(bool on);         // true=开窗（立即建引擎），false=关窗（让路）
+  bool running() const { return _running; }
+  void idleTick();                 // 主循环调用：堆护栏守护（窗口内堆不够时让路）
+
   // 事件回调桥（laap_wake.cpp 实现，由 ESP_SR 的 C 回调转发）
   void onWakeword();
 
 private:
-  bool _active = false;
+  bool _active = false;          // begin() 成功过（引擎可用）
+  bool _running = false;         // 当前 sr 在跑
   volatile bool _wakeFlag = false;
   uint32_t _wakeCount = 0;
 };

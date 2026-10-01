@@ -109,11 +109,19 @@ bool LaapAudio::begin() {
   _ok = spkOk;                                 // 麦克风缺失不阻塞 TTS
   Serial.printf("[AUD] I2S ok spk=%d mic=%d\n", spkOk, micOk);
 
-  // ---- AEC（v3.75 全双工打断的心脏）：16k 单麦+单参考，低耗档，PSRAM 不占内部堆 ----
+  // ---- AEC（v3.75 全双工打断的心脏）：16k 单麦+单参考，低耗档 ----
+  // 缓冲走 PSRAM（v3.75b：默认内部堆分配曾把 heap 压到 3KB/最大块 1KB → 每分钟自愈打盹）
   // 失败只降级回"播放不收麦"（v3.74 前的旧行为），不阻塞启动
   _aec = false;
   if (micOk) {
-    _aecHandle = aec_create(16000, 4, 1, AEC_MODE_SR_LOW_COST);
+    aec_config_t ac = {};
+    ac.mic_num = 1; ac.ref_num = 1; ac.out_num = 1;
+    ac.filter_length = 4;
+    ac.sample_rate = 16000;
+    ac.caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;    // 关键：AEC 工作缓冲路由 PSRAM
+    ac.mode = AEC_MODE_SR_LOW_COST;
+    ac.nlp_level = AEC_NLP_LEVEL_AGGR;
+    _aecHandle = aec_create_from_config(&ac);
     if (_aecHandle) {
       _aecChunk = aec_get_chunksize((aec_handle_t*)_aecHandle);   // 实际帧大小（应=160）
       _aecRef48 = (int16_t*)heap_caps_malloc(480 * 8 * 2, MALLOC_CAP_SPIRAM);   // 80ms@48k

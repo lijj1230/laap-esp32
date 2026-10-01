@@ -48,6 +48,9 @@
 #include "laap_r0.h"        // R0 微型循环处理器（ESN 世界预测，误差回注好奇）
 #include "laap_tlsheap.h"   // mbedtls 分配器钩子（TLS 大块路由 PSRAM，v3.55）
 #include "laap_wake.h"      // 本地唤醒词（esp-sr wakenet9，v3.75 阶段四）
+#if defined(LAAP_WAKEWORD_AVAILABLE)
+static uint32_t g_wakeWindowMs = 0;   // 唤醒词窗口开启时刻（BOOT 按下瞬间置位，0=关）
+#endif
 
 // ---------- 全局（定义在各模块 .cpp，头文件已 extern） ----------
 
@@ -2462,12 +2465,11 @@ void setup() {
 
   voice.begin();   // 音频管线 + 编解码器 + VAD 校准
 #if defined(LAAP_WAKEWORD_AVAILABLE)
-  // v3.75 本地唤醒词：esp-sr model 分区里有 wn9_hiesp 才会成功（esp_sr_16 分区表）。
-  // 失败自动退回 VAD 模式（无唤醒词引擎，行为与 v3.74 一致）
+  // v3.75 本地唤醒词（窗口模式，v3.75c 定案）：wakenet9 常驻 47KB 与本固件放不下，
+  // 改为 BOOT 按键后 90s 窗口期在线——人在设备旁刚交互完，说「Hi ESP」免按键续聊。
+  // 窗口外引擎全额让路（堆护栏兜底）。srmodels 由 esp_sr_16 分区表提供
   audio.setWakeFeed([](const int16_t* s, size_t n) { laapWake.feed(s, n); });
-  laapWake.begin();
-  Serial.printf("[LAAP] 唤醒词 %s（累计命中 %u）\n",
-                laapWake.active() ? "启用「Hi ESP」" : "不可用→VAD 模式", laapWake.wakeCount());
+  Serial.println("[LAAP] 唤醒词「Hi ESP」窗口模式（BOOT 按下后 90s 内可用）");
 #endif
   laapNetInit();   // 显式建网络互斥锁（懒创建 check-then-create 在两任务同进时有竞态）
   metrics.loadPrev();  // 读回上一段会话的指标快照（崩溃/自愈重启的事故现场不丢）
@@ -2634,18 +2636,20 @@ void loop() {
   voice.loopTick();   // VAD 自动聆听模式
 
 #if defined(LAAP_WAKEWORD_AVAILABLE)
-  // v3.75 唤醒词事件消费：说「Hi ESP」→ 立即开新对话。
-  // ① 播报中：voice.speak 的 AEC 打断正在播放的音频（audio.interrupt()），
-  //    说完半截算成功，随后 converse() 直接听新指令
-  // ② 空闲/冷却：直接 converse()（manualOnce 授权绕过软件唤醒词门——本地唤醒词本身就是门）
-  if (laapWake.consumeWakeup()) {
-    laapActivity();
-    if (voice.speaking()) {
-      Serial.println("[WAKE] 播报中被打断 → 听新指令");
-      audio.forceInterrupt();
+  // v3.75 唤醒词窗口模式（v3.75c 定案）：wakenet9 常驻 47KB 与本固件共存放不下
+  // （实测建引擎后最大块 3.5KB，堆护栏每次都触发）——改为"交互窗口"模式：
+  // 按键后 90s 内引擎在线（人在设备旁刚交互完，最可能连续语音），超时让路
+  {
+    bool inWindow = g_wakeWindowMs && (millis() - g_wakeWindowMs < 90000);
+    laapWake.setWindow(inWindow);
+    laapWake.idleTick();
+    if (laapWake.consumeWakeup()) {                        // 窗口内的唤醒 → 新对话
+      g_wakeWindowMs = millis();                           // 唤醒命中续窗
+      laapActivity();
+      if (voice.speaking()) audio.forceInterrupt();
+      laapVoiceSetManualOnce();
+      voice.converse();
     }
-    laapVoiceSetManualOnce();
-    voice.converse();
   }
 #endif
   laapBBPhase(5);
@@ -2742,6 +2746,9 @@ void loop() {
       xTaskCreate([](void*) { asr.warmup(); vTaskDelete(nullptr); },
                   "asrwarm", 12288, nullptr, 1, nullptr);
     }
+#if defined(LAAP_WAKEWORD_AVAILABLE)
+    g_wakeWindowMs = millis();   // v3.75c：按键瞬间开唤醒词窗（90s）
+#endif
   }
   if (!pressed && g_btnDown > 0) {
     uint32_t held = millis() - g_btnDown;

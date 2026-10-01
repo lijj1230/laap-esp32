@@ -91,7 +91,17 @@ void LaapVoice::speak(const String& text, const char* expr) {
   }
 }
 
+bool LaapVoice::isListening() const { return _listening; }
+
 bool LaapVoice::listenAndTranscribe(String& heard) {
+  heard = "";
+  _listening = true;
+  bool ok = listenAndTranscribeInner(heard);
+  _listening = false;
+  return ok;
+}
+
+bool LaapVoice::listenAndTranscribeInner(String& heard) {
   heard = "";
   if (!audio.micOk) { lastError = "无麦克风"; return false; }
   Serial.printf("[VOICE] 请说…（说完 %u ms 无声收音，最多 12s）\n", audio.vadStopMs());

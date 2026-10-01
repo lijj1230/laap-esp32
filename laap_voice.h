@@ -46,9 +46,13 @@ public:
   void setVadPaused(bool paused);
   // 正在播报中（唤醒词打断路径用：判定是否需要掐断 TTS）
   bool speaking() const { return _busy; }
+  // 正在录音听写（唤醒词忙期判定用；实现在 cpp——audio 全局不进头文件）
+  bool isListening() const;
 
 private:
-  bool listenAndTranscribe(String& heard);
+  bool listenAndTranscribe(String& heard);        // 包装：置/清 _listening
+  bool listenAndTranscribeInner(String& heard);   // 原实现
+  bool _listening = false;   // 录音听写进行中（isListening 的后端）
   bool _ready = false;
   bool _busy = false;
   uint32_t _cooldownMs = 0;   // 播报后冷却截止时刻，避免自听见
