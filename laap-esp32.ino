@@ -302,6 +302,26 @@ static String g_resLookErr;
 static String g_resUserText;                          // 随结果发布的"当时主人问了什么"
 static uint32_t g_resChatStartMs = 0;                 // 同代端到端计时起点
 static uint32_t g_resLookStartMs = 0;
+// v3.70 流式播报：LLM 任务解析 SSE 成句推入队列（首句 0.5~1s），loop 逐句播放；
+// g_resStreamSpoke 随结果同代发布——收割侧据此跳过整段重播（否则同一句话会念两遍）
+static QueueHandle_t g_sayQueue = nullptr;            // 元素=char*（malloc，播完 free）
+static volatile uint8_t g_streamSayCount = 0;         // 本轮流式已入队句数（llmTask 写）
+static volatile bool g_resStreamSpoke = false;        // 同代发布：本轮已流式播报过
+
+// v3.70 流式成句回调（在 LLM 任务语境同步执行）：只做 malloc+入队，绝不阻塞——
+// 队列满宁可丢这句也不拖慢 SSE 流（文字侧仍完整）。播放由 loop 的 drain 负责。
+static void laapStreamSayPush(const String& sentence, void* ctx) {
+  (void)ctx;
+  if (!g_sayQueue || sentence.length() < 2) return;
+  char* p = (char*)malloc(sentence.length() + 1);
+  if (!p) return;
+  memcpy(p, sentence.c_str(), sentence.length() + 1);
+  if (xQueueSend(g_sayQueue, &p, 0) != pdTRUE) { free(p); return; }
+  if (g_streamSayCount == 0)
+    Serial.printf("[LLM·流] 首句 %uB 已入播报队列（距提问 %lums）\n",
+                  (unsigned)sentence.length(), (unsigned long)(millis() - g_chatStartMs));
+  if (g_streamSayCount < 255) g_streamSayCount++;
+}
 static uint32_t g_lookStartMs = 0;                    // 视觉受理时刻（rspDir 口径）
 static uint8_t g_llmFailStreak = 0;                   // LLM 连续失败次数（≥2 独白让路）
 // 后台 LLM 是否在飞（含独白/反思/整理——多步流水线一跑就是几十秒）。
@@ -606,12 +626,21 @@ static void llmTaskFunc(void*) {
           req->nm++;
         }
       }
-      rr = llm.chatMsgs(req->msgs, req->nm, req->maxTokens, req->temperature);
+      if (req->kind == LK_CHAT) {
+        // v3.70 流式：成句即推播报队列（首句 0.5~1s 出声）；拿不到正文自动回退非流式。
+        // 独白/表达/反思等保持整段契约（三候选仲裁、预期尾行解析都依赖全文）
+        g_streamSayCount = 0;
+        rr = llm.chatMsgsStream(req->msgs, req->nm, req->maxTokens, req->temperature,
+                                laapStreamSayPush, nullptr, true);
+      } else {
+        rr = llm.chatMsgs(req->msgs, req->nm, req->maxTokens, req->temperature);
+      }
     }
     g_resSearchState = g_chatSearchState; g_resSearchErr = g_chatSearchErr;
     g_resLookState = g_chatLookState;     g_resLookErr = g_chatLookErr;
     g_resUserText = g_pendingUserText;
     g_resChatStartMs = g_chatStartMs; g_resLookStartMs = g_lookStartMs;
+    g_resStreamSpoke = (g_streamSayCount > 0 && rr.ok && rr.say.length() > 0);   // v3.70 同代发布
     g_resultKind = req->kind;
     g_llmResult = rr;
     laapBlackBox("llmtask:done");   // v3.65 黑匣子
@@ -1140,7 +1169,13 @@ void llmHarvest() {
   Serial.printf(kind == LK_EXPRESS ? "[Aris·自发] %s\n" : "[Aris] %s\n", say.c_str());
   display.drawNeeds(mind.needs().energy, mind.needs().curiosity, mind.needs().social,
                     mind.needs().security, mind.needs().expression);
-  voice.speak(say, g_lastExpr.c_str());
+  if (kind == LK_CHAT && g_resStreamSpoke) {
+    // v3.70：本轮聊天已流式逐句播报（首句早就出声了）——这里不再整段重播
+    g_replySpoken = true;
+    Serial.printf("[VOICE·流] 整段已流式播报，跳过重播（末句队列播完后自然收尾）\n");
+  } else {
+    voice.speak(say, g_lastExpr.c_str());
+  }
   maybeTeachExtract();     // 这轮聊天若是教技能句式，LLM 空出来了 → 后台提取口令技能
 }
 
@@ -2456,6 +2491,7 @@ void setup() {
   // F4: LLM 后台任务（核 1，栈 12KB —— TLS+String 操作吃栈）
   g_llmQueue = xQueueCreate(2, sizeof(LlmRequest*));
   if (g_llmQueue) xTaskCreatePinnedToCore(llmTaskFunc, "llm", 12288, nullptr, 1, nullptr, 1);
+  g_sayQueue = xQueueCreate(16, sizeof(char*));   // v3.70 流式成句播报队列（16 句≈整段上限）
 
   if (firstBreath) {
     arisExpress(true, "birth");
@@ -2541,6 +2577,19 @@ void touchGestures() {
   }
 }
 
+// v3.70 流式播报 drain：每轮 loop 最多播 1 句（播放阻塞 ~0.5-3s，句间回到 loop 处理网页/触觉，
+// 间隙 ~10ms≈自然换气）。播完清空队列自然收尾；播报守卫（栈/堆）都在 voice.speak 内复用。
+static void laapStreamSayDrain() {
+  if (!g_sayQueue) return;
+  char* p = nullptr;
+  if (xQueueReceive(g_sayQueue, &p, 0) != pdTRUE || !p) return;
+  String s(p); free(p);
+  Serial.printf("[VOICE·流] 播报（%u 字）\n", (unsigned)s.length());
+  display.drawFace(mind.moodKey(), true);
+  voice.speak(s, mind.moodKey());
+  laapActivity();
+}
+
 void loop() {
   laapBBPhase(0);
   webui.handleClient();
@@ -2571,6 +2620,7 @@ void loop() {
   audio.paTick();     // 功放空闲关断（流式播放间隔中保持开启）
   laapBBPhase(6);
   llmHarvest();       // F4: 收割后台 LLM 结果
+  laapStreamSayDrain();   // v3.70 流式：把 LLM 任务推来的成句逐句播报（首句 0.5~1s 出声）
   laapBBPhase(7);
   touchGestures();    // F5: 摇晃/翻面触觉（每帧，内部自带节流）
 

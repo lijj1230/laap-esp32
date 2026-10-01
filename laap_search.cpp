@@ -304,7 +304,10 @@ String LaapSearch::search(const String& query, int maxHit, int maxLen) {
   if (!laapNetLock()) { lastError = "搜索正忙（后台独白占用）"; return ""; }
   String r = searchLocked(query, maxHit, maxLen);
   laapNetUnlock();
-  return r;
+  // v3.71 边界消毒：中文站点多为 GBK/GB18030，网页字节会伪装成合法 UTF-8 结构
+  // （如 EF BF BE=U+FFFE 非字符）——曾被大模型 API 整包 400（invalid unicode）
+  // 并污染记忆文件。所有搜索出口一律严格清洗（本行是新毒的唯一写入口）。
+  return r.length() ? sanitizeUtf8(r) : r;
 }
 
 String LaapSearch::searchLocked(const String& query, int maxHit, int maxLen) {

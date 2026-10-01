@@ -24,6 +24,10 @@ struct LlmMsg {
   String content;
 };
 
+// v3.70 流式回调：SSE 正文每凑满一句可播报的句子时同步回调（在 LLM 任务语境）——
+// 回调里只做入队等轻操作，禁止网络/播放/长阻塞。sentence 已 trim、≥4 字节。
+typedef void (*LlmSentenceCb)(const String& sentence, void* ctx);
+
 class LlmClient {
 public:
   LlmReply chat(const String& systemPrompt, const String& userPrompt,
@@ -31,9 +35,15 @@ public:
   // 多轮版本（自发独白/搜索追问用）：roles 必须以 system 开头
   LlmReply chatMsgs(const LlmMsg* msgs, int count,
                     int maxTokens = 200, float temperature = 0.9f);
+  // v3.70 流式（SSE）：正文增量接收 + 句子级回调——首句 0.5~1s 即可开始 TTS（对话提速核心）。
+  // skipFirstLine=true 时首行（情绪词）不外播；流式拿不到任何正文时自行回退非流式一次。
+  LlmReply chatMsgsStream(const LlmMsg* msgs, int count, int maxTokens, float temperature,
+                          LlmSentenceCb cb, void* ctx, bool skipFirstLine = true);
   // 内部：带剩余续写深度的多轮请求（depth=0 不再续；chatMsgs 按 cfg.s.llmContinue 初始化）
+  // v3.70：cb 非空时走流式路径；续写/回退调用一律 cb=nullptr（保持原契约）
   LlmReply chatMsgsContinue(const LlmMsg* msgs, int count,
-                            int maxTokens, float temperature, int depth);
+                            int maxTokens, float temperature, int depth,
+                            LlmSentenceCb cb = nullptr, void* ctx = nullptr, bool skipFirstLine = true);
   // 后台"测试连接"用
   bool ping(String& reply);
   String lastError;

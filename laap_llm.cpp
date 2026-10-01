@@ -256,6 +256,96 @@ bool laapHttpRead(WiFiClient* c, uint32_t timeoutMs, String& hdrs, String& paylo
   return framedDone && !srvClose;
 }
 
+// ---- v3.70 流式 SSE 读取（对话提速核心）：逐 data: 行解析 delta.content 增量，
+// 边收边按句切分，成句立即回调（调用方入播报队列 → TTS 流水线，首句 0.5~1s 出声）。
+// skipFirstLine=true：首行（情绪词 happy/curious/…）整段跳过不外播，等出现 '\n' 才切句。
+// 返回 true=收到 [DONE]（正常流尾）；false=超时/断连（调用方按 gotAny 决定用已收内容或回退）。
+static bool readSseStream(WiFiClient* c, uint32_t timeoutMs, int maxBody, String& out,
+                          LlmSentenceCb cb, void* ctx, bool skipFirstLine, bool& gotAny) {
+  gotAny = false;
+  uint32_t t0 = millis();
+  String hdrs; hdrs.reserve(1024);
+  while (millis() - t0 < timeoutMs) {                  // 头阶段：与 laapHttpRead 同读法
+    int ch = c->read();
+    if (ch < 0) { if (!c->connected()) return false; delay(2); continue; }
+    hdrs += (char)ch;
+    if (hdrs.endsWith("\r\n\r\n")) break;
+    if (hdrs.length() > 8192) return false;
+  }
+  if (!hdrs.endsWith("\r\n\r\n")) return false;
+  { int sp = hdrs.indexOf(' ');                        // 非 200：错误体是 JSON，交调用方回退非流式拿 message
+    if (sp <= 0 || hdrs.substring(sp + 1, sp + 4).toInt() != 200) return false; }
+
+  out = ""; out.reserve(4096);
+  String line; line.reserve(768);
+  size_t spokenUpTo = 0;                               // 已外播水位（out 内偏移）
+  int emoCut = skipFirstLine ? -1 : 0;                 // -1=情绪行未结束；0=无需跳过
+  bool sawDone = false;
+  while (!sawDone && millis() - t0 < timeoutMs) {
+    int ch = c->read();
+    if (ch < 0) { if (!c->connected()) break; delay(2); continue; }
+    if (ch != '\n') { if (line.length() < 4096) line += (char)ch; continue; }
+    String ln = line; line = "";
+    ln.trim();                                         // 行尾 \r 一并去掉
+    if (!ln.startsWith("data:")) continue;             // 注释/event:/空行忽略
+    String d = ln.substring(5); d.trim();
+    if (d == "[DONE]") { sawDone = true; break; }
+    String piece;
+    if (!LlmClient::extractStringField(d, "content", piece) || !piece.length()) continue;
+    gotAny = true;
+    out += piece;
+    if ((int)out.length() > maxBody) break;
+    if (emoCut < 0) {
+      // 情绪行结束判定放宽：模型常把表情词与正文连写（"curious。章鱼有三个心脏…"），
+      // 换行不存在时就找"首个英文情绪词后紧跟的中日标点/空白"作为切点
+      static const char* kEmo[] = {"happy","curious","excited","lonely","anxious","tired","calm"};
+      int head = 0; while (head < (int)out.length() && (out[head]==' '||out[head]=='\r')) head++;
+      bool emoHead = false;
+      for (auto w : kEmo) {
+        int wl = strlen(w);
+        if (out.length() >= (unsigned)(head + wl)) {
+          String h2 = out.substring(head, head + wl); h2.toLowerCase();
+          if (h2 == w) { emoHead = true; head += wl; break; }
+        }
+      }
+      if (emoHead) {
+        while (head < (int)out.length() &&
+               (out[head]==' '||out[head]=='\r'||out[head]=='。'||out[head]=='，'||
+                out[head]=='.'||out[head]==','||out[head]=='\n')) head++;
+        emoCut = head;                                  // 正文从标点串之后开始
+      } else {
+        int nl = out.indexOf('\n');
+        emoCut = (nl >= 0) ? nl + 1 : 0;                // 无情绪词：从首个换行后/全文起
+      }
+    }
+    if ((int)spokenUpTo < emoCut) spokenUpTo = emoCut;  // 情绪段永不外播
+    if (emoCut < 0) continue;                          // 情绪行还没结束：先不切句（防把 happy 念出来）
+    while ((int)spokenUpTo < (int)out.length()) {
+      int start = (int)spokenUpTo;
+      int end = -1;
+      for (int i = start; i < (int)out.length(); i++) {
+        char c2 = out[i];
+        if (c2 == '\n' || c2 == '。' || c2 == '！' || c2 == '？' ||
+            c2 == '!' || c2 == '?' || c2 == '；' || c2 == ';') { end = i + 1; break; }
+      }
+      if (end < 0 && (int)out.length() - start >= 90) {  // 长句不等句末符：90 字节强制切（退到字符边界）
+        int cut = start + 90;
+        while (cut > start && ((unsigned char)out[cut] & 0xC0) == 0x80) cut--;
+        end = cut;
+      }
+      if (end < 0) break;                              // 等更多增量
+      String s = out.substring(start, end); s.trim();
+      spokenUpTo = end;
+      if (s.length() >= 4 && cb) cb(s, ctx);
+    }
+  }
+  if (cb && (int)spokenUpTo < (int)out.length()) {     // 流尾残余（无句末符的收尾句）
+    String s = out.substring((int)spokenUpTo); s.trim();
+    if (s.length() >= 4) cb(s, ctx);
+  }
+  return sawDone;
+}
+
 LlmReply LlmClient::chat(const String& systemPrompt, const String& userPrompt,
                           int maxTokens, float temperature) {
   LlmMsg msgs[2] = { {"system", systemPrompt}, {"user", userPrompt} };
@@ -268,9 +358,17 @@ LlmReply LlmClient::chatMsgs(const LlmMsg* msgs, int count,
   return chatMsgsContinue(msgs, count, maxTokens, temperature, maxCont);
 }
 
+LlmReply LlmClient::chatMsgsStream(const LlmMsg* msgs, int count, int maxTokens,
+                                   float temperature, LlmSentenceCb cb, void* ctx,
+                                   bool skipFirstLine) {
+  int maxCont = cfg.s.llmContinue > 3 ? 3 : cfg.s.llmContinue;
+  return chatMsgsContinue(msgs, count, maxTokens, temperature, maxCont, cb, ctx, skipFirstLine);
+}
+
 // depth=剩余可续写轮数（0=不再续）
 LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
-                                      int maxTokens, float temperature, int depth) {
+                                      int maxTokens, float temperature, int depth,
+                                      LlmSentenceCb cb, void* ctx, bool skipFirstLine) {
   LlmReply r;
   if (String(cfg.s.llmKey).length() == 0) { lastError = "API Key 未配置"; return r; }
   // 内存碎片：TLS 握手要一块连续内存，只看"总空闲"会被碎片骗（实测 heap 75KB、
@@ -304,7 +402,8 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
     body += String("{\"role\":\"") + msgs[i].role + "\",\"content\":\"" + jsonEscape(msgs[i].content) + "\"}";
   }
   body += String("],\"max_tokens\":") + maxTokens +
-    ",\"temperature\":" + String(temperature, 2) + ",\"stream\":false";
+    ",\"temperature\":" + String(temperature, 2) +
+    ",\"stream\":" + (cb ? "true" : "false");   // v3.70：流式路径要求服务端 SSE
   // 关掉思考：思考型模型（v4 系）在这些短任务上会把预算全花在推理上、正文返回空
   // （实测 60~1600 token 都可能拿到 content=""），关掉后既快又稳。
   // 不认这个字段的服务商一般忽略它；若报 400 就在设置页关掉这个开关。
@@ -347,42 +446,73 @@ LlmReply LlmClient::chatMsgsContinue(const LlmMsg* msgs, int count,
     return r;
   }
 
-  String hdrs, payload;
-  bool clean = laapHttpRead(client, 30000, hdrs, payload, 40000);
-  connFinish(s_chatConn, client, clean, host, port, useTls);
-  if (!clean) Serial.println("[LLM] 连接未按帧干净结束，已丢弃");
-
-  int sp = hdrs.indexOf(' ');
-  r.httpStatus = (sp > 0) ? hdrs.substring(sp + 1, sp + 4).toInt() : 0;
-
-  String content;
-  if (r.httpStatus != 200) {
-    String emsg;
-    if (extractStringField(payload, "message", emsg)) lastError = "HTTP " + String(r.httpStatus) + ": " + emsg;
-    else {
-      // 服务商报错形状五花八门（error.message / error.code / 纯文本），
-      // 解析不到 message 就带一段响应体原文——"HTTP 400" 三个字排查不了任何问题
-      lastError = "HTTP " + String(r.httpStatus);
-      String snip = payload; snip.trim();
-      if (snip.length()) lastError += "｜" + snip.substring(0, 160);
+  String hdrs, payload, content;
+  if (cb) {
+    // ---- v3.70 流式路径：SSE 增量 + 句子级回调（首句即成句入播报队列） ----
+    bool gotAny = false;
+    bool fin = readSseStream(client, 60000, 40000, content, cb, ctx, skipFirstLine, gotAny);
+    // 流式帧尾结构因商而异：连接一律不复用（新建握手 1~2s 藏在下轮生成时间里）
+    connFinish(s_chatConn, client, false, host, port, useTls);
+    if (!gotAny) {
+      // 一点正文都没收到（非 200/协议不符/断连）：回退非流式一次（拿真实错误/正常答复）
+      Serial.println("[LLM·流] 流式无数据 → 回退非流式");
+      lastError = "";
+      return chatMsgsContinue(msgs, count, maxTokens, temperature, depth > 0 ? depth - 1 : 0);
     }
-    // 400 且开着"关闭思考"：多半是这家服务商不认 thinking 字段 → 直接告诉用户怎么关
-    if (r.httpStatus == 400 && cfg.s.llmNoThink)
-      lastError += "（若报未知参数，请在设置页关掉「关闭模型思考」）";
-    return r;
-  }
-  if (!extractStringField(payload, "content", content)) {
-    lastError = "响应无 content";
-    // 诊断：思考模型（v4 系列默认思考）可能把正文放 reasoning_content，
-    // 把原始响应头打出来，便于判断"答非所问/空回复"是模型侧还是解析侧
-    Serial.printf("[LLM] 响应无 content，payload 头: %.200s\n", payload.c_str());
-    return r;
-  }
+    if (!fin) Serial.println("[LLM·流] 流式提前结束（按已收内容继续）");
+    content.trim();
+    if (!content.length()) { lastError = "流式无正文"; return r; }
+    r.httpStatus = 200;
+    {   // 原文取证（与整段路径同口径）
+      String fin0; fin0 = fin ? "stop" : "cut";
+      Serial.printf("[LLM·流] 原文(finish=%s, 流式): %.160s\n", fin0.c_str(), content.c_str());
+    }
+  } else {
+    bool clean = laapHttpRead(client, 30000, hdrs, payload, 40000);
+    connFinish(s_chatConn, client, clean, host, port, useTls);
+    if (!clean) Serial.println("[LLM] 连接未按帧干净结束，已丢弃");
 
-  {   // 原文取证：判断"答非所问/截断/空回复"的第一现场
-    String fin;
-    extractStringField(payload, "finish_reason", fin);
-    Serial.printf("[LLM] 原文(finish=%s): %.160s\n", fin.c_str(), content.c_str());
+    int sp = hdrs.indexOf(' ');
+    r.httpStatus = (sp > 0) ? hdrs.substring(sp + 1, sp + 4).toInt() : 0;
+
+    if (r.httpStatus != 200) {
+      String emsg;
+      if (extractStringField(payload, "message", emsg)) lastError = "HTTP " + String(r.httpStatus) + ": " + emsg;
+      else {
+        // 服务商报错形状五花八门（error.message / error.code / 纯文本），
+        // 解析不到 message 就带一段响应体原文——"HTTP 400" 三个字排查不了任何问题
+        lastError = "HTTP " + String(r.httpStatus);
+        String snip = payload; snip.trim();
+        if (snip.length()) lastError += "｜" + snip.substring(0, 160);
+      }
+      // 400 且开着"关闭思考"：多半是这家服务商不认 thinking 字段 → 直接告诉用户怎么关
+      if (r.httpStatus == 400 && cfg.s.llmNoThink)
+        lastError += "（若报未知参数，请在设置页关掉「关闭模型思考」）";
+      // v3.71 诊断：invalid unicode 时把最后一条消息（本次提示词）整条 hex 打出，本地定位毒码点
+      if (r.httpStatus == 400 && payload.indexOf("invalid unicode") >= 0) {
+        const String& cc = msgs[count - 1].content;
+        Serial.printf("[LLM·400] 最后消息 %uB 全量 hex：\n", (unsigned)cc.length());
+        for (unsigned int i = 0; i < cc.length(); i++) {
+          Serial.printf("%02X", (unsigned char)cc[i]);
+          if (i % 32 == 31) Serial.println();
+        }
+        Serial.println();
+      }
+      return r;
+    }
+    if (!extractStringField(payload, "content", content)) {
+      lastError = "响应无 content";
+      // 诊断：思考模型（v4 系列默认思考）可能把正文放 reasoning_content，
+      // 把原始响应头打出来，便于判断"答非所问/空回复"是模型侧还是解析侧
+      Serial.printf("[LLM] 响应无 content，payload 头: %.200s\n", payload.c_str());
+      return r;
+    }
+
+    {   // 原文取证：判断"答非所问/截断/空回复"的第一现场
+      String fin;
+      extractStringField(payload, "finish_reason", fin);
+      Serial.printf("[LLM] 原文(finish=%s): %.160s\n", fin.c_str(), content.c_str());
+    }
   }
   // 空正文按失败处理：思考型模型（v4 系列默认开思考）会把 max_tokens 全花在思考上、
   // content 返回空串。旧代码当成功 → 网页拿到空白气泡、TTS 无话可说（实测 2026-09-26）
@@ -499,6 +629,9 @@ String utf8Cut(const String& s, int len) {
 // 但 0xC0/0xC1 首字节（过长编码）、代理区 ED A0-BF、>U+10FFFF（F5+）是任何解码器
 // 都拒收的——大模型 API 会整包 400「invalid unicode code point」，把聊天/表达全线
 // 打进本地兜底。结构校验必须 reject 这四类。
+// v3.71 再补一刀：**非字符码点**（U+FDD0~FDEF、各平面 U+FFFE/U+FFFF）结构合法但
+// 严格 JSON/Unicode 解析器同样拒收——GBK 0xEF 0xBF 0xBE 伪装成 U+FFFE 就是当时
+// 修完 v3.67 仍 400 的真凶。
 String sanitizeUtf8(const String& s) {
   String out; out.reserve(s.length());
   unsigned int i = 0;
@@ -515,12 +648,25 @@ String sanitizeUtf8(const String& s) {
     else if ((c & 0xF8) == 0xF0) { reject = true; need = 3; }       // F5-FF：>U+10FFFF / 非法
     else { i++; continue; }                       // 孤立续字节 / 非法首字节
     bool ok = !reject && (i + (unsigned)need < s.length());
+    unsigned cp = 0;
     for (int k = 1; ok && k <= need; k++)
       if (((uint8_t)s[i + k] & 0xC0) != 0x80) ok = false;
+    if (ok) {                                     // 解码码点：非字符/代理区整类拒收
+      cp = (unsigned)c & (unsigned)(0x7F >> (need == 0 ? 7 : need));
+      for (int k = 1; k <= need; k++) cp = (cp << 6) | ((unsigned)s[i + k] & 0x3F);
+      if (cp >= 0xFDD0 && cp <= 0xFDEF) ok = false;                       // 非字符区
+      if (cp >= 0xFFFE && (cp & 0xFFFF) >= 0xFFFE) ok = false;            // 各平面 FFFE/FFFF
+    }
     if (ok && need == 2 && (uint8_t)s[i] == 0xED && ((uint8_t)s[i+1] & 0xE0) == 0xA0) ok = false;  // 代理区
     if (ok && (uint8_t)s[i] == 0xF0 && ((uint8_t)s[i+1] & 0xE0) == 0x80) ok = false;  // 过长 4 字节
     if (ok && (uint8_t)s[i] == 0xF4 && (uint8_t)s[i+1] >= 0x90) ok = false;           // >U+10FFFF
-    if (!ok) { i++; continue; }                   // 丢弃该字节（截断序列的续字节下一轮同样被丢）
+    if (!ok) {
+      // v3.71c 关键修正：跳过**整个候选序列**（含续字节），绝不把 GBK 双字节的第二字节
+      // 留给下一轮当"合法序列的开头"重新组队——GBK(小)=CF B8 的 B8 与后随 GBK 首字节
+      // 组成 E? 形态假序列，正是"清了又毒"的根源。孤立续字节只需跳 1 字节，其余全跳 need+1。
+      i += (c >= 0x80 && c < 0xC2) ? 1 : (need + 1);
+      continue;
+    }
     for (int k = 0; k <= need; k++) out += s[i + k];
     i += need + 1;
   }

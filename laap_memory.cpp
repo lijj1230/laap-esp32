@@ -17,6 +17,26 @@ static const int  REL_MAX  = 40;
 static const char* EMB_PATH = "/mem/emb.bin";
 static const int   EMB_DIM  = 1024;
 
+// v3.71 全记忆文件净化：毒字节不止 episodes——relations/semantic/intents/rules/
+// skills/feedback 全都喂进提示词或夜间任务，且多为 v3.67 严格校验之前年代写入，
+// 藏着能骗过结构校验的非字符码点（U+FFFE 等）。逐一清洗，有变化才重写。
+static void repairTextFile(const char* path) {
+  File f = LittleFS.open(path, "r");
+  if (!f) return;
+  String all = f.readString();
+  f.close();
+  if (!all.length()) return;
+  String clean = sanitizeUtf8(all);
+  if (clean.length() == all.length()) return;      // 干净：不写盘
+  File w = LittleFS.open(String(path) + ".tmp", "w");
+  if (!w) { Serial.printf("[MEM] %s 净化写盘失败\n", path); return; }
+  w.print(clean);
+  w.close();
+  LittleFS.remove(path);
+  LittleFS.rename(String(path) + ".tmp", path);
+  Serial.printf("[MEM] %s 净化完成（%uB → %uB）\n", path, (unsigned)all.length(), (unsigned)clean.length());
+}
+
 bool MemorySystem::begin() {
   if (!LittleFS.begin(true)) return false;
   LittleFS.mkdir("/mem");
@@ -104,6 +124,12 @@ bool MemorySystem::begin() {
   if (_embCount != (uint32_t)_count) {          // 行数不齐（淘汰/损坏）→ 缓存作废重嵌
     LittleFS.remove(EMB_PATH);
     _embCount = 0;
+  }
+  {   // v3.71：episodes 之外的记忆文件一并净化（顺序在 reloadWork/各模块缓存加载之前）
+    static const char* kRepairPaths[] = {
+      "/mem/semantic.txt", "/mem/relations.jsonl", "/mem/intents.txt",
+      "/mem/rules.txt", "/mem/skills.txt", "/mem/feedback.jsonl" };
+    for (auto p : kRepairPaths) repairTextFile(p);
   }
   reloadWork();   // 从盘上末段重建工作记忆环：否则重启后 recentContext 为空，
                   // 夜间反思会因为"没素材"跳过、聊天也丢了最近几轮上下文
