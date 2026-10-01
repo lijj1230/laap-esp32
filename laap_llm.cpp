@@ -315,7 +315,12 @@ static bool readSseStream(WiFiClient* c, uint32_t timeoutMs, int maxBody, String
         emoCut = head;                                  // 正文从标点串之后开始
       } else {
         int nl = out.indexOf('\n');
-        emoCut = (nl >= 0) ? nl + 1 : 0;                // 无情绪词：从首个换行后/全文起
+        // v3.72b 关键：无换行时**保持 -1 继续等**——首增量常只有情绪词的前几个字节
+        // （如 "t"），此时 emoHead 必然匹配不上；提前定 0 会让后续到齐的 "tired\n"
+        // 永远不被剥离，"tired" 直接成首句播出去（v3.72 实测回归）
+        if (nl >= 0) emoCut = nl + 1;
+        else if (out.length() >= 8) emoCut = 0;         // 8B 仍无换行且无情绪词头：真·无情绪行
+        else continue;                                  // 太短：等下一个增量再判
       }
     }
     if ((int)spokenUpTo < emoCut) spokenUpTo = emoCut;  // 情绪段永不外播
