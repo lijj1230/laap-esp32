@@ -55,6 +55,15 @@ hdrDone:
 
 void WsClient::stop() { if (_nc) _nc->stop(); _nc = nullptr; }
 
+// v3.65：_bin 是裸指针缓冲（ensureBin realloc），原类没有析构 → Edge TTS 每次播报
+// 泄漏"最大二进制帧+512B"（实测每轮聊天内部堆掉 1.5~2KB，纯 LLM 路径零泄漏）。
+// stop() 不动 _bin（重连场景可复用），连接对象销毁时统一释放。
+WsClient::~WsClient() {
+  stop();
+  free(_bin);
+  _bin = nullptr; _binLen = 0; _binCap = 0;
+}
+
 bool WsClient::sendFrame(uint8_t opcode, const uint8_t* data, size_t len) {
   if (!_nc || !_nc->connected()) return false;
   uint8_t hdr[14]; int h = 0;

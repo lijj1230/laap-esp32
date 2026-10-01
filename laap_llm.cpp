@@ -495,21 +495,32 @@ String utf8Cut(const String& s, int len) {
 }
 
 // UTF-8 兜底清洗：丢掉非法字节（孤立续字节、被截断的多字节序列）
+// v3.67 严格化：GB18030/GBK 字节对常伪装成合法 UTF-8 结构（如 0xCF 0xB5=ε），
+// 但 0xC0/0xC1 首字节（过长编码）、代理区 ED A0-BF、>U+10FFFF（F5+）是任何解码器
+// 都拒收的——大模型 API 会整包 400「invalid unicode code point」，把聊天/表达全线
+// 打进本地兜底。结构校验必须 reject 这四类。
 String sanitizeUtf8(const String& s) {
   String out; out.reserve(s.length());
   unsigned int i = 0;
   while (i < s.length()) {
     uint8_t c = (uint8_t)s[i];
     int need;
+    bool reject = false;
     if      (c < 0x80)           need = 0;
+    else if (c == 0xC0 || c == 0xC1) { reject = true; need = 0; }   // 过长编码首字节
     else if ((c & 0xE0) == 0xC0) need = 1;
     else if ((c & 0xF0) == 0xE0) need = 2;
-    else if ((c & 0xF8) == 0xF0) need = 3;
+    else if (c == 0xF0)          need = 3;
+    else if (c == 0xF4)          need = 3;
+    else if ((c & 0xF8) == 0xF0) { reject = true; need = 3; }       // F5-FF：>U+10FFFF / 非法
     else { i++; continue; }                       // 孤立续字节 / 非法首字节
-    bool ok = (i + (unsigned)need < s.length());
+    bool ok = !reject && (i + (unsigned)need < s.length());
     for (int k = 1; ok && k <= need; k++)
       if (((uint8_t)s[i + k] & 0xC0) != 0x80) ok = false;
-    if (!ok) { i++; continue; }                   // 截断序列：丢首字节，续字节下一轮同样被丢
+    if (ok && need == 2 && (uint8_t)s[i] == 0xED && ((uint8_t)s[i+1] & 0xE0) == 0xA0) ok = false;  // 代理区
+    if (ok && (uint8_t)s[i] == 0xF0 && ((uint8_t)s[i+1] & 0xE0) == 0x80) ok = false;  // 过长 4 字节
+    if (ok && (uint8_t)s[i] == 0xF4 && (uint8_t)s[i+1] >= 0x90) ok = false;           // >U+10FFFF
+    if (!ok) { i++; continue; }                   // 丢弃该字节（截断序列的续字节下一轮同样被丢）
     for (int k = 0; k <= need; k++) out += s[i + k];
     i += need + 1;
   }

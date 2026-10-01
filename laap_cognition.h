@@ -42,8 +42,8 @@ public:
   uint8_t expectation() const { return _expCat; }
   uint32_t expectAtMs() const { return _expAtMs; }
   // C5 置信度校准（v3.59）：五类预期的命中 EMA（精度加权）。0.5=无先验，常落空→趋 0
-  void  expectEmaLoad(const uint8_t* blob);          // NVS 恢复（10B：5×EMA 定点/200 + 5×判定次数 u16）
-  void  expectEmaBlob(uint8_t* out);                 // 序列化落盘（外部按 5 分钟批量写 NVS）
+  void  expectEmaLoad(const uint8_t* blob);          // NVS 恢复（15B：5×EMA 定点/200 + 5×判定次数 u16；v3.66 修正原 10B 尺寸错）
+  void  expectEmaBlob(uint8_t* out);                 // 序列化落盘（写满 15B，外部缓冲必须 ≥15）
   float expectPrecision(uint8_t cat) const;          // 该类精度 0.05~1.0（NONE 恒 1）
   float _expEma[5] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f}; // [0]=NONE 占位不用；公开供序列化直读
   uint16_t _expN[5] = {0, 0, 0, 0, 0};               // 各类已判定次数（EMA 冷启动权重）

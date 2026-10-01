@@ -13,6 +13,7 @@ public:
   // extraHeaders: 每行 "Key: value\r\n"
   bool connect(const char* host, int port, const char* path, const char* extraHeaders, uint32_t timeoutMs = 15000);
   void stop();
+  ~WsClient();   // v3.65：补 _bin 释放（原无析构=每次 TTS 泄漏最大帧+512B，聊几轮堆见底）
 
   bool sendText(const String& text);
 

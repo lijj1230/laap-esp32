@@ -3,8 +3,28 @@
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <time.h>
+#include <esp_heap_caps.h>
 
 LaapMetrics metrics;
+
+// ---- 黑匣子（v3.65）：RTC 慢内存存"最后活动"，无声重启后读回 ----
+RTC_DATA_ATTR static char s_bbTag[48];
+RTC_DATA_ATTR static uint32_t s_bbMs;
+RTC_DATA_ATTR static uint32_t s_bbHeapKb;
+RTC_DATA_ATTR static uint32_t s_bbMaxKb;
+
+void laapBlackBox(const char* tag) {
+  strlcpy(s_bbTag, tag, sizeof(s_bbTag));
+  s_bbMs = millis();
+  s_bbHeapKb = ESP.getFreeHeap() / 1024;
+  s_bbMaxKb = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024;
+}
+
+String laapBlackBoxText() {
+  if (!s_bbTag[0]) return String("（本次上电还没有记录）");
+  return String(s_bbTag) + " @T+" + String(s_bbMs / 1000UL) + "s（heap " +
+         String(s_bbHeapKb) + "KB/最大 " + String(s_bbMaxKb) + "KB）";
+}
 
 // 就地清洗非法 UTF-8 与 JSON 转义统一走 laap_llm 的公共实现（v3.55 收敛：原来这里
 // 各有一份 cleanUtf8/escTo，且转义的 \t 语义与别处漂移）

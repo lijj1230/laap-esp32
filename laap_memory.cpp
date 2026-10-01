@@ -55,6 +55,39 @@ bool MemorySystem::begin() {
     }
     f.close();
   }
+  // v3.67 记忆文件净化：GBK 等伪 UTF-8 字节对能骗过结构校验但会被大模型 API 整包
+  // 400（invalid unicode code point）——聊天/表达全线打进本地兜底。开机全文件按行
+  // 严格清洗一遍，有变化才重写（正常情况只多一次顺序读，无写放大）。
+  {
+    File rf = LittleFS.open(EP_PATH, "r");
+    if (rf) {
+      bool dirty = false;
+      unsigned fixed = 0;
+      std::vector<String> lines;
+      while (rf.available()) {
+        String l = rf.readStringUntil('\n');
+        if (!l.length()) continue;
+        String clean = sanitizeUtf8(l);
+        if (clean.length() != l.length()) { dirty = true; fixed++; l = clean; }
+        lines.push_back(l);
+      }
+      rf.close();
+      if (dirty) {
+        laapSnapMake("episodes", false);   // 修复也是覆盖：先拍快照
+        File wf = LittleFS.open(String(EP_PATH) + ".tmp", "w");
+        if (wf) {
+          for (auto& l : lines) { wf.print(l); wf.print('\n'); }
+          wf.close();
+          LittleFS.remove(EP_PATH);
+          LittleFS.rename(String(EP_PATH) + ".tmp", EP_PATH);
+          Serial.printf("[MEM] 记忆文件净化完成：修正 %u 行非法字节（共 %u 行）\n",
+                        fixed, (unsigned)lines.size());
+        } else {
+          Serial.println("[MEM] 净化写盘失败，保留原文件");
+        }
+      }
+    }
+  }
   // 向量缓存对齐条数（emb.bin 与 episodes.jsonl 行序一一对应）
   _embCount = 0; _embFail = 0;
   File ef = LittleFS.open(EMB_PATH, "r");

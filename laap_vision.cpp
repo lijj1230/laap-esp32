@@ -2,6 +2,7 @@
 #include "laap_config.h"
 #include "laap_llm.h"
 #include "laap_memory.h"
+#include "laap_metrics.h"   // v3.65 黑匣子
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -243,8 +244,10 @@ String LaapVision::debugPngB64(size_t& outLen) {
 // 跨任务互斥：后台独白"起意前看一眼"与主线程的聊天/CLI 会用同一个 vision 对象
 // （lastError 是 String，并发写=撕裂）。拿不到锁就当这次没看成。
 String LaapVision::look(const String& question) {
+  laapBlackBox("look:start");   // v3.65 黑匣子：相机抓帧+VLM 上传（独白流水线/聊天识图共用）
   if (!laapNetLock()) { lastError = "视觉正忙（后台独白占用）"; return ""; }
   String r = lookLocked(question);
+  laapBlackBox(r.length() ? "look:ok" : "look:empty");
   laapNetUnlock();
   return r;
 }

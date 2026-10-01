@@ -195,6 +195,7 @@ static bool g_expressForced = false;   // 本次 LK_EXPRESS 是否 forced（C4 �
 //  主动表达（PSI 心跳触发）—— v3.3 起投递后台任务，主循环不冻结
 // ============================================================
 void arisExpress(bool forced, const String& trigger) {
+  laapBlackBox("express-fire");   // v3.65 黑匣子：自发表达链启动（LLM+TTS 全链）
   // 硬性最小间隔：阈值触发的心跳每 10 秒一次，只要 dominance 卡在阈值上就会连环说话。
   // 认知层已让需求能回落（tick 的自我回补），这里是最后一道兜底——任何路径都别想刷屏。
   // forced=主人按了 BOOT 键（明确要求它说一句），不受冷却限制。
@@ -215,6 +216,7 @@ void arisExpress(bool forced, const String& trigger) {
   // R2+R3（v3.48）：表达输出契约扩展——三候选自选 + 类别化预期。写在 user 消息里
   // 而非共享系统提示词（聊天/独白共用后者，不能动）。全部行可缺省，解析失败回退旧契约
   String up = buildUserPrompt("");
+  laapBlackBox("express:bup");   // v3.66 细标签：buildUserPrompt 完成
   up += "\n\n[本次输出格式] 恰好如下：\n"
         "第一行：情绪词（happy/curious/excited/lonely/anxious/tired/calm 之一）\n"
         "第二~四行：A|、B|、C| 开头的三种不同说法（各≤40字，角度或措辞不同）\n"
@@ -224,6 +226,7 @@ void arisExpress(bool forced, const String& trigger) {
   LlmMsg m[2] = {
     {"system", buildSystemPrompt()},
     {"user", up} };
+  laapBlackBox("express:sys");   // v3.66 细标签：buildSystemPrompt 完成
   if (llmSubmit(m, 2, cfg.s.llmMaxTokens < 80 ? 80 : cfg.s.llmMaxTokens, 0.95f, LK_EXPRESS))
     display.drawFace("curious", true);           // 起意表情（后台思考中）
 }
@@ -569,6 +572,9 @@ static void llmTaskFunc(void*) {
     LlmReply rr;
     g_chatSearchState = -1; g_chatSearchErr = "";
     g_chatLookState = -1; g_chatLookErr = "";
+    { char bb[24]; snprintf(bb, sizeof(bb), "llmtask:%c go",
+                            (req->kind < 13) ? "CEMoRrlmDLSit"[req->kind] : '?');
+      laapBlackBox(bb); }   // v3.65 黑匣子：后台网络作业开始（TLS/搜索/视觉都在这）
     if (req->kind == LK_MONO) {
       rr = monologueGenerate();                  // 多步流水线也在后台跑
     } else if (req->kind == LK_LOOK) {
@@ -608,6 +614,7 @@ static void llmTaskFunc(void*) {
     g_resChatStartMs = g_chatStartMs; g_resLookStartMs = g_lookStartMs;
     g_resultKind = req->kind;
     g_llmResult = rr;
+    laapBlackBox("llmtask:done");   // v3.65 黑匣子
     g_llmBusy = false;
     g_llmHasNew = true;               // loop 轮询收割
     delete req;
@@ -617,6 +624,7 @@ static void llmTaskFunc(void*) {
 // 受理一个 LLM 请求（立即返回 true=已入队，false=忙/队满）
 bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
                uint8_t kind, const String& searchQ, const String& lookQ) {
+  laapBlackBox("submit:enter");   // v3.66 细标签：提交入口（区分死在构建段还是提交段）
   // ASR 预热连接会占住内部堆最大的一块，堆紧时先请它让位。v3.55 起 TLS 收发缓冲
   // 走 PSRAM（tlsheap 钩子），LLM 对内部堆的需求从 ~36KB 降到 ~10KB——门槛同步下调，
   // 不再无谓杀掉预热连接（杀一次 = 下次录音要多等一次完整 TLS 握手）
@@ -639,6 +647,9 @@ bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
   }
   shape += "] last=" + String(msgs[req->nm - 1].content.length()) + "B";
   strlcpy(g_lastReqShape, shape.c_str(), sizeof(g_lastReqShape));
+  { char bb[24]; snprintf(bb, sizeof(bb), "submit:%c n=%d",
+                          (kind < 13) ? "CEMoRrlmDLSit"[kind] : '?', nm);
+    laapBlackBox(bb); }   // v3.65 黑匣子：LLM 提交（真网络在 llmTask）
   Serial.printf("[LLM] 请求 %s（heap %uKB/最大块 %uKB）\n", shape.c_str(),
                 (unsigned)(ESP.getFreeHeap() / 1024),
                 (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024));
@@ -845,6 +856,8 @@ void llmHarvest() {
   g_llmHasNew = false;
   LlmReply r = g_llmResult;
   uint8_t kind = g_resultKind;
+  { char bb[24]; snprintf(bb, sizeof(bb), "harvest:%c", (kind < 13) ? "CEMoRrlmDLSit"[kind] : '?');
+    laapBlackBox(bb); }   // v3.65 黑匣子：收割=一轮 LLM 结算开始
   if (kind == LK_LOOK && g_resLookState == 0) {       // 没看成：已按普通聊天兜底（v3.54），按聊天结算
     metrics.vision(false);
     metrics.failNote(String("视觉: ") + g_resLookErr);
@@ -1137,6 +1150,7 @@ void llmHarvest() {
 // ============================================================
 // 返回 0=已提交（调用方计整个间隔） 1=广播未过（短重试，节奏由配置间隔决定） 2=忙/失败（30s 重试）
 int arisIdleMonologue(bool force) {
+  laapBlackBox("mono-fire");   // v3.65 黑匣子：独白链启动（出题→看→搜→成文→播报）
   if (g_llmFailStreak >= 2) {             // 连续失败让路（等效退避），本轮沉默
     Serial.println("[LAAP·独白] LLM 连败，本轮沉默");
     return 2;
@@ -1737,6 +1751,7 @@ void memoryTidy(bool force) {
 void psiTick() {
   float dtMin = (millis() - g_lastTickMs) / 60000.0f;
   g_lastTickMs = millis();
+  laapBlackBox("psi");   // v3.65 黑匣子：心跳拍（tickSec 节流，写入廉价）
   mind.tick(dtMin);
   mind.incCycle();
   nightlyReflect(false);   // F7: 深夜复盘（内部自带每天一次节流）
@@ -2354,6 +2369,7 @@ void setup() {
   // 构建时间戳：判断"板子里跑的到底是哪一版"的唯一可靠依据（烧录后必看这一行）
   Serial.printf("[LAAP] 固件构建 %s %s\n", __DATE__, __TIME__);
   Serial.printf("[LAAP] 启动原因: %s\n", laapBootReason().c_str());   // 崩溃/打盹/OTA 一眼可辨（v3.41）
+  Serial.printf("[LAAP] 黑匣子（上次活动）: %s\n", laapBlackBoxText().c_str());   // v3.65：无声重启的"死前一刻"
   {   // 运行槽位：OTA 后靠这行确认"新固件真的生效了"（还是老固件在跑）
     const esp_partition_t* rp = esp_ota_get_running_partition();
     Serial.printf("[LAAP] 运行分区 %s (0x%06x) | OTA 可升级: %s\n",
@@ -2406,12 +2422,15 @@ void setup() {
   metrics.loadPrev();  // 读回上一段会话的指标快照（崩溃/自愈重启的事故现场不丢）
   r0.begin();          // R0 微型循环处理器：储备池固定重建
   r0.loadNvs();        // 恢复读出层学习进度（打盹/断电不清零"身体直觉"，v3.50）
-  {   // C5 预期置信度 EMA 恢复（10B，laapmtr/expema；判定次数打满才可信赖）
+  {   // C5 预期置信度 EMA 恢复（15B，laapmtr/expema；v3.61 判定次数改 u16 后 blob 仍按 10B
+      // 分配 = expectEmaBlob 每 5 分钟栈越界写 5B（无声重启元凶），v3.66 修正尺寸。
+      // 旧 10B 布局=[ema5][n_lo5]，补零后语义等价（次数≤255 时高字节本就是 0））
     Preferences pe;
     if (pe.begin("laapmtr", true)) {
-      uint8_t blob[10];
-      if (pe.getBytesLength("expema") == sizeof(blob) &&
-          pe.getBytes("expema", blob, sizeof(blob)) == sizeof(blob)) mind.expectEmaLoad(blob);
+      uint8_t blob[15] = {0};
+      size_t n = pe.getBytesLength("expema");
+      if ((n == sizeof(blob) || n == 10) &&
+          pe.getBytes("expema", blob, sizeof(blob)) == n) mind.expectEmaLoad(blob);
       pe.end();
     }
   }
@@ -2609,10 +2628,12 @@ void loop() {
 
   // 累计运行时长：每 5 分钟落盘一次（单键写入，NVS 磨损可忽略）
   { static uint32_t s_lastUpSave = 0;
-    if (millis() - s_lastUpSave > 300000UL) { s_lastUpSave = millis(); laapUptimePersist(); metrics.persist(); metrics.decayFeedback24(); r0.saveNvs();
-      Preferences pe;   // C5：预期 EMA 同拍批量落盘（零额外磨损节拍）
+    if (millis() - s_lastUpSave > 300000UL) { s_lastUpSave = millis();
+      laapBlackBox("persist5min");   // v3.65 黑匣子：NVS/LittleFS 落盘拍
+      laapUptimePersist(); metrics.persist(); metrics.decayFeedback24(); r0.saveNvs();
+      Preferences pe;   // C5：预期 EMA 同拍批量落盘（v3.66：blob 10B→15B，旧尺寸越界写 5B 栈）
       if (pe.begin("laapmtr", false)) {
-        uint8_t blob[10];
+        uint8_t blob[15];
         mind.expectEmaBlob(blob);
         pe.putBytes("expema", blob, sizeof(blob));
         pe.end();

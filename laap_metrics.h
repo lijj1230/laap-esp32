@@ -85,3 +85,11 @@ extern LaapMetrics metrics;
 // 主动重启一律走 laapReboot(原因)，别直接 ESP.restart()——否则下次"为什么重启"只能靠失败环反推。
 void laapReboot(const char* why);
 String laapBootReason();
+
+// ---- 黑匣子（v3.65）----
+// 无声重启（复位码11=USB外设复位）连 panic 打印都来不及输出，死前在干什么无从知晓。
+// RTC 慢内存 survives 软复位/看门狗复位且零 flash 磨损：关键路径顺手写"最后活动"标签
+// （带当时的堆水位），重启后 /api/status 的 bb 字段与开机串口直接读回。
+// 写入廉价（strlcpy+两次堆查询 ~10µs），只埋在慢路径（LLM/TTS/视觉/心跳），别放进每帧循环。
+void laapBlackBox(const char* tag);
+String laapBlackBoxText();

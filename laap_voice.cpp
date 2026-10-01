@@ -20,6 +20,7 @@ void LaapVoice::begin() {
 }
 
 void LaapVoice::speak(const String& text, const char* expr) {
+  laapBlackBox("tts:start");   // v3.65 黑匣子：TTS 全链（WS-TLS+MP3 解码+I2S 播放）在此阻塞
   if (!_ready || (VoiceMode)cfg.s.voiceMode == VoiceMode::Off) return;
   if (!text.length()) return;
   // 栈水位护栏：TTS 要过一次 TLS 握手。单位注意——本 IDF 的 uxTaskGetStackHighWaterMark
@@ -61,6 +62,12 @@ void LaapVoice::speak(const String& text, const char* expr) {
   _cooldownMs = millis() + _cooldownDur;
   audio.prerollFlush();
   _busy = false;
+  { UBaseType_t hw = uxTaskGetStackHighWaterMark(NULL);   // v3.65：每轮播报后看 loop 栈余量（栈溢出曾疑）
+    char bb[40];
+    snprintf(bb, sizeof(bb), "tts:done hw=%u", (unsigned)hw);
+    laapBlackBox(bb);
+    if (hw < 4000) Serial.printf("[VOICE] 栈余量偏低: %uB（阈值 4000，观察项）\n", (unsigned)hw);
+  }
 }
 
 bool LaapVoice::listenAndTranscribe(String& heard) {
