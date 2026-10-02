@@ -3,6 +3,7 @@
 #include "laap_snap.h"  // 覆盖"自我"文件前拍快照（RSI 安全网）
 #include "laap_cognition.h"  // mind：意图加权（intent）与资源深度（bodyStrain）
 #include <LittleFS.h>
+#include <esp_heap_caps.h>   // embedTick 堆护栏（v3.76c：握手前查最大块）
 #include <time.h>
 #include <vector>
 
@@ -286,13 +287,20 @@ static bool callEmbedding(const String& text, float* out) {
 }
 
 void MemorySystem::embedTick() {
+  // v3.76c 三道闸（实证：85 轮训练后"空闲最大块 12KB"+LLM"碎片过多"失败，真凶=
+  // 本函数的 TLS 握手瞬态——每条向量一次完整握手，瞬态把最大块压到 12-14KB；
+  // bb/状态轮询采在握手窗口里像"空闲 12KB"，LLM 提交撞进同一窗口即失败）：
+  // ①堆护栏：最大块 <30KB 不开新握手（防把堆进一步压穿、防自愈打盹误判）
+  if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 30000) return;
+  // ②忙时让路：调用侧（主循环）在 LLM/播报/录音期间不调本函数；此处兜底"握手
+  // 进行中恰逢 LLM 提交"的竞态靠 ③限速 30s（碰撞窗口 2-4s/30s≈10%，15s 时为 20%）
   if (_embFail >= 3) {
     // 熔断后不永久装死：每 5 分钟放行一次试探，成功路径会把 _embFail 清零（自愈）
     static uint32_t s_probeMs = 0;
     if (millis() - s_probeMs < 300000) return;
     s_probeMs = millis();
   }
-  if (millis() - _embLastMs < 15000) return;              // 限速：15s 一条
+  if (millis() - _embLastMs < 30000) return;              // 限速：30s 一条（原 15s）
   // 有未对齐的新行才干活。口径必须与 begin() 一致：数"非空行"（原来数 '\n'，
   // 混进空行时 total 恒大于 _embCount → 每 15s 删一次向量缓存重建，永不收敛）
   File f = LittleFS.open(EP_PATH, "r");

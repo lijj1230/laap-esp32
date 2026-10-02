@@ -2613,7 +2613,12 @@ void loop() {
   webui.handleClient();
   laapBBPhase(1);
   serialCli();
-  memory.embedTick();   // 语义向量懒补（15s 限速，断网自动退关键词）
+  { // v3.76c 忙时让路：语义向量补嵌的 TLS 握手瞬态曾把最大块压到 12KB（撞上 LLM 提交
+    // 即"碎片过多"失败）。LLM 在飞/播报/录音期间跳过本轮（embedTick 内还有堆护栏兜底）
+    static uint32_t s_embSkip = 0;
+    if (laapLlmBusy() || voice.speaking() || voice.isListening()) s_embSkip = millis();
+    if (millis() - s_embSkip > 8000) memory.embedTick();   // 忙后至少静默 8s 再恢复
+  }
   laapBBPhase(3);
   display.blinkTick();
   { // 顶栏（时间/需求数字/设备信息/IMU）每秒刷新
