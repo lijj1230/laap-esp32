@@ -10,10 +10,13 @@
 // ============================================================
 
 #include <sdkconfig.h>
-// 双重门控：① sdkconfig 有 MODEL_IN_FLASH（esp-sr 库编译进来了）
-// ② 当前分区表是 esp_sr_16（真有 model 分区放 srmodels.bin）
-// no_fs 分区下宏不定义 → laapWake 整个模块编译为空，sr_start 不会被调
-#if (CONFIG_IDF_TARGET_ESP32S3) && (CONFIG_MODEL_IN_FLASH || CONFIG_MODEL_IN_SDCARD) \
+// v3.76 回退（用户拍板"损耗太大"）：窗口模式唤醒词的代价 = 固件 96%（OTA 余量仅 114KB）
+// + 空闲堆 -32KB + core 库补丁维护，功能收益撑不起。回退方式 = 默认关闸：
+// 整个模块编译为空，ESP_SR 库不链接，固件回落 ~1.7MB。
+// 重新启用：build_opt.h 加 -DLAAP_WAKEWORD_ENABLE=1 重编译即可——model 分区与
+// srmodels 已烧在设备上，重启用是纯 OTA，无需动分区表。
+#if defined(LAAP_WAKEWORD_ENABLE) \
+    && (CONFIG_IDF_TARGET_ESP32S3) && (CONFIG_MODEL_IN_FLASH || CONFIG_MODEL_IN_SDCARD) \
     && defined(ARDUINO_PARTITION_esp_sr_16)
 #define LAAP_WAKEWORD_AVAILABLE 1
 #endif

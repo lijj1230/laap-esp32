@@ -1,12 +1,10 @@
-# LAAP-lite 16MB 分区表（立创实战派 ESP32-S3 N16R8）v3.75 阶段四
-# esp_sr_16 布局：app 2MB→3MB（唤醒词全家桶 3.03MB 需要），新增 model 分区 3.9MB
-# （srmodels.bin=wn9_hiesp 唤醒词+VAD 模型，esp_srmodel_init("model") 按此标签加载），
-# spiffs(LittleFS 记忆区) 收为 6MB。代价：LittleFS 起始地址移动=旧记忆不可沿用（已获用户批准，
-# 由日常对话/训练课程自动回补）。
+# LAAP-lite 16MB 分区表（立创实战派 ESP32-S3 N16R8）v3.76
+# 回退到 no_fs 布局（双 OTA 槽各 2MB + LittleFS 11.875MB）：唤醒词需 model 分区
+# 才能常驻，但 wakenet9 的 47KB 内部堆开销在本固件上撑不起（v3.75 实测），整链回退。
+# v3.75 的 esp_sr_16 表只在 git 历史里，重启用=恢复该 csv+OTA 不可行（分区表变更必须 USB）。
 # Name,   Type, SubType, Offset,   Size,      Flags
 nvs,      data, nvs,     0x9000,   0x5000,
 otadata,  data, ota,     0xe000,   0x2000,
-app0,     app,  ota_0,   0x10000,  0x300000,
-app1,     app,  ota_1,   0x310000, 0x300000,
-spiffs,   data, spiffs,  0x610000, 0x600000,
-model,    data, spiffs,  0xC10000, 0x3E0000,
+app0,     app,  ota_0,   0x10000,  0x200000,
+app1,     app,  ota_1,   0x210000, 0x200000,
+spiffs,   data, spiffs,  0x410000, 0xBF0000,
