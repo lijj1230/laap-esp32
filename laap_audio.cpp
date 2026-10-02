@@ -109,11 +109,10 @@ bool LaapAudio::begin() {
   _ok = spkOk;                                 // 麦克风缺失不阻塞 TTS
   Serial.printf("[AUD] I2S ok spk=%d mic=%d\n", spkOk, micOk);
 
-  // ---- AEC（v3.75 全双工打断的心脏）：16k 单麦+单参考，低耗档 ----
-  // 缓冲走 PSRAM（v3.75b：默认内部堆分配曾把 heap 压到 3KB/最大块 1KB → 每分钟自愈打盹）
-  // 失败只降级回"播放不收麦"（v3.74 前的旧行为），不阻塞启动
+  // ---- AEC（v3.76b 已回退）：create 跳过（省 ~8KB 内部堆常驻）。代码与缓冲
+  // 分配保留在此分支里，重启用=把 if(0) 改回 if(micOk)。阶段四的实测记录见 git 历史
   _aec = false;
-  if (micOk) {
+  if (false && micOk) {
     aec_config_t ac = {};
     ac.mic_num = 1; ac.ref_num = 1; ac.out_num = 1;
     ac.filter_length = 4;
@@ -309,13 +308,14 @@ bool LaapAudio::playPcm(const int16_t* data, size_t samples, uint32_t rate,
                         bool (*interruptCb)(void*), void* ctx) {
   if (!spkOk) return false;
   _interrupted = false;
-  _aecInterrupt = false;
   paSet(true);               // 起振等待已内置在 paSet 的开沿（逐帧流播不再每帧空转 30ms）
 
-  // v3.75 AEC 全双工：启用条件=算法可用+调用方开了打断+麦克在线。
-  // AEC 模式下播放期间持续收麦，回声被消掉，VAD 只对真人声音起反应
-  bool aec = _aec && _bargeEn && micOk;
-  _aecEn = aec;
+  // v3.76b：AEC 全双工整链回退（用户拍板）——播报期间+TLS 并发时 AEC 的内部堆
+  // 开销（chunk 512 工作区+滤波器状态）会把 LLM 的 31KB 连续块挤没（llm_fail 8 次
+  // 实证），堆护栏也只护住播报起点、护不住播报中途的 TLS 起飞。打断退回
+  // v3.74 形态：bargeInEnable(false)=播放不收麦，冷却期+preerollFlush 防自听见。
+  // AEC 代码路径保留（git 历史），重启用=playPcm 里恢复 aec 判定+aec_create。
+  bool aec = false;
   if (aec) { _aecRefLen = 0; _aecMicLen = 0; }
 
   static int16_t out[2 * 480];   // 480 输出样本对(10ms@48k)
