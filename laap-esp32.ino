@@ -48,6 +48,7 @@
 #include "laap_r0.h"        // R0 微型循环处理器（ESN 世界预测，误差回注好奇）
 #include "laap_tlsheap.h"   // mbedtls 分配器钩子（TLS 大块路由 PSRAM，v3.55）
 #include "laap_wake.h"      // 本地唤醒词（esp-sr wakenet9，v3.75 阶段四）
+#include "driver/gpio.h"    // btnIsr 的 gpio_get_level（IRAM 安全，v3.76d）
 #if defined(LAAP_WAKEWORD_AVAILABLE)
 static uint32_t g_wakeWindowMs = 0;   // 唤醒词窗口开启时刻（BOOT 按下瞬间置位，0=关）
 #endif
@@ -120,6 +121,20 @@ static String g_recentTopics;          // 最近自问话题（防重复，滚�
 // BOOT 按键
 #define BTN_PIN 0
 static uint32_t g_btnDown = 0;
+// ---- BOOT 按键中断捕获（v3.76d）----
+// 播报期间 loop 阻塞在 voice.speak()（单句最长 10-20s），轮询会整段丢失按键事件
+// （按下+松开都发生在阻塞窗口内=彻底不可见）。ISR 记双沿时间戳（gpio_get_level/
+// millis 均 IRAM 安全，NVS 写 flash 期间触发也不会 cache-miss 崩），主循环空闲时补派发。
+static volatile uint32_t s_btnPressMs = 0, s_btnReleaseMs = 0, s_btnLastIrq = 0;
+static volatile bool g_btnSpeechInterrupt = false;   // 播报被按键打断 → 停后立即听新指令
+static bool btnTapPending() { return s_btnPressMs && s_btnReleaseMs && (int32_t)(s_btnReleaseMs - s_btnPressMs) >= 0; }
+void IRAM_ATTR btnIsr() {
+  uint32_t now = millis();
+  if (now - s_btnLastIrq < 30) return;               // 30ms 消抖（抖动沿不更新时间戳）
+  s_btnLastIrq = now;
+  if (gpio_get_level((gpio_num_t)BTN_PIN) == LOW) s_btnPressMs = now;
+  else s_btnReleaseMs = now;
+}
 
 // LLM 请求种类（F4 后台任务的收割分流）：聊天/主动表达/独白/记忆压缩/夜间反思/规则归纳/技能提取/意图生成/记忆整理
 enum LlmKind : uint8_t { LK_CHAT = 0, LK_EXPRESS, LK_MONO, LK_CONSOLIDATE, LK_REFLECT, LK_RULES, LK_RELATION, LK_MOOD, LK_DREAM, LK_LOOK, LK_SKILL, LK_INTENT, LK_TIDY };
@@ -2502,6 +2517,14 @@ void setup() {
                     mind.needs().security, mind.needs().expression);
 
   pinMode(BTN_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BTN_PIN), btnIsr, CHANGE);   // v3.76d：按键事件必达
+  // 按键打断探针：playPcm 每块询问"有没有未消费的按键点按"（v3.76d 播报可被按键停）
+  audio.setTapProbe([]() -> bool {
+    if (!btnTapPending()) return false;
+    s_btnPressMs = 0; s_btnReleaseMs = 0;
+    g_btnSpeechInterrupt = true;          // 消费这次点按：标记"打断后听新指令"
+    return true;
+  });
   g_lastTickMs = millis();
   g_lastConsumeMs = millis();
   g_lastActivityMs = millis();     // 开机先亮 cfg.s.screenOffSec 秒，之后静默才息屏
@@ -2597,8 +2620,34 @@ void touchGestures() {
 
 // v3.70 流式播报 drain：每轮 loop 最多播 1 句（播放阻塞 ~0.5-3s，句间回到 loop 处理网页/触觉，
 // 间隙 ~10ms≈自然换气）。播完清空队列自然收尾；播报守卫（栈/堆）都在 voice.speak 内复用。
+// 按键事件派发（v3.76d 从 loop 内联块抽出——ISR 补派发与实时轮询共用同一套语义）
+static void dispatchButton(uint32_t held) {
+  if (held > 10000) { Serial.println("[LAAP] 恢复出厂"); display.clear(0); cfg.reset(); laapReboot("恢复出厂"); }
+  else if (held > 4000) { if (!webui.inAP()) webui.beginAP(); }
+  else if (held > 60) {
+    laapActivity();                 // 按键=活动（息屏先点亮）
+    mind.onButtonPress();
+    laapResetIdleClock();           // 主人按键=在场的交互
+    if (voice.ready() && (VoiceMode)cfg.s.voiceMode == VoiceMode::Vad) {
+      voice.setVadPaused(!voice.vadPaused());   // 自动聆听模式：短按=暂停/恢复
+    } else if (voice.ready() && (VoiceMode)cfg.s.voiceMode == VoiceMode::Button) {
+      laapVoiceSetManualOnce();       // F8: 按键触发绕过唤醒词门
+      voice.converse();               // 按键对讲：短按开始说话
+    } else {
+      arisExpress(true, "button");
+    }
+  }
+}
+
 static void laapStreamSayDrain() {
   if (!g_sayQueue) return;
+  // v3.76d：上一句被按键打断 → 队列里剩余的句子全部作废（主人有新话要说）
+  if (audio.interrupted()) {
+    char* p = nullptr;
+    while (xQueueReceive(g_sayQueue, &p, 0) == pdTRUE && p) free(p);
+    Serial.println("[VOICE·流] 播报被打断，队列清空");
+    return;
+  }
   char* p = nullptr;
   if (xQueueReceive(g_sayQueue, &p, 0) != pdTRUE || !p) return;
   String s(p); free(p);
@@ -2662,6 +2711,11 @@ void loop() {
   laapBBPhase(6);
   llmHarvest();       // F4: 收割后台 LLM 结果
   laapStreamSayDrain();   // v3.70 流式：把 LLM 任务推来的成句逐句播报（首句 0.5~1s 出声）
+  if (g_btnSpeechInterrupt && !voice.speaking()) {   // v3.76d：播报被按键打断 → 立即听新指令
+    g_btnSpeechInterrupt = false;
+    laapVoiceSetManualOnce();
+    voice.converse();                 // manualOnce 已豁免冷却（laap_voice v3.76d）
+  }
   laapBBPhase(7);
   touchGestures();    // F5: 摇晃/翻面触觉（每帧，内部自带节流）
 
@@ -2743,6 +2797,20 @@ void loop() {
   laapBBPhase(11);
 
   // BOOT 键: 短按=主动表达 长按4s=配置热点 长按10s=格式化
+  // v3.76d：ISR 捕获的完整按键事件优先补派发（播报阻塞窗口里丢的按键在这里还魂）。
+  // 播报中的短按=打断即听新指令（探针已停播）；长按手势照旧走派发
+  if (btnTapPending()) {
+    uint32_t pMs = s_btnPressMs, rMs = s_btnReleaseMs;
+    s_btnPressMs = 0; s_btnReleaseMs = 0;
+    uint32_t held = rMs - pMs;
+    if (held <= 4000 && voice.speaking()) {
+      Serial.println("[LAAP] 播报被按键打断 → 听新指令");
+      g_btnSpeechInterrupt = true;
+      audio.forceInterrupt();            // playPcm 每块检查，≤10ms 内停播；say 队列由 drain 清
+    } else {
+      dispatchButton(held);
+    }
+  } else {
   bool pressed = (digitalRead(BTN_PIN) == LOW);
   if (pressed && g_btnDown == 0) { g_btnDown = millis();
     // v3.73：按下**瞬间**就预热 ASR TLS（松开才 converse——录音的几秒里握手并行完成，
@@ -2758,21 +2826,8 @@ void loop() {
   if (!pressed && g_btnDown > 0) {
     uint32_t held = millis() - g_btnDown;
     g_btnDown = 0;
-    if (held > 10000) { Serial.println("[LAAP] 恢复出厂"); display.clear(0); cfg.reset(); laapReboot("恢复出厂"); }
-    else if (held > 4000) { if (!webui.inAP()) webui.beginAP(); }
-    else if (held > 60) {
-      laapActivity();                 // 按键=活动（息屏先点亮）
-      mind.onButtonPress();
-      laapResetIdleClock();           // 主人按键=在场的交互
-      if (voice.ready() && (VoiceMode)cfg.s.voiceMode == VoiceMode::Vad) {
-        voice.setVadPaused(!voice.vadPaused());   // 自动聆听模式：短按=暂停/恢复
-      } else if (voice.ready() && (VoiceMode)cfg.s.voiceMode == VoiceMode::Button) {
-        laapVoiceSetManualOnce();       // F8: 按键触发绕过唤醒词门
-        voice.converse();               // 按键对讲：短按开始说话
-      } else {
-        arisExpress(true, "button");
-      }
-    }
+    dispatchButton(held);
+  }
   }
 
   laapBBPhase(12);

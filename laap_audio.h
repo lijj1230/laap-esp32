@@ -80,7 +80,11 @@ public:
   void setWakeFeed(void (*cb)(const int16_t*, size_t)) { _wakeFeed = cb; }
 
   // 播放中强制打断（唤醒词事件路径）：下一个 I2S 写块检查即停
-  void forceInterrupt() { if (_bargeEn) _interrupted = true; }
+  void forceInterrupt() { _interrupted = true; }   // v3.76d：无条件（playPcm 开头会复位，空闲期置位无害）
+
+  // ---- 按键打断探针（v3.76d）：playPcm 每块轮询一次，返回 true=有未消费的按键
+  // 点按 → 立即停播。由主程序注册（读 ISR 捕获的按键事件），audio 层不依赖按键实现
+  void setTapProbe(bool (*cb)()) { _tapProbe = cb; }
 
   // ---- 麦克风 PGA 增益（ES7210，0..37.5dB）----
   // 实测 30dB 时近场自响只有 RMS 200（底噪 102，仅 6dB 余量）→ 远场说话会被埋掉，
@@ -106,6 +110,7 @@ private:
   bool _vadSpeech = false;
   uint32_t _silenceMs = 0;
   bool _interrupted = false, _bargeEn = false;   // 默认关：播放期间不收麦（防回环/自触发）
+  bool (*_tapProbe)() = nullptr;                 // 按键打断探针（v3.76d）
   void (*_wakeFeed)(const int16_t*, size_t) = nullptr;  // 16k 样本转发回调（laap_wake）
   // ---- AEC 全双工状态 ----
   bool _aec = false;            // aec_create 成功

@@ -357,6 +357,7 @@ bool LaapAudio::playPcm(const int16_t* data, size_t samples, uint32_t rate,
       }
     }
     if (interruptCb && interruptCb(ctx)) _interrupted = true;
+    if (_tapProbe && _tapProbe()) _interrupted = true;   // v3.76d：按键点按=停播
     if (_interrupted) break;
   }
   // PA 不再逐块关断：流式播放每 24ms 一块，逐块开关会让功放永远停在启动瞬态（无声根因）。

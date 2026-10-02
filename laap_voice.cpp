@@ -60,7 +60,7 @@ void LaapVoice::speak(const String& text, const char* expr) {
     if (ratePct > 50) ratePct = 50;
     if (ratePct < -50) ratePct = -50;
     String rateStr = (ratePct > 0 ? "+" : "") + String(ratePct) + "%";
-    ok = edgeTts.speak(text, String(cfg.s.ttsVoice), rateStr);
+    ok = edgeTts.speak(text, String(cfg.s.ttsVoice), rateStr, true);   // v3.76d：可被按键打断
     if (!ok) Serial.printf("[VOICE] Edge TTS 失败: %s\n", edgeTts.lastError.c_str());
   }
   if (!ok && (cfg.s.ttsChannel == 0 || cfg.s.ttsChannel == 2)) {
@@ -167,9 +167,12 @@ String LaapVoice::converse() {
   // 残留授权会让下一次 VAD 自动触发绕过唤醒词门）
   bool manualOnce = g_manualOnce;
   g_manualOnce = false;
-  if ((int32_t)(millis() - _cooldownMs) < 0) {
+  // v3.76d：手动按键豁免冷却——冷却防的是"自家尾音被 VAD 误判"（自动路径的问题），
+  // 人手按键是明确意图。原顺序"先消费授权→冷却丢弃"会把按键整下吞掉（授权也没了），
+  // 正是"按好几下才有反应"的帮凶之一
+  if (!manualOnce && (int32_t)(millis() - _cooldownMs) < 0) {
     metrics.cooldownDrop();   // 冷却期丢弃：37.5dB 高增益下回声自触发的量（/micgain 调参参考）
-    Serial.println("[VOICE] 刚播报完还在冷却期，忽略这次触发（防自听见）");
+    Serial.println("[VOICE] 刚播报完还在冷却期，忽略 VAD 触发（防自听见）");
     return "";
   }
   metrics.vadTrigger();       // 一轮真实对话（含"没听清"和唤醒词拒绝）
