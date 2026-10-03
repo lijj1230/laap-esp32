@@ -1,5 +1,6 @@
 #include "laap_llm.h"
 #include "laap_config.h"
+#include <new>               // std::nothrow（v3.76e 空指针防线）
 #include <esp_heap_caps.h>   // 最大连续块（TLS 握手要一整块，不看总量）
 #include <WiFiClientSecure.h>
 #include <WiFi.h>
@@ -118,7 +119,8 @@ static const uint32_t LLM_KEEPALIVE_MS = 180000; // 闲置 3 分钟以上的连�
 // 碎片多时等几百毫秒回收往往就通了，比让上层收到一个"连接失败"有用得多
 static WiFiClient* llmFreshConnect(bool useTls, const String& host, int port, String& lastError) {
   for (int attempt = 0; attempt < 3; attempt++) {
-    WiFiClient* c = useTls ? (WiFiClient*)(new WiFiClientSecure) : new WiFiClient;
+    WiFiClient* c = useTls ? (WiFiClient*)(new (std::nothrow) WiFiClientSecure) : new (std::nothrow) WiFiClient;
+    if (!c) { lastError = "内存不足（LLM 连接对象）"; return nullptr; }   // v3.76e：堆耗尽时 new 不抛异常，判空防线
     if (useTls) ((WiFiClientSecure*)c)->setInsecure(); // 端侧自签策略见 README
     c->setTimeout(15000); // Stream 超时单位为 ms
     if (c->connect(host.c_str(), port)) return c;
@@ -137,21 +139,24 @@ static WiFiClient* connAcquire(LlmKeepConn& slot, const String& host, int port,
                                bool tls, bool& reused) {
   reused = false;
   if (!s_connMtx || xSemaphoreTake(s_connMtx, pdMS_TO_TICKS(100)) != pdTRUE) return nullptr;
+  WiFiClient* doomed = nullptr;    // v3.76e：stop/delete 移到锁外（半开连接的 stop 可阻塞，
+                                   // 持锁销毁会把其它任务的 connAcquire/connFinish 全部拖死）
   if (slot.c && !slot.inUse) {
     if (slot.host != host || slot.port != port || slot.tls != tls ||
         millis() - slot.lastUse > LLM_KEEPALIVE_MS) {
-      slot.c->stop(); delete slot.c; slot.c = nullptr;      // 过期/不匹配：丢弃
+      doomed = slot.c; slot.c = nullptr;      // 过期/不匹配：丢弃
     } else {
       // 存活探测：connected() 内部会拉取下一条 TLS 记录，闲置连接上会一路阻塞到
       // SO_RCVTIMEO——先压到 10ms 探一次：EOF=服务器已关（丢弃），读超时=仍活着。
       // 探测后由调用方 setTimeout 恢复正常读超时（复用成功路径必须恢复）
       slot.c->setTimeout(10);
-      if (!slot.c->connected()) { slot.c->stop(); delete slot.c; slot.c = nullptr; }
+      if (!slot.c->connected()) { doomed = slot.c; slot.c = nullptr; }
     }
   }
   WiFiClient* c = nullptr;
   if (slot.c && !slot.inUse) { slot.inUse = true; reused = true; c = slot.c; }
   xSemaphoreGive(s_connMtx);
+  if (doomed) { doomed->stop(); delete doomed; }
   return c;
 }
 
@@ -163,11 +168,14 @@ static void connFinish(LlmKeepConn& slot, WiFiClient* c, bool clean,
                        const String& host, int port, bool tls) {
   if (!c) return;
   bool owned = false;                       // true=锁内已处置完毕，尾部不再动
+  WiFiClient* doomed = nullptr;             // v3.76e：stop/delete 移到锁外——半开连接上的
+                                            // TLS close_notify 写可阻塞分钟级，持锁 stop
+                                            // 会把其它任务的 connFinish 全部拖死
   if (s_connMtx && xSemaphoreTake(s_connMtx, portMAX_DELAY) == pdTRUE) {
     if (c == slot.c) {                      // 复用的那条：干净与否都已在槽位处置
       slot.inUse = false;
       if (clean) slot.lastUse = millis();
-      else { slot.c->stop(); delete slot.c; slot.c = nullptr; }
+      else { doomed = slot.c; slot.c = nullptr; }
       owned = true;
     } else if (clean && !slot.c && !slot.inUse) {   // 新建干净 + 槽位空 → 收养
       slot.c = c; slot.inUse = false;
@@ -177,6 +185,7 @@ static void connFinish(LlmKeepConn& slot, WiFiClient* c, bool clean,
     }
     xSemaphoreGive(s_connMtx);
   }
+  if (doomed) { doomed->stop(); delete doomed; }
   if (!owned) { c->stop(); delete c; }      // 只有"新建且未收养"走这里
 }
 
@@ -709,7 +718,8 @@ String laapEmbed(const String& text, bool& ok) {
   if (client) client->setTimeout(12000);   // 复用路径必须恢复读超时（探测把它压到了 10ms）
   (void)reused;   // embed 高频且静默：复用成功不打日志，这里只接收 out 参数
   if (!client) {
-    client = new WiFiClientSecure;
+    client = new (std::nothrow) WiFiClientSecure;
+    if (!client) return "";   // v3.76e：堆耗尽静默退关键词通道（与 embed 失败语义一致）
     ((WiFiClientSecure*)client)->setInsecure();
     client->setTimeout(12000);
     if (!client->connect(host.c_str(), port)) { delete client; return ""; }

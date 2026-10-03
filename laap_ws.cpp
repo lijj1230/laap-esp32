@@ -27,7 +27,9 @@ bool WsClient::connect(const char* host, int port, const char* path, const char*
     "\r\nSec-WebSocket-Version: 13\r\n";
   if (extraHeaders) req += extraHeaders;
   req += "\r\n";
-  _nc->print(req);
+  size_t want = req.length();
+  size_t wrote = _nc->print(req);
+  if (wrote != want) { lastError = "握手请求发送不完整"; stop(); return false; }
 
   // 读到响应头结束
   String resp; uint32_t t0 = millis();
@@ -81,7 +83,7 @@ bool WsClient::sendFrame(uint8_t opcode, const uint8_t* data, size_t len) {
     for (int i = 7; i >= 0; i--) { hdr[h++] = (l >> (8 * i)) & 0xFF; }
   }
   hdr[h++] = mask[0]; hdr[h++] = mask[1]; hdr[h++] = mask[2]; hdr[h++] = mask[3];
-  _nc->write(hdr, h);
+  if (_nc->write(hdr, h) != (size_t)h) return false;
   // 掩码 payload 分块发送
   const int CHUNK = 2048;
   static uint8_t buf[CHUNK];
@@ -89,7 +91,7 @@ bool WsClient::sendFrame(uint8_t opcode, const uint8_t* data, size_t len) {
   while (sent < len) {
     int n = (len - sent > CHUNK) ? CHUNK : (len - sent);
     for (int i = 0; i < n; i++) buf[i] = data[sent + i] ^ mask[(sent + i) % 4];
-    _nc->write(buf, n);
+    if (_nc->write(buf, n) != (size_t)n) return false;
     sent += n;
   }
   return true;
@@ -141,15 +143,30 @@ int WsClient::poll(uint32_t timeoutMs) {
         }
         for (int i = 0; i < 4; i++) mask[i] = _nc->read();
       }
-      if (len > 6 * 1024 * 1024) { lastError = "帧过大"; return -1; }
+      // v3.76e：帧长上限 6MB→128KB（Edge TTS 单帧实际 ~16KB；6MB 的 ensureBin 在 200KB
+      // 堆上必败，超大声明帧本就不合法）
+      if (len > 128 * 1024) { lastError = "帧过大"; stop(); return -1; }
       if (opcode == 0x8) { stop(); return -1; }               // close
-      if (opcode == 0x9) {                                     // ping → pong
-        uint8_t pb[64] = {0}; int n = len < 64 ? (int)len : 64;
-        for (int i = 0; i < n; i++) pb[i] = _nc->read() ^ mask[i % 4];
-        sendFrame(0xA, pb, n);
+      // v3.76e 控制帧（ping/pong）统一走有界丢弃：原来的 pong 丢弃是逐字节阻塞 read
+      // 无超时无连接检查、ping 只吃 64B 造成流错步——网络半死时单次 poll 可挂死小时级
+      // （2026-10-03 搜新闻卡死的实锤根因），服务器大 ping 一来 TTS 就冻结。
+      if (opcode == 0x9 || opcode == 0xA) {
+        uint8_t pb[64] = {0}; size_t take = len < 64 ? (size_t)len : 64;
+        size_t got = 0; uint32_t ct = millis();
+        while (got < (size_t)len) {
+          while (_nc->available() && got < (size_t)len) {
+            uint8_t b = _nc->read();
+            if (got < take) pb[got] = b ^ mask[got % 4];
+            got++;
+          }
+          if (got < (size_t)len) {
+            if (!_nc->connected() || millis() - ct > 3000) { lastError = "控制帧载荷超时"; stop(); return -1; }
+            delay(1);
+          }
+        }
+        if (opcode == 0x9) sendFrame(0xA, pb, take);   // ping → pong（吃全载荷不丢字节）
         return 0;
       }
-      if (opcode == 0xA) { for (uint64_t i = 0; i < len; i++) _nc->read(); return 0; } // pong 丢弃
 
       // 数据帧（文本/二进制）
       if (!ensureBin((size_t)len + 1)) { lastError = "内存不足"; return -1; }
@@ -157,7 +174,8 @@ int WsClient::poll(uint32_t timeoutMs) {
       while (got < len) {
         while (_nc->available()) {
           uint8_t b = _nc->read();
-          _bin[got++] = masked ? (b ^ mask[got % 4]) : b;
+          if (masked) b ^= mask[got % 4];   // v3.76e：掩码索引显式化（原复合表达式依赖求值顺序）
+          _bin[got++] = b;
           if (got >= len) break;
         }
         if (got < len) {

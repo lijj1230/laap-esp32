@@ -140,6 +140,17 @@ bool MemorySystem::begin() {
 void MemorySystem::appendEpisodic(const char* role, const String& rawText) {
   File f = LittleFS.open(EP_PATH, "a");
   if (!f) return;
+  { // v3.76e 残尾检查（全项目唯一裸追加路径原来没有）：上次断电/盘满留下的无换行半行，
+    // 会让本条拼接成损坏行——计数/对齐检查都发现不了（begin() 的开机修复只管开机那一次）
+    if (f.size() > 0) {
+      File chk = LittleFS.open(EP_PATH, "r");
+      if (chk) {
+        chk.seek(chk.size() - 1);
+        if (chk.read() != (int)'\n') f.print('\n');
+        chk.close();
+      }
+    }
+  }
   // 落盘前清洗：切半的汉字会让整个 episodes.jsonl 行非法，/api/memory 直接吐不出合法 JSON
   const String text = sanitizeUtf8(rawText);
   time_t now = time(nullptr);
@@ -150,9 +161,13 @@ void MemorySystem::appendEpisodic(const char* role, const String& rawText) {
   String esc = LlmClient::jsonEscape(text);
   // m=写入那一刻的情绪（手稿"情绪权重"的落点）：当时的心情就是这段经历的色彩。
   // 放 x 之前——正文里万一出现字面 "m":" 也不会干扰键定位；embedding 只抽 x，向量不受污染
-  f.printf("{\"t\":%lu,\"r\":\"%s\",\"w\":1.0,\"m\":\"%s\",\"x\":\"%s\"}\n",
-           (unsigned long)t, role, mind.moodKey(), esc.c_str());
+  String rec = String("{\"t\":") + (unsigned long)t + ",\"r\":\"" + role +
+               "\",\"w\":1.0,\"m\":\"" + mind.moodKey() + "\",\"x\":\"" + esc + "\"}\n";
+  size_t wrote = f.print(rec);
   f.close();
+  // v3.76e：写失败（盘满/坏块）不计数——虚高的 _count 会让 rewriteEpisodicByScore 的
+  // 早退路径失效，此后每条消息都触发整文件重扫 + 全量 vector 入堆
+  if (wrote < rec.length()) { Serial.printf("[MEM] episode 写入失败 %u/%u（盘满？）\n", (unsigned)wrote, (unsigned)rec.length()); return; }
   _count++;
 
   if (_count > EP_MAX + 50) { // 超限 → 按权重淘汰（不是纯FIFO：重要的留、无谓的先忘）
@@ -189,7 +204,7 @@ void MemorySystem::rewriteEpisodicByScore() {
     lines.push_back({l, w * 0.7f + fresh * 0.3f});
   }
   in.close();
-  if (lines.size() <= EP_MAX) return;
+  if (lines.size() <= EP_MAX) { _count = lines.size(); return; }   // v3.76e：无条件校正 _count（虚高会让每条消息都进全文件重扫）
   // 简单选择淘汰：反复找最低分丢掉（300 条规模，性能无虞）
   size_t drop = lines.size() - EP_MAX;
   for (size_t d = 0; d < drop; d++) {
@@ -287,6 +302,11 @@ static bool callEmbedding(const String& text, float* out) {
 }
 
 void MemorySystem::embedTick() {
+  // v3.76e：毒化熔断——盘上某行损坏时本进程停摆 embedding（缓存/计数都不动，保持与
+  // 前 k-1 行对齐，召回通道仍可用）。原来的"整份作废重建"遇上坏行 = 30 秒一轮的
+  // 毁灭循环：嵌入→撞坏行→全删→重嵌→再删（flash 磨损 + embedding 白烧）。
+  static bool s_embPoison = false;
+  if (s_embPoison) return;
   // v3.76c 三道闸（实证：85 轮训练后"空闲最大块 12KB"+LLM"碎片过多"失败，真凶=
   // 本函数的 TLS 握手瞬态——每条向量一次完整握手，瞬态把最大块压到 12-14KB；
   // bb/状态轮询采在握手窗口里像"空闲 12KB"，LLM 提交撞进同一窗口即失败）：
@@ -333,9 +353,10 @@ void MemorySystem::embedTick() {
   // 抽 x 字段文本
   int xp = line.indexOf("\"x\":\"");
   if (xp < 0) {
-    // 非记忆行（无正文）：向量缓存与行序已脱钩，整份作废重建（原来 _embCount++ 会错位）
-    LittleFS.remove(EMB_PATH);
-    _embCount = 0;
+    // v3.76e：非记忆行（无正文）→ 熔断（见函数顶部 s_embPoison）。缓存与 _embCount
+    // 都不动（保持与前 k-1 行对齐）；坏行靠 /tidy、快照恢复或重新导入清除，修好后自动继续。
+    Serial.printf("[MEM] episodes 第 %u 行损坏，embedding 熔断\n", (unsigned)(_embCount + 1));
+    s_embPoison = true;
     return;
   }
   int qe = line.lastIndexOf('"');                          // 正文到收尾引号为止（按长度倒推会因 CRLF/LF 尾不同多砍字）
@@ -991,6 +1012,7 @@ void MemorySystem::clearAll() {
   LittleFS.remove(EMB_PATH);              // 向量缓存一并清，否则旧向量错配新记忆
   LittleFS.remove(REL_PATH);              // 关系记忆也是"自我"：清空后 40 条偏好/承诺仍在盘上并继续进提示词（v3.51 审计）
   LittleFS.remove("/mem/intents.txt");    // 意图栈也是记忆（v3.56 审计：出厂重置漏了它，重启后旧目标继续驱动独白）
+  LittleFS.remove("/mem/feedback.jsonl"); // v3.76e：反馈原文（user/reply 明文）也属记忆——"整个人重来"却残留历史问答=隐私违背语义
   _count = 0; _workLen = 0; _workHead = 0;
   _embCount = 0; _embFail = 0;
 }
@@ -1071,7 +1093,15 @@ bool MemorySystem::applyImport(String& msg) {
     }
     if (!l.length()) continue;
     if (section == 1) { semBuf += l; semBuf += '\n'; nSem++; }   // v3.56 审计：原来无分隔，多行自我认知被拼成一行
-    else if (section == 2) { epsTmp.print(l); epsTmp.print('\n'); nEps++; }
+    else if (section == 2) {
+      // v3.76e：episode 行最小校验（首{ 尾} 含 "x":"）。坏行落盘会让 embedTick
+      // 撞上后熔断（旧代码则是 30s 一轮删缓存重建的毁灭循环），导入侧必须挡住
+      if (l[0] == '{' && l[l.length() - 1] == '}' && l.indexOf("\"x\":\"") >= 0) {
+        epsTmp.print(l); epsTmp.print('\n'); nEps++;
+      } else {
+        Serial.printf("[MEM] 导入拒绝损坏的 episode 行（第 %d 条）\n", nEps + 1);
+      }
+    }
     else if (section == 3) { evoBuf += l; nEvo++; }
     else if (section == 4) { relBuf += l; relBuf += '\n'; nRel++; }
   }
@@ -1082,6 +1112,15 @@ bool MemorySystem::applyImport(String& msg) {
     LittleFS.remove("/mem/episodes.imp"); LittleFS.remove(IMP_PATH);
     msg = "内容不像记忆备份（没有 ###SEMANTIC/###EPISODES 段头）";
     return false;
+  }
+  // v3.76e：EVOLUTION 段内容校验——任意非空行都会整份覆盖 evolution.json，手改坏一行
+  // = 人格/世代静默归零（回执还报"已导入"）。至少必须是含 "gen": 的 JSON。
+  if (nEvo) {
+    if (evoBuf.indexOf("\"gen\":") < 0) {
+      LittleFS.remove("/mem/episodes.imp"); LittleFS.remove(IMP_PATH);
+      msg = "###EVOLUTION 段损坏（缺 \"gen\": 字段）——已拒绝，未改动任何记忆";
+      return false;
+    }
   }
   // 截断备份拒绝（v3.51 审计）：导出侧有 ###END 校验、导入侧没有——上传被截断的备份
   // 会把情景记忆静默替换成前半段（回执还报"已导入 N 条"）
@@ -1098,9 +1137,16 @@ bool MemorySystem::applyImport(String& msg) {
   } else {
     LittleFS.remove("/mem/episodes.imp");
   }
-  // 语义/性格：有就覆盖，没有就保留原样
-  if (nSem) { File f = LittleFS.open("/mem/semantic.txt", "w"); if (f) { f.print(semBuf); f.close(); } }
-  if (nEvo) { File f = LittleFS.open("/evolution.json", "w"); if (f) { f.print(evoBuf); f.close(); } }
+  // 语义/性格：有就覆盖，没有就保留原样（v3.76e：tmp+rename 原子化——原来 open("w")
+  // 直写正式文件，掉电/盘满会把 semantic 清空或 evolution 写半行，人格静默归零）
+  if (nSem) {
+    File f = LittleFS.open("/mem/semantic.tmp", "w");
+    if (f) { f.print(semBuf); f.close(); LittleFS.remove("/mem/semantic.txt"); LittleFS.rename("/mem/semantic.tmp", "/mem/semantic.txt"); }
+  }
+  if (nEvo) {
+    File f = LittleFS.open("/evolution.tmp", "w");
+    if (f) { f.print(evoBuf); f.close(); LittleFS.remove("/evolution.json"); LittleFS.rename("/evolution.tmp", "/evolution.json"); }
+  }
   if (nRel) {   // 关系记忆（v3.51）：有才覆盖，无则保留（老备份没有此段）
     File rf = LittleFS.open("/mem/relations.jsonl.tmp", "w");
     if (rf) { rf.print(relBuf); rf.close();
@@ -1126,6 +1172,16 @@ bool MemorySystem::applyImport(String& msg) {
 }
 
 // 从盘上末段重建工作记忆环：导入后立刻就能"想起"，不用等到下次聊天
+void MemorySystem::onRestored() {
+  // v3.76e：快照恢复/导入后把 RAM 计数与盘上文件重新对齐（恢复→重启的窗口里
+  // embedTick 原会拿陈旧 _embCount 往新文件上追加向量 = 行序错位）
+  _embCount = 0; _embFail = 0;
+  _count = 0;
+  File f = LittleFS.open(EP_PATH, "r");
+  if (f) { while (f.available()) { if (f.read() == '\n') _count++; } f.close(); }
+  reloadWork();
+}
+
 void MemorySystem::reloadWork() {
   _workLen = 0; _workHead = 0;
   File f = LittleFS.open(EP_PATH, "r");

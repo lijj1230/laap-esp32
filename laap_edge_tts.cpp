@@ -1,6 +1,7 @@
 #include "laap_edge_tts.h"
 #include "laap_ws.h"
 #include "laap_audio.h"
+#include <new>               // std::nothrow（v3.76e 空指针防线）
 uint32_t laapI2sBytes();   // 诊断：I2S 实写字节（laap_audio.cpp）
 #include <WiFiClientSecure.h>
 #include <esp_heap_caps.h>   // PSRAM 缓冲（别把内部堆切碎）
@@ -59,8 +60,12 @@ static String s_prePath;                 // 该连接的握手 URL（SSML 请求
 static bool s_preOk = false;
 static uint32_t s_preMs = 0;
 static SemaphoreHandle_t s_preMtx = nullptr;
-static void preLock()   { if (!s_preMtx) s_preMtx = xSemaphoreCreateMutex(); xSemaphoreTake(s_preMtx, portMAX_DELAY); }
+// v3.76e：锁改由 begin() 在 setup 里显式创建（懒建是 check-then-create 竞态——
+// preconnect 临时任务与 speak 收养侧同时首进会各建一把锁，互斥失效 → UAF/双删）
+static void preLock()   { xSemaphoreTake(s_preMtx, portMAX_DELAY); }
 static void preUnlock() { xSemaphoreGive(s_preMtx); }
+
+void EdgeTts::begin() { if (!s_preMtx) s_preMtx = xSemaphoreCreateMutex(); }
 
 void EdgeTts::preconnect() {
   if (time(nullptr) < 1700000000) return;
@@ -243,7 +248,8 @@ bool EdgeTts::speak(const String& text, const String& voice, const String& rate,
     cid = uuidNoDash();
     path = String("/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=") + TCT +
       "&Sec-MS-GEC=" + genSecMsGec() + "&Sec-MS-GEC-Version=" + GEC_VER + "&ConnectionId=" + cid;
-    ws = new WsClient();
+    ws = new (std::nothrow) WsClient();
+    if (!ws) { lastError = "内存不足（WsClient）"; return false; }
     String cookie = "Cookie: muid=" + uuidNoDash() + ";\r\n";
     String extra = String("Origin: chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold\r\n") +
       "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0\r\n" +
@@ -260,7 +266,31 @@ bool EdgeTts::speak(const String& text, const String& voice, const String& rate,
   String cfgmsg = "X-Timestamp:" + ts + "\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n"
     "{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"},"
     "\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}";
-  if (!ws->sendText(cfgmsg)) { lastError = "发送 speech.config 失败"; ws->stop(); delete ws; return false; }
+  // v3.76e：收养的预取连接可能已被服务端掐线（30s 窗口内空闲即可能被收），发送失败不再
+  // 整句失败，退回现场握手重试一次（旧行为）
+  if (!ws->sendText(cfgmsg)) {
+    Serial.printf("[TTS·预] 收养连接发送失败（%s），退回现场握手\n", ws->lastError.c_str());
+    ws->stop(); delete ws; ws = nullptr;
+    cid = uuidNoDash();
+    path = String("/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=") + TCT +
+      "&Sec-MS-GEC=" + genSecMsGec() + "&Sec-MS-GEC-Version=" + GEC_VER + "&ConnectionId=" + cid;
+    ws = new (std::nothrow) WsClient();
+    if (!ws) { lastError = "内存不足（WsClient）"; return false; }
+    String cookie2 = "Cookie: muid=" + uuidNoDash() + ";\r\n";
+    String extra2 = String("Origin: chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold\r\n") +
+      "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0\r\n" +
+      cookie2;
+    if (!ws->connect(EDGE_HOST, 443, path.c_str(), extra2.c_str())) {
+      lastError = ws->lastError;
+      delete ws;
+      return false;
+    }
+    ts = jsDate();
+    cfgmsg = "X-Timestamp:" + ts + "\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n"
+      "{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"},"
+      "\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}";
+    if (!ws->sendText(cfgmsg)) { lastError = "发送 speech.config 失败"; ws->stop(); delete ws; return false; }
+  }
 
   // SSML
   String esc;
@@ -289,6 +319,13 @@ bool EdgeTts::speak(const String& text, const String& voice, const String& rate,
     if (fr < 0) { lastError = "连接中断"; break; }
     if (fr == 0) continue;
     if (fr == 1) {
+      // v3.76e：服务端每 ~10s 发 Path:ping 保活——回 pong 防，"只发 ping 不发音频"的
+      // 慢死链把 30s 看门狗无限续期（原文本帧一律续期 = 永不超时）。ping 不算进展。
+      if (ws->textPayload().indexOf("Path:ping") >= 0) {
+        String pong = "X-RequestId:" + cid + "\r\nContent-Type:application/json; charset=utf-8\r\nPath:pong\r\n\r\n";
+        ws->sendText(pong);
+        continue;
+      }
       lastProgress = millis();
       if (ws->textPayload().indexOf("Path:turn.end") >= 0) turnEnd = true;
     } else {
@@ -305,6 +342,7 @@ bool EdgeTts::speak(const String& text, const String& voice, const String& rate,
     }
   }
   ws->stop(); delete ws;
+  audio.bargeInEnable(false);   // v3.76e：能量门打断只属于本次 Edge 播报，不残留到后续火山回退/本地播放
   if (!audioRecv) {
     Serial.printf("[TTS] 没解出音频：收到 %uB / 解码 %u 帧（%s）\n",
                   (unsigned)s_ttsBytes, (unsigned)s_ttsFrames,

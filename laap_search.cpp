@@ -80,7 +80,7 @@ static String extractTexts(const String& json, int maxHit) {
 }
 
 // ---------- 源一：DuckDuckGo Instant Answer（被墙时快败）----------
-String LaapSearch::searchDdg(const String& q, int maxHit, int maxLen) {
+String LaapSearch::searchDdg(const String& q, int maxHit, int maxLen, uint32_t budgetMs) {
   String host = "api.duckduckgo.com";
   String path = "/?q=" + q + "&format=json&no_html=1&skip_disambig=1&t=laap-esp32";
 
@@ -92,7 +92,7 @@ String LaapSearch::searchDdg(const String& q, int maxHit, int maxLen) {
             "\r\nUser-Agent: laap-esp32/2.1\r\nConnection: close\r\n\r\n");
 
   String hdrs, payload;
-  laapHttpRead(&cli, 6000, hdrs, payload, 24000);
+  laapHttpRead(&cli, budgetMs < 6000 ? budgetMs : 6000, hdrs, payload, 24000);
   cli.stop();
 
   int sp = hdrs.indexOf(' ');
@@ -123,7 +123,7 @@ String LaapSearch::searchDdg(const String& q, int maxHit, int maxLen) {
 }
 
 // ---------- 源二：Bing 中国版网页抓取（大陆可达，免 Key）----------
-String LaapSearch::searchBing(const String& q, int maxHit, int maxLen) {
+String LaapSearch::searchBing(const String& q, int maxHit, int maxLen, uint32_t budgetMs) {
   String host = "cn.bing.com";
   String path = "/search?q=" + q + "&mkt=zh-CN&count=6";
 
@@ -139,7 +139,7 @@ String LaapSearch::searchBing(const String& q, int maxHit, int maxLen) {
 
   // 结果块（b_algo）出现在页面前段：有界缓冲 80KB，够取 maxHit 条
   String hdrs, payload;
-  laapHttpRead(&cli, 12000, hdrs, payload, 80000);
+  laapHttpRead(&cli, budgetMs < 12000 ? budgetMs : 12000, hdrs, payload, 80000);
   cli.stop();
 
   int sp = hdrs.indexOf(' ');
@@ -168,7 +168,7 @@ String LaapSearch::searchBing(const String& q, int maxHit, int maxLen) {
 }
 
 // ---------- 源：必应 RSS（默认主源，3-4KB 轻量结构化）----------
-String LaapSearch::searchRss(const String& q, int maxHit, int maxLen) {
+String LaapSearch::searchRss(const String& q, int maxHit, int maxLen, uint32_t budgetMs) {
   String host = "cn.bing.com";
   String path = "/search?q=" + q + "&format=rss";
 
@@ -182,7 +182,7 @@ String LaapSearch::searchRss(const String& q, int maxHit, int maxLen) {
             "\r\nConnection: close\r\n\r\n");
 
   String hdrs, payload;
-  laapHttpRead(&cli, 10000, hdrs, payload, 16384);
+  laapHttpRead(&cli, budgetMs < 10000 ? budgetMs : 10000, hdrs, payload, 16384);
   cli.stop();
 
   int sp = hdrs.indexOf(' ');
@@ -217,9 +217,9 @@ String LaapSearch::searchRss(const String& q, int maxHit, int maxLen) {
 }
 
 // ---------- 主源：NVS 可配 URL 模板（{q}=查询词），空=必应 RSS ----------
-String LaapSearch::searchCustom(const String& q, int maxHit, int maxLen) {
+String LaapSearch::searchCustom(const String& q, int maxHit, int maxLen, uint32_t budgetMs) {
   String tmpl(cfg.s.searchApi);
-  if (!tmpl.length()) return searchRss(q, maxHit, maxLen);
+  if (!tmpl.length()) return searchRss(q, maxHit, maxLen, budgetMs);
 
   // 模板形态 https://host/path?...{q}...：拆 host+path 直连
   int sp = tmpl.indexOf("://");
@@ -243,7 +243,7 @@ String LaapSearch::searchCustom(const String& q, int maxHit, int maxLen) {
             "\r\nConnection: close\r\n\r\n");
 
   String hdrs, payload;
-  laapHttpRead(&cli, 10000, hdrs, payload, 16384);
+  laapHttpRead(&cli, budgetMs < 10000 ? budgetMs : 10000, hdrs, payload, 16384);
   cli.stop();
 
   int spx = hdrs.indexOf(' ');
@@ -301,7 +301,7 @@ String LaapSearch::searchCustom(const String& q, int maxHit, int maxLen) {
 // 两任务并发写会 String 撕裂（堆损坏/莫名重启）。拿不到锁就降级成"这次没查到"，
 // 不用长超时——调用方含主循环，等几秒会让屏幕/网页一起卡住。
 String LaapSearch::search(const String& query, int maxHit, int maxLen) {
-  if (!laapNetLock()) { lastError = "搜索正忙（后台独白占用）"; return ""; }
+  if (!laapNetLock()) { Serial.println("[SEARCH] 搜索正忙（后台独白占用），本次放弃"); return ""; }
   String r = searchLocked(query, maxHit, maxLen);
   laapNetUnlock();
   // v3.71 边界消毒：中文站点多为 GBK/GB18030，网页字节会伪装成合法 UTF-8 结构
@@ -331,20 +331,30 @@ String LaapSearch::searchLocked(const String& query, int maxHit, int maxLen) {
   static uint32_t s_ddgSkipMs = 0;
   bool ddgSkip = (s_ddgFail >= 2) && (millis() - s_ddgSkipMs < 600000UL);
 
-  String r = searchCustom(q, maxHit, maxLen);
+  // v3.76e 总预算 25s：三源串行最坏 ≈51s（且全程持 laapNetLock，把 vision/embed/其它
+  // 网络用户全部饿到 400ms 快败）——2026-10-03 卡死事故的放大器。源间查剩余，不够 3s
+  // 就跳过后续源；各源的读预算也随剩余收缩。
+  const uint32_t t0 = millis();
+  auto remain = [&t0]() -> int32_t { return (int32_t)(25000UL - (millis() - t0)); };
+  auto remOrMin = [&remain]() -> uint32_t { int32_t r = remain(); return r > 3000 ? (uint32_t)r : 3000; };
+
+  String r = searchCustom(q, maxHit, maxLen, remOrMin());
   if (r.length()) return r;
   String err1 = lastError;
   String err2;
   if (ddgSkip) {
     err2 = "DDG跳过(连败退避)";
+  } else if (remain() < 3000) {
+    err2 = "DDG跳过(总预算尽)";
   } else {
-    r = searchDdg(q, maxHit, maxLen);
+    r = searchDdg(q, maxHit, maxLen, remOrMin());
     if (r.length()) { s_ddgFail = 0; return r; }   // 成功即复位退避（v3.51：原来只涨不落，DDG 恢复后仍被压 10 分钟）
     err2 = lastError;
     s_ddgFail++; s_ddgSkipMs = millis();
     if (s_ddgFail >= 2) Serial.println("[SEARCH] DDG 连败，10 分钟内跳过它");
   }
-  r = searchBing(q, maxHit, maxLen);
+  if (remain() < 3000) { lastError = err1 + " | " + err2 + " | Bing跳过(总预算尽)"; return ""; }
+  r = searchBing(q, maxHit, maxLen, remOrMin());
   if (r.length()) return r;
   lastError = err1 + " | " + err2 + " | " + lastError;
   return "";

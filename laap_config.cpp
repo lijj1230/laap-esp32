@@ -9,7 +9,20 @@ float laapTrust() { return g_trust; }
 void laapTrustSet(float v) { if (v < 0) v = 0; if (v > 1) v = 1; g_trust = v; }
 
 void LaapConfig::begin() {
-  prefs.begin("laap", false);
+  if (!prefs.begin("laap", false)) {
+    // v3.76e：NVS 挂载失败必须出声——否则 load() 得到全默认值（空 key 照常连网），
+    // 表现恰是"配置丢失"类故障，且无任何日志线索
+    Serial.println("[LAAP] !! NVS 挂载失败：本次全部配置回默认且不可保存（擦除/换件后首次？）");
+  }
+}
+
+// v3.76e：putString 失败登记（NVS 满时大值键静默丢 = "网页显示已保存、重启还原"）。
+// putString 返回写入字节数；空串写 0 字节返回 0 属正常（清空键值）
+static bool putStrOk(Preferences& p, const char* key, const char* v) {
+  size_t r = p.putString(key, v);
+  bool ok = (!v[0]) || (r == strlen(v));
+  if (!ok) Serial.printf("[LAAP] !! 配置键 %s 写入 NVS 失败（空间不足？）\n", key);
+  return ok;
 }
 
 void LaapConfig::load() {
@@ -71,18 +84,18 @@ void LaapConfig::load() {
 }
 
 bool LaapConfig::save() {
-  // 关键键写失败要出声（v3.51）：原来 save() 恒 true，NVS 满/句柄异常时网页显示"已保存"、
-  // 重启还原（历史上"配置重启还原"类故障最易被误判为"网页没保存"）
-  bool ok = (prefs.putString("ssid", s.wifiSsid) != 0);
+  // 关键键写失败要出声（v3.51）；v3.76e 扩展到全部字符串键（putStrOk 逐键核查，
+  // NVS 满时 persona/各 key 等大值键原来静默丢弃）+ 空串清空语义修正
+  bool ok = putStrOk(prefs, "ssid", s.wifiSsid);
   prefs.putString("pass", s.wifiPass);
-  prefs.putString("llmbase", s.llmBase);
-  ok = (prefs.putString("llmkey", s.llmKey) != 0) && ok;
+  ok = putStrOk(prefs, "llmbase", s.llmBase) && ok;
+  ok = putStrOk(prefs, "llmkey", s.llmKey) && ok;
   if (!ok) Serial.println("[LAAP] !! 配置写入 NVS 失败（空间不足？）——本次保存可能未生效");
-  prefs.putString("llmmodel", s.llmModel);
-  prefs.putString("agent", s.agentName);
-  prefs.putString("owner", s.ownerName);
-  prefs.putString("persona", s.persona);
-  prefs.putString("wcity", s.city);
+  ok = putStrOk(prefs, "llmmodel", s.llmModel) && ok;
+  ok = putStrOk(prefs, "agent", s.agentName) && ok;
+  ok = putStrOk(prefs, "owner", s.ownerName) && ok;
+  ok = putStrOk(prefs, "persona", s.persona) && ok;
+  ok = putStrOk(prefs, "wcity", s.city) && ok;
   prefs.putUInt("tick", s.tickSec);
   prefs.putUChar("thold", s.threshold);
   prefs.putBool("expren", s.expressEn);
@@ -99,29 +112,29 @@ bool LaapConfig::save() {
   prefs.putUShort("llmtok", s.llmMaxTokens);
   prefs.putUChar("nothink", s.llmNoThink);
   prefs.putUChar("trust", (uint8_t)(laapTrust() * 255));
-  prefs.putString("srchkeys", s.searchKeys);
-  prefs.putString("srchapi", s.searchApi);
+  ok = putStrOk(prefs, "srchkeys", s.searchKeys) && ok;
+  ok = putStrOk(prefs, "srchapi", s.searchApi) && ok;
   prefs.putUChar("vmode", s.voiceMode);
   prefs.putUChar("ttsch", s.ttsChannel);
-  prefs.putString("ttsvoice", s.ttsVoice);
-  prefs.putString("ttsrate", s.ttsRate);
-  prefs.putString("volcappid", s.volcAppid);
-  prefs.putString("volctoken", s.volcToken);
-  prefs.putString("volcvoice", s.volcVoice);
-  prefs.putString("asrbase", s.asrBase);
-  prefs.putString("asrkey", s.asrKey);
-  prefs.putString("asrmodel", s.asrModel);
-  prefs.putString("asr2base", s.asr2Base);
-  prefs.putString("asr2key", s.asr2Key);
-  prefs.putString("asr2model", s.asr2Model);
-  prefs.putString("embbase", s.embBase);
-  prefs.putString("embkey", s.embKey);
-  prefs.putString("embmodel", s.embModel);
-  prefs.putString("wakeword", s.wakeWord);
-  prefs.putString("visionbase", s.visionBase);
-  prefs.putString("vlbase", s.visionLlmBase);
-  prefs.putString("vkey", s.visionKey);
-  prefs.putString("vmodel", s.visionModel);
+  ok = putStrOk(prefs, "ttsvoice", s.ttsVoice) && ok;
+  ok = putStrOk(prefs, "ttsrate", s.ttsRate) && ok;
+  ok = putStrOk(prefs, "volcappid", s.volcAppid) && ok;
+  ok = putStrOk(prefs, "volctoken", s.volcToken) && ok;
+  ok = putStrOk(prefs, "volcvoice", s.volcVoice) && ok;
+  ok = putStrOk(prefs, "asrbase", s.asrBase) && ok;
+  ok = putStrOk(prefs, "asrkey", s.asrKey) && ok;
+  ok = putStrOk(prefs, "asrmodel", s.asrModel) && ok;
+  ok = putStrOk(prefs, "asr2base", s.asr2Base) && ok;
+  ok = putStrOk(prefs, "asr2key", s.asr2Key) && ok;
+  ok = putStrOk(prefs, "asr2model", s.asr2Model) && ok;
+  ok = putStrOk(prefs, "embbase", s.embBase) && ok;
+  ok = putStrOk(prefs, "embkey", s.embKey) && ok;
+  ok = putStrOk(prefs, "embmodel", s.embModel) && ok;
+  ok = putStrOk(prefs, "wakeword", s.wakeWord) && ok;
+  ok = putStrOk(prefs, "visionbase", s.visionBase) && ok;
+  ok = putStrOk(prefs, "vlbase", s.visionLlmBase) && ok;
+  ok = putStrOk(prefs, "vkey", s.visionKey) && ok;
+  ok = putStrOk(prefs, "vmodel", s.visionModel) && ok;
   return ok;
 }
 

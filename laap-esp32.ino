@@ -128,12 +128,15 @@ static uint32_t g_btnDown = 0;
 static volatile uint32_t s_btnPressMs = 0, s_btnReleaseMs = 0, s_btnLastIrq = 0;
 static volatile bool g_btnSpeechInterrupt = false;   // 播报被按键打断 → 停后立即听新指令
 static bool btnTapPending() { return s_btnPressMs && s_btnReleaseMs && (int32_t)(s_btnReleaseMs - s_btnPressMs) >= 0; }
+static portMUX_TYPE s_btnMux = portMUX_INITIALIZER_UNLOCKED;   // v3.76e：时间戳读改写临界区
 void IRAM_ATTR btnIsr() {
   uint32_t now = millis();
   if (now - s_btnLastIrq < 30) return;               // 30ms 消抖（抖动沿不更新时间戳）
   s_btnLastIrq = now;
+  portENTER_CRITICAL_ISR(&s_btnMux);
   if (gpio_get_level((gpio_num_t)BTN_PIN) == LOW) s_btnPressMs = now;
   else s_btnReleaseMs = now;
+  portEXIT_CRITICAL_ISR(&s_btnMux);
 }
 
 // LLM 请求种类（F4 后台任务的收割分流）：聊天/主动表达/独白/记忆压缩/夜间反思/规则归纳/技能提取/意图生成/记忆整理
@@ -617,9 +620,16 @@ static void llmTaskFunc(void*) {
     // v3.74 TTS 连接预取：聊天要说话——LLM 生成的几秒里并行完成 TTS 的 WS-TLS 握手，
     // 首句入队时连接已热（speak 收养省 ~0.5s）。独立小任务跑（握手阻塞数秒不能占 llmTask）
     if (req->kind == LK_CHAT) {
-      if (xTaskCreate([](void*) { edgeTts.preconnect(); vTaskDelete(nullptr); },
-                      "ttspre", 12288, nullptr, 1, nullptr) != pdPASS)
-        edgeTts.preconnect();               // 建任务失败：退化为本任务内同步预取
+      static volatile bool s_preInFlight = false;   // v3.76e：在飞即跳过——上一轮 preconnect
+                                                    // 卡在 WS/TLS 时连发任务会累积 12KB 栈到堆耗尽
+      if (!s_preInFlight) {
+        s_preInFlight = true;
+        if (xTaskCreate([](void*) { edgeTts.preconnect(); s_preInFlight = false; vTaskDelete(nullptr); },
+                        "ttspre", 12288, nullptr, 1, nullptr) != pdPASS) {
+          s_preInFlight = false;
+          edgeTts.preconnect();               // 建任务失败：退化为本任务内同步预取
+        }
+      }
     }
     if (req->kind == LK_MONO) {
       rr = monologueGenerate();                  // 多步流水线也在后台跑
@@ -670,8 +680,10 @@ static void llmTaskFunc(void*) {
     g_resultKind = req->kind;
     g_llmResult = rr;
     laapBlackBox("llmtask:done");   // v3.65 黑匣子
-    g_llmBusy = false;
     g_llmHasNew = true;               // loop 轮询收割
+    // v3.76e：先置 hasNew 再清 busy——原序两行间被抢占时，独白守卫(busy||hasNew)双假
+    // 通过会清空独白快照，上一条 LK_MONO 结果的【完成】结算丢失
+    g_llmBusy = false;
     delete req;
   }
 }
@@ -686,7 +698,8 @@ bool llmSubmit(LlmMsg* msgs, int nm, int maxTokens, float temperature,
   if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 18000)
     asr.warmDrop();
   if (g_llmBusy || !g_llmQueue) return false;
-  LlmRequest* req = new LlmRequest();
+  LlmRequest* req = new (std::nothrow) LlmRequest();
+  if (!req) return false;   // v3.76e：堆坍塌期 bad_alloc 直接 terminate，改安静拒收
   // 容量就是 msgs[14]：必须全量保全。旧代码写 `nm<12?nm:12`，而带搜索+满历史时 nm 是 13~14，
   // 被砍掉的恰好是队尾那两条 —— 其中最后一条就是本次主人的提问。模型收不到问题，
   // 只能顺着历史乱接话 → 实测表现为"聊天牛头不对马嘴"（2026-09-26 定位）。
@@ -803,26 +816,21 @@ String laapInteractSearch(const String& userText) {
         g_chatPending = true;                    // 受理即回：收割侧直答并念出（网页轮询取件闭环）
         return "";
       }
-      Serial.println("[LAAP] 后台忙：退回同步看图（旧行为）");
-      display.drawFace("curious", true);
-      String d = vision.look(userText);
-      if (d.length()) {
-        metrics.vision(true); metrics.rspDir(millis() - t0);
-        vision.logSight(d);
+      // v3.76e：后台忙时不再退回同步看图——那是 llmSubmit 失败（后台最忙）的场景，
+      // 同步 look 链路（抓帧 24s + 上传 + 读响应 45s）会把 loop 冻结 >70s 且不置任何
+      // 看门狗可见的标志。直接给主人一句诚实回执，视觉走后台队列稍后自然恢复
+      Serial.println("[LAAP] 后台忙：看图稍后再试（拒绝同步 look 兜底，v3.76e）");
+      metrics.vision(false);
+      {
+        String d = String("我正忙着想事情，眼睛暂时腾不开——稍后再让我看一次。");
         g_lastSay = d; g_lastExpr = "curious";
         g_chatReply = d; g_chatSeq++;
-        memory.logEvent("user", userText);
-        memory.logEvent("aris", d);
         laapActivity();
-        Serial.printf("[Aris·看] %s\n", d.c_str());
         display.drawFace("curious", false);
         voice.speak(d, "curious");
-        g_replySpoken = true;                    // 已经念过：调用方别再念（否则说两遍）
+        g_replySpoken = true;
         return d;
       }
-      Serial.printf("[LAAP] 视觉失败（%s），交给搜索/大模型兜底\n", vision.lastError.c_str());
-      metrics.vision(false);
-      metrics.failNote(String("视觉: ") + vision.lastError);
     } else if (wantLook) {
       Serial.println("[LAAP] 视觉未就绪（/api/status 的 vision_ready）");
     }
@@ -1045,6 +1053,8 @@ void llmHarvest() {
     if (!r.ok) {
       Serial.printf("[LAAP·独白] 失败: %s（保持安静，连败 %d 次）\n",
                     llm.lastError.c_str(), g_llmFailStreak);
+      // v3.76e：失败也要退出思考脸（原直接 return，深夜独白失败后屏幕长时间卡"思考中"）
+      display.drawFace(mind.moodKey(), false);
       return;
     }
     // R3（v3.48）：剥离尾行「预期:…」——不念出、不进记忆正文，写入认知供固件判定。
@@ -2342,8 +2352,16 @@ void serialCli() {
       String t = rules.text();
       Serial.println(t.length() ? t : String("[RULES] 还没有行为规则（/rulesreflect 现在归纳一轮，或等夜里自动跑）"));
     } else if (line == "/rules clear") {
-      rules.clear();
-      Serial.println("[RULES] 规则已清空");
+      // v3.76e：30 秒内重复输入才执行（原来无确认一键清空落盘）
+      static uint32_t s_rulesArmMs = 0;
+      if (s_rulesArmMs && millis() - s_rulesArmMs < 30000UL) {
+        s_rulesArmMs = 0;
+        rules.clear();
+        Serial.println("[RULES] 规则已清空");
+      } else {
+        s_rulesArmMs = millis();
+        Serial.println("[RULES] 规则清空布防：30 秒内再输 /rules clear 才执行");
+      }
     } else if (line == "/relations") {
       String rt = memory.relationsText();
       Serial.println(rt.length() ? rt : String("[REL] 还没有关系记忆（/relationsreflect 现在抽一轮，或等夜里自动跑）"));
@@ -2375,8 +2393,16 @@ void serialCli() {
       String t = skills.text();
       Serial.println(t.length() ? t : String("[SKILLS] 还没教过技能。对它说：以后每当我说<词>你就<做什么>"));
     } else if (line == "/skills clear") {
-      skills.clear();
-      Serial.println("[SKILLS] 技能已清空");
+      // v3.76e：30 秒内重复输入才执行
+      static uint32_t s_skillsArmMs = 0;
+      if (s_skillsArmMs && millis() - s_skillsArmMs < 30000UL) {
+        s_skillsArmMs = 0;
+        skills.clear();
+        Serial.println("[SKILLS] 技能已清空");
+      } else {
+        s_skillsArmMs = millis();
+        Serial.println("[SKILLS] 技能清空布防：30 秒内再输 /skills clear 才执行");
+      }
     } else if (line == "/intents") {
       String it = mind.intentsLine();
       Serial.println(it.length() ? it : String("[INTENTS] 心里没有惦记的事（好奇 >0.75 且空闲时会自己升起目标）"));
@@ -2413,7 +2439,16 @@ void serialCli() {
         Serial.printf("[LAAP] 当前亮度 %d%%（用法: /bright 5-100，下限5防全黑）\n", display.getBrightness());
       }
     } else if (line == "/reset") {
-      cfg.reset(); laapReboot("恢复出厂");
+      // v3.76e 两段式：与按键恢复出厂同规格（30 秒内再输 /reset 才真清）
+      static uint32_t s_rstArmMs = 0;
+      static bool s_cliResetArmed = false;
+      if (s_cliResetArmed && millis() - s_rstArmMs < 30000UL) {
+        s_cliResetArmed = false;
+        cfg.reset(); laapReboot("恢复出厂");
+      } else {
+        s_rstArmMs = millis(); s_cliResetArmed = true;
+        Serial.println("[LAAP] 恢复出厂布防：30 秒内再输入 /reset confirm 才执行");
+      }
     } else {
       laapInteractSearch(line);
     }
@@ -2425,6 +2460,8 @@ void serialCli() {
 // ============================================================
 void setup() {
   Serial.begin(115200);
+  Serial.setTimeout(50);   // v3.76e：readStringUntil 默认 1s 超时——无换行字节流（噪声/异常
+                           // 主机）曾让串口 CLI 每轮阻塞最长 8 秒且持续发生
   delay(200);
   Serial.println("\n[LAAP] Living Agent Application Protocol - 端侧生命体启动中…");
   // 构建时间戳：判断"板子里跑的到底是哪一版"的唯一可靠依据（烧录后必看这一行）
@@ -2487,6 +2524,8 @@ void setup() {
   Serial.println("[LAAP] 唤醒词「Hi ESP」窗口模式（BOOT 按下后 90s 内可用）");
 #endif
   laapNetInit();   // 显式建网络互斥锁（懒创建 check-then-create 在两任务同进时有竞态）
+  asr.begin();       // v3.76e：预热互斥量显式创建（懒建竞态防线）
+  edgeTts.begin();   // v3.76e：TTS 预取槽互斥量显式创建（懒建竞态 → UAF/双删）
   metrics.loadPrev();  // 读回上一段会话的指标快照（崩溃/自愈重启的事故现场不丢）
   r0.begin();          // R0 微型循环处理器：储备池固定重建
   r0.loadNvs();        // 恢复读出层学习进度（打盹/断电不清零"身体直觉"，v3.50）
@@ -2521,7 +2560,13 @@ void setup() {
   // 按键打断探针：playPcm 每块询问"有没有未消费的按键点按"（v3.76d 播报可被按键停）
   audio.setTapProbe([]() -> bool {
     if (!btnTapPending()) return false;
+    // v3.76e：只消费 ≤4s 的点按做"打断听新指令"；长按手势（4s 开热点/10s 两段式恢复出厂）
+    // 留给 loop 的 btnTapPending 派发——原版无条件消费，播报期间长按手势完全不可达
+    portENTER_CRITICAL(&s_btnMux);
+    uint32_t held = s_btnReleaseMs - s_btnPressMs;
+    if (held > 4000) { portEXIT_CRITICAL(&s_btnMux); return false; }
     s_btnPressMs = 0; s_btnReleaseMs = 0;
+    portEXIT_CRITICAL(&s_btnMux);
     g_btnSpeechInterrupt = true;          // 消费这次点按：标记"打断后听新指令"
     return true;
   });
@@ -2572,7 +2617,15 @@ void touchGestures() {
   if (!g_imuOk) return;
   float x, y, z;
   imuReadAccel(x, y, z);
-  if (z < -8) return;                     // IMU 无效
+  if (z < -8) {
+    // v3.76e：IMU 无效只跳过本轮采样，不再挡住扣伏状态机——扣伏中 IMU 失效会让
+    // 翻面恢复分支永远走不到（屏幕黑屏 + g_facedown 卡 true）
+    if (g_facedown) {
+      g_facedown = false;
+      display.repaint();
+    }
+    return;
+  }
 
   // ---- 摇晃检测：1.5s 窗口累计 3 次强晃 = 事件（阈值 0.55→0.35：原来轻摇完全测不到） ----
   float mag = sqrtf(x * x + y * y + z * z);
@@ -2621,15 +2674,37 @@ void touchGestures() {
 // v3.70 流式播报 drain：每轮 loop 最多播 1 句（播放阻塞 ~0.5-3s，句间回到 loop 处理网页/触觉，
 // 间隙 ~10ms≈自然换气）。播完清空队列自然收尾；播报守卫（栈/堆）都在 voice.speak 内复用。
 // 按键事件派发（v3.76d 从 loop 内联块抽出——ISR 补派发与实时轮询共用同一套语义）
-static void dispatchButton(uint32_t held) {
-  if (held > 10000) { Serial.println("[LAAP] 恢复出厂"); display.clear(0); cfg.reset(); laapReboot("恢复出厂"); }
+// v3.76e 加固（2026-10-03 实案驱动：卡死期间主人只短按几下，却触发了恢复出厂全清）：
+//   - 轮询路径的 held 跨越 loop 阻塞窗口时不可信（磨损按键的 release 边沿可能被 30ms
+//     去抖吞掉 → ISR 配不上对 → 掉进轮询路径，held 被阻塞窗口撑成十几秒）。因此 >4s
+//     的手势只认 ISR 配对（isrVerified=true，中断在阻塞期也运行，测的是真实物理时长）；
+//   - 恢复出厂改两段式：首次长按 10s 只布防 45s（屏显 SURE?），期内再长按 10s 才真清；
+//   - 轮询路径的 held>4000 一律降级忽略并留痕（真长按必然经 ISR 配对进来）。
+static uint32_t s_facArmMs = 0;
+static void dispatchButton(uint32_t held, bool isrVerified) {
+  if (held > 10000) {
+    if (!isrVerified) { Serial.println("[LAAP] 忽略阻塞期积压的疑似长按（轮询时长不可信，v3.76e）"); return; }
+    if (s_facArmMs && millis() - s_facArmMs < 45000UL) {
+      Serial.println("[LAAP] 恢复出厂二次确认成立 → 执行全清");
+      display.clear(0); cfg.reset(); laapReboot("恢复出厂");
+    }
+    s_facArmMs = millis();
+    Serial.println("[LAAP] 恢复出厂布防：45 秒内再长按 10 秒才执行（防误触）");
+    display.clear(0);
+    display.drawText3x5((SZP_LCD_W - (int)strlen("SURE?") * 4 * 8 + 8) / 2, 100, "SURE?", 0xFFFF, 8);
+    return;
+  }
   else if (held > 4000) { if (!webui.inAP()) webui.beginAP(); }
   else if (held > 60) {
     laapActivity();                 // 按键=活动（息屏先点亮）
     mind.onButtonPress();
     laapResetIdleClock();           // 主人按键=在场的交互
     if (voice.ready() && (VoiceMode)cfg.s.voiceMode == VoiceMode::Vad) {
-      voice.setVadPaused(!voice.vadPaused());   // 自动聆听模式：短按=暂停/恢复
+      bool pausing = !voice.vadPaused();
+      voice.setVadPaused(pausing);
+      // v3.76e：暂停/恢复必须留痕——实案里"卡死聋哑"半个真凶是 Vad 模式短按切了暂停
+      // 而无任何反馈，主人以为机器坏了
+      Serial.printf("[LAAP] VAD 聆听已%s（短按切换）\n", pausing ? "暂停，再短按恢复" : "恢复");
     } else if (voice.ready() && (VoiceMode)cfg.s.voiceMode == VoiceMode::Button) {
       laapVoiceSetManualOnce();       // F8: 按键触发绕过唤醒词门
       voice.converse();               // 按键对讲：短按开始说话
@@ -2779,6 +2854,32 @@ void loop() {
       }
     } else s_tightSince = 0;
   }
+  // v3.76e 僵尸看门狗：自愈打盹管不到的两种挂死。2026-10-03 实案：语音搜热点新闻后
+  // 设备聋哑且永不自愈——对话任务挂死时 g_chatPending 卡住，反而把打盹门禁掉
+  // （v3.56 注释早预警过"体检门与自愈打盹门被永久卡住"）。正常链路全有超时：
+  // 受理→成品 <60s（搜索/LLM/TTS 各段都有界）；播报最长 900 token 新闻稿 <6 分钟。
+  // 超限=挂死，网络栈/任务栈已不可信，只能干净重启救。
+  static uint32_t s_pendSince = 0, s_speakSince = 0;
+  if (laapChatPending()) {
+    if (!s_pendSince) s_pendSince = millis();
+    else if (millis() - s_pendSince > 240000UL) {
+      Serial.println("[LAAP] 对话任务 4 分钟无成品 → 判定挂死，自愈重启");
+      laapBlackBox("chat-pending-hang");
+      metrics.persist(); mind.saveEvolution(true); r0.saveNvs(); laapUptimePersist();
+      delay(600); laapReboot("对话挂死自愈");
+    }
+  } else s_pendSince = 0;
+  if (voice.speaking()) {
+    if (!s_speakSince) s_speakSince = millis();
+    else if (millis() - s_speakSince > 480000UL) {
+      Serial.println("[LAAP] 播报 8 分钟未结束 → 判定音频链路挂死，自愈重启");
+      laapBlackBox("speak-hang");
+      metrics.persist(); mind.saveEvolution(true); r0.saveNvs(); laapUptimePersist();
+      delay(600); laapReboot("播报挂死自愈");
+    }
+  } else s_speakSince = 0;
+  // 恢复出厂布防到期 → 收起 SURE? 提示，恢复表情
+  if (s_facArmMs && millis() - s_facArmMs > 45000UL) { s_facArmMs = 0; display.repaint(); }
   laapBBPhase(10);
 
   // 累计运行时长：每 5 分钟落盘一次（单键写入，NVS 磨损可忽略）
@@ -2800,15 +2901,17 @@ void loop() {
   // v3.76d：ISR 捕获的完整按键事件优先补派发（播报阻塞窗口里丢的按键在这里还魂）。
   // 播报中的短按=打断即听新指令（探针已停播）；长按手势照旧走派发
   if (btnTapPending()) {
-    uint32_t pMs = s_btnPressMs, rMs = s_btnReleaseMs;
+    portENTER_CRITICAL(&s_btnMux);              // v3.76e：读+清原子化（新按下沿落在读与清
+    uint32_t pMs = s_btnPressMs, rMs = s_btnReleaseMs;   // 之间会被抹掉=丢一次按键）
     s_btnPressMs = 0; s_btnReleaseMs = 0;
+    portEXIT_CRITICAL(&s_btnMux);
     uint32_t held = rMs - pMs;
     if (held <= 4000 && voice.speaking()) {
       Serial.println("[LAAP] 播报被按键打断 → 听新指令");
       g_btnSpeechInterrupt = true;
       audio.forceInterrupt();            // playPcm 每块检查，≤10ms 内停播；say 队列由 drain 清
     } else {
-      dispatchButton(held);
+      dispatchButton(held, true);       // v3.76e：ISR 配对的时长=真实物理按压时长
     }
   } else {
   bool pressed = (digitalRead(BTN_PIN) == LOW);
@@ -2826,7 +2929,7 @@ void loop() {
   if (!pressed && g_btnDown > 0) {
     uint32_t held = millis() - g_btnDown;
     g_btnDown = 0;
-    dispatchButton(held);
+    dispatchButton(held, false);        // v3.76e：轮询时长跨阻塞窗口不可信，>4s 在派发内降级
   }
   }
 
@@ -2843,6 +2946,21 @@ void loop() {
     lastReconnect = millis();
     WiFi.reconnect();
     mind.onError();
+  }
+  // v3.76e：配置热点模式下别放弃回家——每 60s 拿已存凭证试一次 STA（APSTA 混模，热点不断），
+  // 连上就重启回正常模式。2026-10-03 实案：开机时路由器瞬断掉进配置热点就永远出不来，
+  // 在人看来就是"板子卡死了"。
+  static uint32_t s_apRetryMs = 0;
+  if (!wifiUp && webui.inAP() && String(cfg.s.wifiSsid).length() > 0 && millis() - s_apRetryMs > 60000UL) {
+    s_apRetryMs = millis();
+    Serial.println("[LAAP] 配置热点模式下用已存凭证重试 STA…");
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(cfg.s.wifiSsid, cfg.s.wifiPass);
+    for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) delay(500);
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("[LAAP] STA 重连成功 IP=%s → 重启回正常模式\n", WiFi.localIP().toString().c_str());
+      laapUptimePersist(); delay(600); laapReboot("AP模式重连自愈");
+    }
   }
 
   laapBBPhase(13);

@@ -10,6 +10,8 @@
 
 class AsrClient {
 public:
+  // v3.76e：setup 里调用一次——创建预热互斥量（懒建是 check-then-create 竞态）
+  void begin();
   // pcm16k: 16kHz 16bit 单声道；返回空串表示失败
   String transcribe(const int16_t* pcm16k, size_t bytes, String& err);
   // 连通性探针（设置页"逐项体检"用）：合成 0.3s 正弦音发给指定服务商，

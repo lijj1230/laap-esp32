@@ -1,4 +1,5 @@
 #include "laap_snap.h"
+#include "laap_memory.h"   // v3.76e：恢复后调用 memory.onRestored() 对齐 RAM 计数
 #include <LittleFS.h>
 #include <time.h>   // getLastWrite() 是墙钟 epoch，节流/年龄都得拿 time(nullptr) 相减
 
@@ -104,11 +105,44 @@ bool laapSnapRestore(const char* name, int ver) {
     size_t sz = cf ? cf.size() : 0;
     if (cf) cf.close();
     if (!sz) { Serial.printf("[SNAP] %s v%d 是空快照，拒绝恢复\n", name, ver); return false; }
+    // v3.76e：内容最小校验——快照损坏成非目标格式时拒绝（半损坏文件防不住，空壳/纯垃圾防得住）
+    File vf = LittleFS.open(src, "r");
+    if (vf) {
+      char head[2] = {0, 0};
+      for (size_t i = 0; i < sizeof(head) && vf.available(); i++) { int c = vf.read(); while (c == '\r' || c == '\n' || c == ' ') { if (!vf.available()) break; c = vf.read(); } head[i] = (char)c; break; }
+      vf.close();
+      bool looksOk = (head[0] == '{' || head[0] == '#');
+      if (!looksOk) { Serial.printf("[SNAP] %s v%d 内容非 JSON/分段格式，拒绝恢复\n", name, ver); return false; }
+    }
   }
-  if (LittleFS.exists(e->path))                         // 现状先存 .pre（回滚本身也要有后悔药）
-    copyFile((String(SNAP_DIR) + "/" + name + ".pre").c_str(), e->path);
-  if (!copyFile(e->path, src.c_str())) return false;
+  // v3.76e：先拷到 .rest 转正前不碰活文件；.pre 回滚备份失败即中止（原来失败被忽略，
+  // 盘满时恢复到一半失败="活文件已截断+无后悔药"双重灾难）
+  String prePath = String(SNAP_DIR) + "/" + name + ".pre";
+  if (LittleFS.exists(e->path)) {
+    LittleFS.remove(prePath + ".tmp");
+    if (!copyFile((prePath + ".tmp").c_str(), e->path)) {
+      LittleFS.remove(prePath + ".tmp");
+      Serial.printf("[SNAP] %s .pre 备份失败（盘满？），中止恢复\n", name);
+      return false;
+    }
+  }
+  LittleFS.remove((String(SNAP_DIR) + "/" + name + ".rest").c_str());
+  if (!copyFile((String(SNAP_DIR) + "/" + name + ".rest").c_str(), src.c_str())) {
+    LittleFS.remove((String(SNAP_DIR) + "/" + name + ".rest").c_str());
+    LittleFS.remove(prePath + ".tmp");
+    Serial.printf("[SNAP] %s 恢复拷贝失败（活文件未动）\n", name);
+    return false;
+  }
+  if (LittleFS.exists(e->path)) LittleFS.remove(e->path);
+  LittleFS.rename((String(SNAP_DIR) + "/" + name + ".rest").c_str(), e->path);
+  if (LittleFS.exists(prePath + ".tmp")) {
+    LittleFS.remove(prePath);
+    LittleFS.rename(prePath + ".tmp", prePath);
+  }
   LittleFS.remove("/mem/emb.bin");   // 向量与行序绑死：恢复后整份重建（v3.51：原来只靠条数不符兜底）
+  // v3.76e：把"恢复后必须重启"的隐式约定显式化——恢复到重启的窗口里 embedTick 会拿
+  // 陈旧 _embCount 往新文件上追加向量（行序错位）；直接清零重数，窗口内也不再错配
+  memory.onRestored();
   Serial.printf("[SNAP] %s 已恢复到第 %d 版（原状态在 .pre）\n", name, ver);
   return true;
 }

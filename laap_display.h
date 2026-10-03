@@ -55,6 +55,7 @@ public:
   void setScreenOn(bool on);              // 静默息屏（关背光，屏内容保留）
   bool screenOn() const { return _screenOn; }
   void repaint();                         // 重画整屏（唤醒/装死后恢复：表情 + 顶栏）
+  int  drawText3x5(int x, int y, const char* s, uint16_t c, uint8_t scale);   // v3.76e 转公开（恢复出厂布防屏显 SURE? 用）
 private:
   // ---- 底层 ST7789 ----
   void lcdCmd(uint8_t c);
@@ -66,7 +67,6 @@ private:
   // ---- UI helpers ----
   void drawEye(int cx, int cy, int rx, int ry, int pupDx, int pupDy, int browY);
   void drawGlyph3x5(int x, int y, char ch, uint16_t c, uint8_t scale);  // 3x5 点阵字符（scale 倍放大）
-  int  drawText3x5(int x, int y, const char* s, uint16_t c, uint8_t scale);
   void drawTopStrip();                                    // 顶栏：时间+需求数字+设备信息
   void drawMoodDot();                                     // 底栏右侧情绪色点（跟随当前表情实时更新）
   void draw7seg(int x, int y, char ch, uint16_t c);

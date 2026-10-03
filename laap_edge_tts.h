@@ -9,6 +9,9 @@
 
 class EdgeTts {
 public:
+  // v3.76e：setup 里调用一次——创建预取槽互斥量（懒建是 check-then-create 竞态，
+  // preconnect 临时任务与 speak 收养侧同时首进会各建一把锁，互斥失效 → UAF/双删）
+  void begin();
   // text: 要说的话 voice: 如 zh-CN-XiaoxiaoNeural rate: "+0%"
   // 成功播放返回 true。interruptible: 播放期间允许能量门打断
   // 默认 false：泄漏基线 ×1.9 的能量门会被语音自身的动态范围误触发，把 TTS 砍成"无声成功"

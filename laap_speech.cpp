@@ -47,18 +47,25 @@ static int g_warmPort = 443;
 // 录音开始前调用：后台把 TLS 握手做完（小智"录传并行"思想的适配——握手最耗时且与录音无依赖）
 // 预热连接的互斥保护（asrwarm 任务与主线程 transcribe 并发访问 g_warm）
 static SemaphoreHandle_t g_warmMtx = nullptr;
+static volatile bool g_warming = false;   // v3.76e：预热在飞标志（连按 N 次/loopTick 连发只跑一次握手）
 static void warmLock()   { if (!g_warmMtx) g_warmMtx = xSemaphoreCreateMutex(); xSemaphoreTake(g_warmMtx, portMAX_DELAY); }
 static void warmUnlock() { xSemaphoreGive(g_warmMtx); }
 
+void AsrClient::begin() { if (!g_warmMtx) g_warmMtx = xSemaphoreCreateMutex(); }   // v3.76e：setup 里显式建锁，消除懒建竞态
+
 void AsrClient::warmup() {
   if (WiFi.status() != WL_CONNECTED) return;   // 原 !x==y 优先级错恒 false
+  if (g_warming) return;                       // v3.76e：在飞去重——阻塞期连按 N 次 =
+                                               // N 个 12KB 栈任务在锁上排队 + N 轮握手（堆最紧时雪上加霜）
   warmLock();
+  if (g_warming) { warmUnlock(); return; }     // 双检：两任务同时过首检的兜底
+  g_warming = true;
   String base(cfg.s.asrBase);
   while (base.endsWith("/")) base.remove(base.length() - 1);
   bool dash = base.indexOf("dashscope") >= 0;
   String url = base + (dash ? "/api/v1/services/audio/asr/transcription" : "/audio/transcriptions");
   int dp = url.indexOf("://");
-  if (dp < 0) { warmUnlock(); return; }   // 畸形 asrBase（少打 https://）：持锁早退=永久死锁整个主循环（v3.51 审计）
+  if (dp < 0) { g_warming = false; warmUnlock(); return; }   // 畸形 asrBase（少打 https://）：持锁早退=永久死锁整个主循环（v3.51 审计）
   int hp = url.indexOf('/', dp + 3);
   g_warmHost = (hp < 0) ? url.substring(dp + 3) : url.substring(dp + 3, hp);
   g_warmPort = 443;
@@ -70,15 +77,18 @@ void AsrClient::warmup() {
   g_warm.setTimeout(8);
   g_warm.setInsecure();   // 缺这句 WiFiClientSecure 无证书配置 connect() 恒败（预热曾是死代码）
   if (g_warm.connect(g_warmHost.c_str(), g_warmPort)) g_warmOk = true;  // TLS 握手在此完成
+  g_warming = false;
   warmUnlock();
 }
 
-static void warmupInvalidate() { warmLock(); g_warmOk = false; g_warm.stop(); warmUnlock(); }
+static void warmupInvalidate() { warmLock(); g_warmOk = false; g_warm.stop(); g_warming = false; warmUnlock(); }
 
 bool AsrClient::warmAlive() {
-  warmLock();
+  if (!g_warmMtx) return false;
+  if (xSemaphoreTake(g_warmMtx, 0) != pdTRUE) return true;   // v3.76e：握手进行中视作"活"——
+                                                             // 拿锁等到握手完会把 loop 拖 ≤9s
   bool alive = g_warmOk && g_warm.connected();
-  warmUnlock();
+  xSemaphoreGive(g_warmMtx);
   return alive;
 }
 
@@ -86,8 +96,9 @@ void AsrClient::warmDrop() {
   warmupInvalidate();
 }
 // 通用 HTTPS POST（warm=已握手的 ASR 预热连接，用后即失效），返回 HTTP 状态与响应体
+// readBudgetMs：响应读预算（v3.76e 总预算的一部分，防网络半死时读满 40s）
 static int httpsPost(const String& url, const String& contentType, const uint8_t* body, size_t bodyLen,
-                     const char* bearer, String& respOut, WiFiClient* warm = nullptr) {
+                     const char* bearer, String& respOut, WiFiClient* warm = nullptr, uint32_t readBudgetMs = 40000) {
   int dp = url.indexOf("://");
   if (dp < 0) return -1;
   bool tls = url.startsWith("https");
@@ -130,7 +141,7 @@ static int httpsPost(const String& url, const String& contentType, const uint8_t
     sent += n;
   }
   String hdrs, payload;
-  laapHttpRead(c, 40000, hdrs, payload, 600000);   // 火山 wav+base64 ≈64KB/s：200KB 只够 3 秒，长回复必败（v3.56 审计）
+  laapHttpRead(c, readBudgetMs, hdrs, payload, 600000);   // 火山 wav+base64 ≈64KB/s：200KB 只够 3 秒，长回复必败（v3.56 审计）
   c->stop();
   int sp = hdrs.indexOf(' ');
   int code = sp > 0 ? hdrs.substring(sp + 1, sp + 4).toInt() : 0;
@@ -168,7 +179,7 @@ static bool extractJsonStr(const String& j, const char* key, String& out) {
 // 单服务商转写：base 为空返回 -1（跳过）；其余同 httpsPost 语义
 static int transcribeOnce(const char* baseC, const char* keyC, const char* modelC,
                           const uint8_t* wav, size_t wavLen, String& text, String& err,
-                          WiFiClient* warm = nullptr) {
+                          WiFiClient* warm = nullptr, uint32_t readBudgetMs = 40000) {
   String base(baseC);
   if (!base.length() || !String(keyC).length()) { err = "未配置"; return -1; }
   while (base.endsWith("/")) base.remove(base.length() - 1);
@@ -193,7 +204,7 @@ static int transcribeOnce(const char* baseC, const char* keyC, const char* model
 
   String resp;
   uint32_t tSendStart = millis();
-  int code = httpsPost(url, String("multipart/form-data; boundary=") + bound, body, total, keyC, resp, warm);
+  int code = httpsPost(url, String("multipart/form-data; boundary=") + bound, body, total, keyC, resp, warm, readBudgetMs);
   size_t sentLen = total;
   free(body);
   // 把"发了多大、花了多久、HTTP 几"打出来：服务端排队慢 vs 请求被拒，一眼可分
@@ -220,28 +231,39 @@ String AsrClient::transcribe(const int16_t* pcm16k, size_t bytes, String& err) {
   size_t wavLen = wavWrap(pcm16k, bytes, wav, wavCap);
 
   String text;
+  // v3.76e 总预算 45s：主请求（读预算随剩余时间收缩，最少 8s）→ 热连接重试 → 备用
+  // 服务商，各自先查剩余预算。原来无总预算时三连发最坏 ≈3×60s——这段全在 loop 上下文，
+  // 是"搜新闻后卡死聋哑"的最大单一阻塞源，且看门狗跑在 loop 里对此完全失明。
+  // 健康链路实测 2-5s 出结果，45s 只砍病态尾部。
+  const uint32_t deadline = millis() + 45000;
+  auto remainMs = [&deadline]() -> uint32_t {
+    int32_t r = (int32_t)(deadline - millis());
+    return r > 8000 ? (uint32_t)r : 8000;   // 至少给 8s：连接+发送+短读还有救
+  };
   warmLock();
   WiFiClient* warmConn = g_warmOk ? (WiFiClient*)&g_warm : nullptr;
   bool usedWarm = (warmConn != nullptr);
-  int code = transcribeOnce(cfg.s.asrBase, cfg.s.asrKey, cfg.s.asrModel, wav, wavLen, text, err, warmConn);
+  int code = transcribeOnce(cfg.s.asrBase, cfg.s.asrKey, cfg.s.asrModel, wav, wavLen, text, err, warmConn, remainMs());
   if (g_warmOk) { g_warmOk = false; g_warm.stop(); }   // 热连接一次性（Connection: close）
   warmUnlock();
   // 预热连接是录音前握好的，服务端 keep-alive 超时/LB 回收可能在这几秒里把它关掉 →
   // 写失败（-3）而不是请求被拒。这种情况必须用新连接重发一次，否则 ASR 会在"看起来
   // 什么都正常"的情况下静默失败（实测坑）。
-  if (usedWarm && code != 200) {
+  if (usedWarm && code != 200 && (int32_t)(deadline - millis()) > 0) {
     Serial.printf("[ASR] 热连接失败(%s) → 改用新连接重试\n", err.c_str());
     String t2b, e2b;
-    int c2b = transcribeOnce(cfg.s.asrBase, cfg.s.asrKey, cfg.s.asrModel, wav, wavLen, t2b, e2b, nullptr);
+    int c2b = transcribeOnce(cfg.s.asrBase, cfg.s.asrKey, cfg.s.asrModel, wav, wavLen, t2b, e2b, nullptr, remainMs());
     if (c2b == 200) { free(wav); err = ""; return t2b; }
     code = c2b; text = t2b; err = e2b;
   }
-  if (code != 200 && code != -1) {
+  // v3.76e：负数 code = 连接/写失败/URL 畸形——网络本身死了，备用服务商必然同样超时，
+  // 只会白吃一个完整读预算；只有 HTTP 状态错误（code>0）才值得试备用。
+  if (code > 0 && code != 200 && (int32_t)(deadline - millis()) > 0) {
     // 主 ASR 失败 → 备用 ASR 自动回退（配置了才试）
     Serial.printf("[ASR] 主服务商失败(%s)，尝试备用…\n", err.c_str());
     String errMain = err;                 // 备用失败时会写 err，别让它盖掉主服务的真报错
     String text2;
-    int code2 = transcribeOnce(cfg.s.asr2Base, cfg.s.asr2Key, cfg.s.asr2Model, wav, wavLen, text2, err);
+    int code2 = transcribeOnce(cfg.s.asr2Base, cfg.s.asr2Key, cfg.s.asr2Model, wav, wavLen, text2, err, nullptr, remainMs());
     if (code2 == 200) { free(wav); return text2; }
     err = errMain + " ｜ 备用: " + err;   // 两条都留着，排障时一眼看清是谁的问题
   }

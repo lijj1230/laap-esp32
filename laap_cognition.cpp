@@ -49,7 +49,7 @@ void Cognition::saveEvolution(bool force) {
            _openness, _sociability, _sensitivity,
            _n.energy, _n.curiosity, _n.social, _n.security, _n.expression, _pleasure);
   f.close();
-  LittleFS.remove("/evolution.json");
+  // v3.76e：单步 rename 直接覆盖（remove+rename 两步之间掉电 = 文件整个消失，比半写更糟）
   LittleFS.rename("/evolution.tmp", "/evolution.json");
   _savedN = _n; _savedPl = _pleasure;   // 快照对齐：下次从"写入时的值"起算漂移
 }
@@ -189,7 +189,7 @@ void Cognition::saveIntents() {
   for (int i = 0; i < intentN; i++)
     f.printf("%lu|%s\n", (unsigned long)intentBorn[i], intents[i].c_str());
   f.close();
-  LittleFS.remove(INTENTS_PATH);
+  // v3.76e：单步 rename 直接覆盖（消除 remove→rename 间的掉电丢失窗口）
   LittleFS.rename(tmpPath, INTENTS_PATH);
 }
 

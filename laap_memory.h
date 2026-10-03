@@ -51,6 +51,7 @@ public:
   void   importEnd();
   bool   applyImport(String& msg);                       // 解析并落盘（覆盖现有记忆）
   void   reloadWork();                                   // 从盘上重建工作记忆环（导入后用）
+  void   onRestored();                                   // v3.76e：快照恢复后重数记忆/清向量计数（防恢复→重启窗口错位）
 
 private:
   void appendEpisodic(const char* role, const String& text);

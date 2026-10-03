@@ -71,10 +71,16 @@ static String jsonField(const String& b, const char* k) {
   String pat = String("\"") + k + "\":";
   int i = b.indexOf(pat);
   if (i < 0) return "";
+  // v3.76e：键匹配是全文子串——字符串值里出现 "key": 字样会截错值。锚定合法键位：
+  // pat 前一个非空白字符必须是 { 或 ,（字符串值内部必然隔着别的内容）
+  int pre = i - 1;
+  while (pre >= 0 && (b[pre] == ' ' || b[pre] == '\t' || b[pre] == '\r' || b[pre] == '\n')) pre--;
+  if (pre >= 0 && b[pre] != '{' && b[pre] != ',') return "";
   int j = i + pat.length();
   while (j < (int)b.length() && (b[j] == ' ' || b[j] == '\t')) j++;
   if (j >= (int)b.length()) return "";
   if (b[j] != '"') {                       // 数字 / true / false / null
+    if (b[j] == '{' || b[j] == '[') return "";   // v3.76e：对象/数组值本解析器不支持，返回空防乱值
     String v;
     while (j < (int)b.length() && b[j] != ',' && b[j] != '}') { v += b[j]; j++; }
     v.trim();
@@ -536,6 +542,9 @@ void LaapWeb::handleSettingsPage() {
 void LaapWeb::handleSave() {
   // 手动解析 JSON body（免库）
   String b = server.arg("plain");
+  // v3.76e：body 上限（设置页正常 ~2KB；超大 body = 35 次全文 indexOf 的 O(n²) 扫描
+  // 卡 loop + 堆峰值，且必然不是本前端发的）
+  if (b.length() > 4096) { server.send(400, "application/json", "{\"ok\":false,\"msg\":\"body 过大\"}"); return; }
   auto get = [&](const char* k) -> String { return jsonField(b, k); };
   // 掩码回显识别：网页旧版会把 "(sk-***abcd)" 这种掩码填进输入框，提交后会把真 Key 覆盖掉。
   // 任何含 "***" 或首尾成对括号的值都不可能是真密钥 → 一律忽略，保住已存的 Key。
