@@ -508,7 +508,7 @@ String Cognition::worldJson() const {
          ",\"security\":" + String(_n.security, 2) +
          ",\"expression\":" + String(_n.expression, 2) +
          "},\"trust\":" + String(trust, 2) +
-         "," + expectLine() + ",\"mood\":\"" + moodKey() + "\",\"goal\":\"" + goalCn() + "\"}";
+         "," + expectLine() + ",\"mood\":\"" + moodCn() + "\",\"goal\":\"" + goalCn() + "\"}";   // v3.76g：mood 出中文——英文 key 会被模型照抄到回复开头（"calm. …"实案）
 }
 
 String Cognition::traitsLine() const {

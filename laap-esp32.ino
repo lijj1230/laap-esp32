@@ -919,6 +919,29 @@ void llmHarvest() {
   g_llmHasNew = false;
   LlmReply r = g_llmResult;
   uint8_t kind = g_resultKind;
+  // v3.76g 兜底：模型偶尔把提示词 JSON 的字段值照抄成回复开头（"calm. 上次聊完…"实案，
+  // "mood":"calm" 与 "expect":"预期…"都在被抄之列）。入口处统一剥掉这类前缀标签。
+  if (r.ok && r.say.length() > 4) {
+    for (int pass = 0; pass < 2; pass++) {           // 两遍：情绪+预期同时粘时都能剥
+      String low = r.say.substring(0, 10); low.toLowerCase();
+      int cut = -1;
+      if (low.startsWith("calm") || low.startsWith("curious") || low.startsWith("happy") ||
+          low.startsWith("sad") || low.startsWith("tired") || low.startsWith("anxious") ||
+          low.startsWith("excited") || low.startsWith("angry")) {
+        cut = low.indexOf(' ') > 0 ? low.indexOf(' ') : -1;   // 英文 key 后跟空格/标点
+        if (cut < 0) break;
+        cut = r.say.indexOf(' ');                             // 按原文定位
+      } else if (r.say.startsWith("预期:") || r.say.startsWith("预期：")) {
+        int nl = r.say.indexOf('\n');
+        if (nl <= 0 || nl > 40) break;                        // 只剥"首行就是标签"的形态
+        cut = nl + 1;
+      } else break;
+      r.say = r.say.substring(cut);
+      r.say.trim();
+      Serial.println("[LAAP] 剥掉回复开头的标签前缀（模型照抄提示词 JSON）");
+      if (!r.say.length()) break;
+    }
+  }
   { char bb[24]; snprintf(bb, sizeof(bb), "harvest:%c", (kind < 13) ? "CEMoRrlmDLSit"[kind] : '?');
     laapBlackBox(bb); }   // v3.65 黑匣子：收割=一轮 LLM 结算开始
   if (kind == LK_LOOK && g_resLookState == 0) {       // 没看成：已按普通聊天兜底（v3.54），按聊天结算
