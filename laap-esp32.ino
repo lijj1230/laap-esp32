@@ -241,6 +241,26 @@ void arisExpress(bool forced, const String& trigger) {
   // 夜间静音窗：只拦"需求自己涨上来的"（forced=主人按键/开机问候不受限）。
   // 静默期不计冷却、不消费需求——天亮 dominance 还在阈值上就自然开口
   if (!forced && laapInQuietWindow()) return;
+  // v3.76h 堆门禁：表达链=LLM TLS+流式 TTS 全链，堆退化区（maxblk<45KB）点火会把
+  // 内部堆压穿成 13KB 碎片区（10-04 两次挂死现场 bb：express-fire @T+72s heap 60/13）。
+  // 自主表达延后无代价（下一拍需求还在）；forced 也要 30KB 底线（LSR 全链最低需求）。
+  { uint32_t maxblk = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    uint32_t floor = forced ? 30000UL : 45000UL;
+    if (maxblk < floor) {
+      Serial.printf("[LAAP] 表达延后：堆最大块 %uKB < %uKB（v3.76h 门禁）\n",
+                    (unsigned)(maxblk / 1024), (unsigned)(floor / 1024));
+      if (!forced) return;                    // 自主：静默延后，不占冷却
+      s_lastExpressMs = millis();             // forced：仍计时防连按刷屏，走本地兜底
+      String d = offlineFallbackSay();
+      g_lastSay = d; g_lastExpr = "calm";
+      g_chatReply = d; g_chatSeq++;
+      laapActivity();
+      display.drawFace("calm", false);
+      voice.speak(d, "calm");
+      g_replySpoken = true;
+      return;
+    }
+  }
   s_lastExpressMs = millis();                    // 受理即计时（失败也已占用这一轮）
   g_expressForced = forced;   // C4 自评豁免依据（审计 P2：强制表达不可被自评否决）
   // R2+R3（v3.48）：表达输出契约扩展——三候选自选 + 类别化预期。写在 user 消息里
@@ -686,7 +706,14 @@ static void llmTaskFunc(void*) {
     if (req->kind == LK_CHAT) {
       static volatile bool s_preInFlight = false;   // v3.76e：在飞即跳过——上一轮 preconnect
                                                     // 卡在 WS/TLS 时连发任务会累积 12KB 栈到堆耗尽
-      if (!s_preInFlight) {
+      static uint32_t s_preSkipMs = 0;        // v3.76h：堆紧时跳过预取（speak 会现场握手），
+                                              // 防"LLM TLS + ttspre TLS"双握手并发压穿内部堆
+      if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 40000) {
+        if (millis() - s_preSkipMs > 60000UL) {
+          s_preSkipMs = millis();
+          Serial.println("[LLM·流] 堆紧，跳过 TTS 预取（v3.76h）");
+        }
+      } else if (!s_preInFlight) {
         s_preInFlight = true;
         if (xTaskCreate([](void*) { edgeTts.preconnect(); s_preInFlight = false; vTaskDelete(nullptr); },
                         "ttspre", 12288, nullptr, 1, nullptr) != pdPASS) {
@@ -1287,6 +1314,12 @@ void llmHarvest() {
 // 返回 0=已提交（调用方计整个间隔） 1=广播未过（短重试，节奏由配置间隔决定） 2=忙/失败（30s 重试）
 int arisIdleMonologue(bool force) {
   laapBlackBox("mono-fire");   // v3.65 黑匣子：独白链启动（出题→看→搜→成文→播报）
+  // v3.76h 堆门禁：独白链=看图+搜索+LLM+TTS 全链，是全固件最重的内存作业。
+  // 堆退化区点火=10-04 挂死现场同款；延后无代价（需求不会消失，下拍再来）。
+  if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 45000) {
+    Serial.println("[LAAP·独白] 堆最大块<45KB，本轮延后（v3.76h 门禁）");
+    return 2;
+  }
   if (g_llmFailStreak >= 2) {             // 连续失败让路（等效退避），本轮沉默
     Serial.println("[LAAP·独白] LLM 连败，本轮沉默");
     return 2;
