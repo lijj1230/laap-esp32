@@ -1430,7 +1430,9 @@ String buildSystemPrompt() {
 
 String buildUserPrompt(const String& userText) {
   String ctx = memory.recentContext(500);
-  String recall = userText.length() ? memory.recallSmart(utf8Cut(userText, 12), 200) : "";
+  // v3.76f：allowNet=false——buildUserPrompt 在 loop 上下文跑（受理路径），同步 embedding
+  // 一次 0.5~12s 曾把受理→掉线卡成 ~60s（T+5s 掉线实锤）；语义召回留给后台收割路径
+  String recall = userText.length() ? memory.recallSmart(utf8Cut(userText, 12), 200, false) : "";
   // 下面的 associativeRecall 复用同一份 recall（原实现再查一次 = 每条消息 2 次串行 embedding）
   String p = "[世界模型] " + mind.worldJson() + "\n";
   if (recall.length()) p += "[相关回忆] " + recall + "\n";
@@ -2462,6 +2464,8 @@ void setup() {
   Serial.begin(115200);
   Serial.setTimeout(50);   // v3.76e：readStringUntil 默认 1s 超时——无换行字节流（噪声/异常
                            // 主机）曾让串口 CLI 每轮阻塞最长 8 秒且持续发生
+  laapPanicCaptureInit();  // v3.76f：崩溃现场→RTC 黑匣子（复位码 11 的 panic 打印被 USJ 吞，
+                           // 只有这条路能把 cause+backtrace 带回来）
   delay(200);
   Serial.println("\n[LAAP] Living Agent Application Protocol - 端侧生命体启动中…");
   // 构建时间戳：判断"板子里跑的到底是哪一版"的唯一可靠依据（烧录后必看这一行）

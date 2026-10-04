@@ -4,6 +4,8 @@
 #include <Preferences.h>
 #include <time.h>
 #include <esp_heap_caps.h>
+#include "esp32-hal.h"   // v3.76f：set_arduino_panic_handler（复位码 11 的 panic 打印被
+                         // USJ 复位吞掉，RTC 内存是唯一能带回现场的路）
 
 LaapMetrics metrics;
 
@@ -13,6 +15,31 @@ RTC_DATA_ATTR static uint32_t s_bbMs;
 RTC_DATA_ATTR static uint32_t s_bbHeapKb;
 RTC_DATA_ATTR static uint32_t s_bbMaxKb;
 RTC_DATA_ATTR static uint32_t s_bbPhase;   // v3.69 loop 微相位
+// v3.76f panic 黑匣子：Arduino panic 钩子里写入；下次启动读一次即清
+RTC_DATA_ATTR static uint32_t s_panMagic;      // 0x50414E31 ("PAN1")=有现场
+RTC_DATA_ATTR static uint32_t s_panCore;
+RTC_DATA_ATTR static uint32_t s_panPc;
+RTC_DATA_ATTR static uint32_t s_panTs;         // 崩溃时刻 millis()
+RTC_DATA_ATTR static uint32_t s_panBtLen;
+RTC_DATA_ATTR static uint32_t s_panBt[8];      // 回溯前 8 帧（核心现场）
+RTC_DATA_ATTR static char s_panReason[32];
+
+// Arduino panic 钩子（官方 handler 打印前调用；ISR 语境：只能碰 RTC 内存，别做别的）
+static void laapPanicHook(arduino_panic_info_t* info, void*) {
+  s_panCore = info->core;
+  s_panPc = (uint32_t)info->pc;
+  s_panTs = millis();
+  s_panBtLen = info->backtrace_len;
+  for (int i = 0; i < 8 && i < (int)info->backtrace_len; i++) s_panBt[i] = info->backtrace[i];
+  if (info->reason) strlcpy(s_panReason, info->reason, sizeof(s_panReason));
+  s_panMagic = 0x50414E31UL;   // "PAN1"——最后写：写完即视为现场完整
+}
+
+// setup 早段调用（见 laap-esp32.ino）：注册 panic 钩子
+void laapPanicCaptureInit() {
+  set_arduino_panic_handler(laapPanicHook, nullptr);
+}
+
 static const char* kBBPhaseName[] = {
   "loop头", "web", "cli", "embedTick", "显示", "voiceTick", "paTick", "harvest",
   "触摸", "息屏", "打盹门", "落盘", "按键", "wifi", "psiTick", "独白调度", "loop尾"
@@ -26,9 +53,20 @@ void laapBlackBox(const char* tag) {
   s_bbMaxKb = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024;
 }
 
-String laapBlackBoxText() {
-  if (!s_bbTag[0]) return String("（本次上电还没有记录）");
-  return String(s_bbTag) + " @T+" + String(s_bbMs / 1000UL) + "s（heap " +
+String laapBlackBoxText(bool consume) {
+  // v3.76f：崩溃现场展示；consume=true 才清除（串口横幅 false——串口看不见，
+  // /api/status 的 HTTP 读取 true——抓到现场后才放行）
+  String panicLine;
+  if (s_panMagic == 0x50414E31UL) {
+    if (consume) s_panMagic = 0;
+    panicLine = String("【上次崩溃】core") + s_panCore + " pc=0x" + String(s_panPc, HEX) +
+                " " + s_panReason + " bt:";
+    for (int i = 0; i < 8 && i < (int)s_panBtLen; i++)
+      panicLine += String(i ? " 0x" : "0x") + String(s_panBt[i], HEX);
+    panicLine += "；";
+  }
+  if (!s_bbTag[0]) return panicLine + String("（本次上电还没有记录）");
+  return panicLine + String(s_bbTag) + " @T+" + String(s_bbMs / 1000UL) + "s（heap " +
          String(s_bbHeapKb) + "KB/最大 " + String(s_bbMaxKb) + "KB）loop相位=" +
          String((s_bbPhase < 17) ? kBBPhaseName[s_bbPhase] : "?") + "(" + String(s_bbPhase) + ")";
 }

@@ -744,7 +744,7 @@ void LaapWeb::handleStatus() {
     // 本次启动原因：主动重启在 NVS 打标（laapReboot），崩溃/看门狗由 esp_reset_reason 细分
     ",\"boot_reason\":\"" + jsonEsc(laapBootReason()) + "\"" +
     // 黑匣子（v3.65）：无声重启后，这里显示的是**上一次开机**死前最后的活动标签
-    ",\"bb\":\"" + jsonEsc(laapBlackBoxText()) + "\"" +
+    ",\"bb\":\"" + jsonEsc(laapBlackBoxText(true)) + "\"" +   // v3.76f：HTTP 读取消费崩溃现场
     ",\"fs_used_kb\":" + String(LittleFS.usedBytes() / 1024) +
     ",\"fs_total_kb\":" + String(LittleFS.totalBytes() / 1024) +
     ",\"screen_off\":" + cfg.s.screenOffSec +

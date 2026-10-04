@@ -92,7 +92,8 @@ String laapBootReason();
 // （带当时的堆水位），重启后 /api/status 的 bb 字段与开机串口直接读回。
 // 写入廉价（strlcpy+两次堆查询 ~10µs），只埋在慢路径（LLM/TTS/视觉/心跳），别放进每帧循环。
 void laapBlackBox(const char* tag);
-String laapBlackBoxText();
+String laapBlackBoxText(bool consume = false);   // v3.76f：consume=true 读取并清除崩溃现场（Web 用）
+void laapPanicCaptureInit();   // v3.76f：注册 panic 钩子（setup 早段；崩溃现场存 RTC，重启后黑匣子带回）
 // v3.69 微标签：loop() 各子阶段写一个 RTC 微相位（普通内存存储，零开销；~1ms 分辨率）。
 // 无声崩溃后 bb 显示的相位=死点所在子阶段，把排查从"整个 loop"缩到"某一段"。
 void laapBBPhase(uint8_t ph);

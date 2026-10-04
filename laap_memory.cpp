@@ -444,13 +444,13 @@ static bool bigramMostlyIn(const String& a, const String& b) {
   return total >= 3 && hit * 10 >= total * 3;
 }
 
-String MemorySystem::recallSmart(const String& query, int maxChars) {
+String MemorySystem::recallSmart(const String& query, int maxChars, bool allowNet) {
   struct Hit { String line; float score; };
   std::vector<Hit> hits;
 
   // 资源适配度（v3.43，借鉴"心光竞争"）：资源状态调制"做多深"，而不只是门控行为发生——
   // 堆紧时省下 embedding 的两次 4KB 向量缓冲（退关键词通道）；堆紧/身体负荷高时少带回忆
-  bool allowEmb = (_embFail < 3);
+  bool allowEmb = (_embFail < 3) && allowNet;   // v3.76f：受理路径传 false（loop 上下文不做同步网络）
   int effChars = maxChars;
   {
     uint32_t maxblk = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);

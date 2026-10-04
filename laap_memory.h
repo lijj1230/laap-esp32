@@ -20,7 +20,7 @@ public:
   // 近 max 轮对话（远→近），roles 并行输出说话人：0=主人 1=它自己（调用方据此标 role，别再靠奇偶猜）
   int recentTurns(String* out, uint8_t* roles, int max) const;
   // 智能回忆（Mem0 式多信号）：语义向量为主，权重/新鲜度/心里目标/情绪同色调加权；无向量退关键词
-  String recallSmart(const String& query, int maxChars = 300);
+  String recallSmart(const String& query, int maxChars = 300, bool allowNet = true);   // v3.76f：allowNet=false 纯本地通道（loop 上下文禁同步 embedding）
   void   rememberBoost(const String& fragment);   // 用户问起=该记忆重要（升级权重）
   // 关系记忆层（v3.43，借鉴"识海手稿"）：主人的偏好/答应的事/要守住的边界
   String relationsFor(const String& query, const String& goal, int maxLines = 2); // 相关条目并入召回
