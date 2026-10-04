@@ -745,7 +745,8 @@ void LaapWeb::handleStatus() {
     ",\"boot_reason\":\"" + jsonEsc(laapBootReason()) + "\"" +
     // 黑匣子（v3.65）：无声重启后，这里显示的是**上一次开机**死前最后的活动标签
     ",\"bb\":\"" + jsonEsc(laapBlackBoxText(true)) + "\"" +   // v3.76f：HTTP 读取消费崩溃现场
-    ",\"strip_cnt\":" + String(laapStripCount()) +            // v3.76g 诊断：标签剥离执行次数
+    ",\"strip_cnt\":" + String(laapStripCount()) +
+    ",\"fw_build\":\"" + __DATE__ " " __TIME__ + "\"" +            // v3.76g 诊断：标签剥离执行次数
     ",\"fs_used_kb\":" + String(LittleFS.usedBytes() / 1024) +
     ",\"fs_total_kb\":" + String(LittleFS.totalBytes() / 1024) +
     ",\"screen_off\":" + cfg.s.screenOffSec +

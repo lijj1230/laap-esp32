@@ -341,6 +341,19 @@ static volatile bool g_resStreamSpoke = false;        // 同代发布：本轮�
 // v3.76g 标签前缀剥离（公共实现）：模型偶尔把提示词 JSON 的字段值照抄到回复开头
 // （"calm. 上次聊完…"/"tired。核心目标是…"实案）。流式首句与整段收割两处都调。
 static uint32_t g_stripCount = 0;
+// v3.76g 字节级分隔符判断：String[k] 是单字节，中文标点是 3 字节 UTF-8——
+// 原 `say[kl]=='。'` 拿首字节 0xE3 比字符字面量 0x3002 永远不等（泄漏不剥的真因）。
+// 。=E3 80 82  ，=E3 80 81  ：=EF BC 9A
+static bool laapLabelSepAt(const String& s, size_t i, size_t& adv) {
+  if (i >= s.length()) return false;
+  uint8_t c = (uint8_t)s[i];
+  if (c == ' ' || c == '.' || c == ',' || c == ':' || c == '\n' || c == '\r' || c == '\t') { adv = 1; return true; }
+  if (c == 0xE3 && i + 2 < s.length() && (uint8_t)s[i + 1] == 0x80 &&
+      ((uint8_t)s[i + 2] == 0x82 || (uint8_t)s[i + 2] == 0x81)) { adv = 3; return true; }   // 。 ，
+  if (c == 0xEF && i + 2 < s.length() && (uint8_t)s[i + 1] == 0xBC && (uint8_t)s[i + 2] == 0x9A) { adv = 3; return true; } // ：
+  return false;
+}
+
 static void laapStripLabelPrefix(String& say) {
   for (int pass = 0; pass < 2; pass++) {           // 两遍：情绪+预期同时粘时都能剥
     if (say.length() < 4) return;
@@ -358,13 +371,11 @@ static void laapStripLabelPrefix(String& say) {
       size_t kl = strlen(keys[k]);
       if (!low.startsWith(keys[k])) continue;
       // key 后面必须紧跟分隔符才算标签——防误伤 "Happy day" 式正文开头
-      char nx = say.length() > (int)kl ? say[kl] : 0;
-      if (nx == ' ' || nx == '.' || nx == '。' || nx == '，' || nx == ',' || nx == '：' || nx == ':' || nx == '\n') {
-        size_t adv = kl;
-        while (adv < say.length() && (say[adv]==' '||say[adv]=='.'||say[adv]=='。'||
-                                      say[adv]=='，'||say[adv]==','||say[adv]=='\n'||say[adv]=='\r'))
-          adv++;                                   // 连分隔符一起吃掉
-        cut = (int)adv;
+      size_t a = 0;
+      if (say.length() > kl && laapLabelSepAt(say, kl, a)) {
+        size_t pos = kl;
+        while (pos < say.length() && laapLabelSepAt(say, pos, a)) pos += a;   // 连分隔符一起吃掉
+        cut = (int)pos;
       }
     }
     if (cut < 0 && (say.startsWith("预期:") || say.startsWith("预期："))) {
