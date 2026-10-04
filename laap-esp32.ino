@@ -76,8 +76,16 @@ static bool g_chatPending = false;
 // 调用方（语音那条链路）若再念一次，同一句话就会说两遍——用户实测"语音问了会回答两次"。
 // 这个标志告诉调用方：这句已经念过了，别再念。
 static bool g_replySpoken = false;
+static void laapStripLabelPrefix(String& say);   // v3.76g 前向声明（getter 兜底剥离用）
 uint32_t laapChatSeq() { return g_chatSeq; }
-String laapChatReply() { return g_chatReply; }
+String laapChatReply() {
+  // v3.76g 终极兜底：不论上游哪条路径忘了剥（实测 strip_cnt=0 而泄漏仍在，
+  // 收割链路存在未定位的旁路），取件口强制剥一次——网页/反馈/记忆都从这里取文本
+  String r = g_chatReply;
+  laapStripLabelPrefix(r);
+  return r;
+}
+uint32_t laapStripCount();   // v3.76g 诊断：标签剥离执行次数
 bool laapChatPending() { return g_chatPending; }
 bool laapReplySpoken() { return g_replySpoken; }
 
@@ -330,18 +338,63 @@ static QueueHandle_t g_sayQueue = nullptr;            // 元素=char*（malloc�
 static volatile uint8_t g_streamSayCount = 0;         // 本轮流式已入队句数（llmTask 写）
 static volatile bool g_resStreamSpoke = false;        // 同代发布：本轮已流式播报过
 
+// v3.76g 标签前缀剥离（公共实现）：模型偶尔把提示词 JSON 的字段值照抄到回复开头
+// （"calm. 上次聊完…"/"tired。核心目标是…"实案）。流式首句与整段收割两处都调。
+static uint32_t g_stripCount = 0;
+static void laapStripLabelPrefix(String& say) {
+  for (int pass = 0; pass < 2; pass++) {           // 两遍：情绪+预期同时粘时都能剥
+    if (say.length() < 4) return;
+    // v3.76g：先跳过前导不可见字符（SSE 流常带 \n / 空格 / 零宽空格，会让 startsWith 落空）
+    size_t lead = 0;
+    while (lead < say.length() &&
+           (say[lead]=='\n' || say[lead]=='\r' || say[lead]==' ' || say[lead]=='\t' ||
+            (uint8_t)say[lead] == 0xEF || (uint8_t)say[lead] == 0xBB || (uint8_t)say[lead] == 0xBF))
+      lead++;
+    if (lead) { say = say.substring(lead); say.trim(); if (say.length() < 4) return; }
+    String low = say.substring(0, 10); low.toLowerCase();
+    int cut = -1;
+    const char* keys[] = {"calm","curious","happy","sad","tired","anxious","excited","angry"};
+    for (int k = 0; k < 8 && cut < 0; k++) {
+      size_t kl = strlen(keys[k]);
+      if (!low.startsWith(keys[k])) continue;
+      // key 后面必须紧跟分隔符才算标签——防误伤 "Happy day" 式正文开头
+      char nx = say.length() > (int)kl ? say[kl] : 0;
+      if (nx == ' ' || nx == '.' || nx == '。' || nx == '，' || nx == ',' || nx == '：' || nx == ':' || nx == '\n') {
+        size_t adv = kl;
+        while (adv < say.length() && (say[adv]==' '||say[adv]=='.'||say[adv]=='。'||
+                                      say[adv]=='，'||say[adv]==','||say[adv]=='\n'||say[adv]=='\r'))
+          adv++;                                   // 连分隔符一起吃掉
+        cut = (int)adv;
+      }
+    }
+    if (cut < 0 && (say.startsWith("预期:") || say.startsWith("预期："))) {
+      int nl = say.indexOf('\n');
+      if (nl > 0 && nl <= 40) cut = nl + 1;        // 只剥"首行就是标签"的形态
+    }
+    if (cut < 0) return;
+    say = say.substring(cut);
+    say.trim();
+    g_stripCount++;
+    Serial.println("[LAAP] 剥掉回复开头的标签前缀（模型照抄提示词 JSON）");
+  }
+}
+uint32_t laapStripCount() { return g_stripCount; }
+
 // v3.70 流式成句回调（在 LLM 任务语境同步执行）：只做 malloc+入队，绝不阻塞——
 // 队列满宁可丢这句也不拖慢 SSE 流（文字侧仍完整）。播放由 loop 的 drain 负责。
 static void laapStreamSayPush(const String& sentence, void* ctx) {
   (void)ctx;
   if (!g_sayQueue || sentence.length() < 2) return;
-  char* p = (char*)malloc(sentence.length() + 1);
+  String s = sentence;
+  laapStripLabelPrefix(s);   // v3.76g：首句自带 "tired。" 类标签时剥掉再入队
+  if (s.length() < 2) return;
+  char* p = (char*)malloc(s.length() + 1);
   if (!p) return;
-  memcpy(p, sentence.c_str(), sentence.length() + 1);
+  memcpy(p, s.c_str(), s.length() + 1);
   if (xQueueSend(g_sayQueue, &p, 0) != pdTRUE) { free(p); return; }
   if (g_streamSayCount == 0)
     Serial.printf("[LLM·流] 首句 %uB 已入播报队列（距提问 %lums）\n",
-                  (unsigned)sentence.length(), (unsigned long)(millis() - g_chatStartMs));
+                  (unsigned)s.length(), (unsigned long)(millis() - g_chatStartMs));
   if (g_streamSayCount < 255) g_streamSayCount++;
 }
 static uint32_t g_lookStartMs = 0;                    // 视觉受理时刻（rspDir 口径）
@@ -919,29 +972,7 @@ void llmHarvest() {
   g_llmHasNew = false;
   LlmReply r = g_llmResult;
   uint8_t kind = g_resultKind;
-  // v3.76g 兜底：模型偶尔把提示词 JSON 的字段值照抄成回复开头（"calm. 上次聊完…"实案，
-  // "mood":"calm" 与 "expect":"预期…"都在被抄之列）。入口处统一剥掉这类前缀标签。
-  if (r.ok && r.say.length() > 4) {
-    for (int pass = 0; pass < 2; pass++) {           // 两遍：情绪+预期同时粘时都能剥
-      String low = r.say.substring(0, 10); low.toLowerCase();
-      int cut = -1;
-      if (low.startsWith("calm") || low.startsWith("curious") || low.startsWith("happy") ||
-          low.startsWith("sad") || low.startsWith("tired") || low.startsWith("anxious") ||
-          low.startsWith("excited") || low.startsWith("angry")) {
-        cut = low.indexOf(' ') > 0 ? low.indexOf(' ') : -1;   // 英文 key 后跟空格/标点
-        if (cut < 0) break;
-        cut = r.say.indexOf(' ');                             // 按原文定位
-      } else if (r.say.startsWith("预期:") || r.say.startsWith("预期：")) {
-        int nl = r.say.indexOf('\n');
-        if (nl <= 0 || nl > 40) break;                        // 只剥"首行就是标签"的形态
-        cut = nl + 1;
-      } else break;
-      r.say = r.say.substring(cut);
-      r.say.trim();
-      Serial.println("[LAAP] 剥掉回复开头的标签前缀（模型照抄提示词 JSON）");
-      if (!r.say.length()) break;
-    }
-  }
+  laapStripLabelPrefix(r.say);   // v3.76g：整段文本的标签前缀剥离（网页取件/记忆落盘用）
   { char bb[24]; snprintf(bb, sizeof(bb), "harvest:%c", (kind < 13) ? "CEMoRrlmDLSit"[kind] : '?');
     laapBlackBox(bb); }   // v3.65 黑匣子：收割=一轮 LLM 结算开始
   if (kind == LK_LOOK && g_resLookState == 0) {       // 没看成：已按普通聊天兜底（v3.54），按聊天结算

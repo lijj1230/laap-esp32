@@ -66,6 +66,7 @@ const char* laapLastReqShape();   // 最近一次 LLM 请求的消息结构（�
 // 聊天回复是异步产生的（主循环不冻结）：网页拿到受理回执后轮询这两个
 uint32_t laapChatSeq();       // 每次有新的聊天成品回复 +1
 String laapChatReply();       // 最近一条聊天成品回复
+uint32_t laapStripCount();    // v3.76g 诊断：标签前缀剥离执行次数
 bool laapChatPending();       // 上一次 laapInteractSearch 是否丢给了后台 LLM
 bool laapReplySpoken();       // 上一次是否已自己念过（本地直答：工具指令 / 看东西）
 String laapLastUserText();    // 最近一轮主人原话（反馈落盘用）
