@@ -1396,7 +1396,11 @@ String buildSystemPrompt() {
     if (meta.length()) p += String("[自我监控] ") + meta + "（这是你自己的状态记录，影响语气即可，别当话题说）\n";
     if (calib) p += "[自我校准] 最近几条回复的反馈不太理想：宁可少而准，不确定就直说不确定。\n";
   }
-  p += String("你刚才的情绪是「") + mind.moodCn() + "」，回复的情绪要与之连续，不要每次都元气满满。\n";
+  // v3.76g：情绪词泄漏修复——训练实测 LLM 会把「好奇/平静」当词说出来。
+  // 只演不说：点名禁止输出情绪词本身，让情绪从语气流露
+  p += String("你刚才的情绪是「") + mind.moodCn() + "」，回复的情绪要与之连续，不要每次都元气满满。"
+       "不要在回复里说出情绪词本身（如「我很好奇」「我很平静」「我现在的情绪是…」）——"
+       "让情绪从语气和用词里流露，而不是把它当内容汇报。\n";
   // 小凌⑥⑤②: 关系温度/失望/身体负荷——让它们在语气里自然流露
   int tr = (int)(mind.trust * 100);
   String rel;
@@ -2843,11 +2847,16 @@ void loop() {
   // 在危险区之上：宁可持续自愈（干净软重启）也不无声崩溃。v3.65 修掉 _bin 泄漏
   // 后退化速度已大幅放缓，打盹频率会远低于 v3.63 时代。
   static uint32_t s_tightSince = 0;
+  static uint8_t s_tightSamples = 0;   // v3.76g：连续命中计数（TLS 握手瞬态可连中数拍，
+                                       // 30s 单窗曾把训练连发期的 44/12 瞬态误判成退化重启）
   { uint32_t maxblk = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (maxblk < 24000) {
-      if (!s_tightSince) s_tightSince = millis();
-      if (millis() - s_tightSince > 30000UL && millis() - g_lastActivityMs > 180000UL &&
-          !laapLlmBusy() && !laapChatPending()) {
+      if (!s_tightSince) { s_tightSince = millis(); s_tightSamples = 1; }
+      else s_tightSamples++;
+      // v3.76g 三重门：①连续 3 拍全低（覆盖 ~90s）②真空闲 5 分钟 ③无任务在飞
+      if (s_tightSamples >= 3 && millis() - s_tightSince > 90000UL &&
+          millis() - g_lastActivityMs > 300000UL &&
+          !laapLlmBusy() && !laapChatPending() && !voice.speaking() && !voice.isListening()) {
         Serial.println("[LAAP] 堆碎片到警戒线且闲置 → 自愈性打盹（重启换干净堆）");
         metrics.persist();     // 打盹前的失败证据必须留底
         mind.saveEvolution(true);   // 需求/情绪也留底：醒来接着睡前的状态，不"睡一觉归零"（v3.42）
@@ -2856,7 +2865,7 @@ void loop() {
         delay(600);
         laapReboot("自愈打盹");
       }
-    } else s_tightSince = 0;
+    } else { s_tightSince = 0; s_tightSamples = 0; }
   }
   // v3.76e 僵尸看门狗：自愈打盹管不到的两种挂死。2026-10-03 实案：语音搜热点新闻后
   // 设备聋哑且永不自愈——对话任务挂死时 g_chatPending 卡住，反而把打盹门禁掉
